@@ -1,0 +1,55 @@
+{{!--
+  about.hbs — cargo-about Handlebars template for THIRD_PARTY_NOTICES.md.
+  ===========================================================================
+  Rendered by `cargo about generate --all-features about.hbs` (config:
+  about.toml). Produces the RUST-CRATE slice of the repo-root
+  THIRD_PARTY_NOTICES.md — one entry per license in the LOCKED dependency graph
+  (Cargo.lock), listing the crates under it, with the verbatim license text.
+
+  IMPORTANT — this template owns ONLY the Rust-crate section. The full file is
+  ASSEMBLED by scripts/desktop/gen-third-party-notices.sh, which sandwiches this
+  rendered output between a static header and the static
+  "UI / npm dependencies" + "Bundled binaries" (Chromium/Node/patchright)
+  sections (those are BINARIES / npm packages, invisible to cargo-about). Do NOT
+  add the surrounding document chrome here — the assembler owns it so the two
+  halves cannot drift.
+
+  DATA MODEL (cargo-about 0.6.x, the `handlebars` Rust crate):
+    {{overview}}  — array of { name, id, count } per license (summary counts).
+    {{licenses}}  — array of { name, id, text, used_by: [ { crate: {name,
+                    version, repository, ... } } ] }.
+  NOTE: this handlebars engine does NOT expose `.length` on arrays as a path
+  (it errors hard: "Cannot access array/vector with string index"), so we never
+  index array lengths — we only iterate with {{#each}} and print scalar fields.
+  The `gt`/`or` helpers cargo-about registers ARE available and used on the
+  scalar `count` in the overview.
+--}}
+{{!--
+  Verbatim fields (license name/text) use TRIPLE mustache {{{ }}} to DISABLE
+  handlebars' default HTML-entity escaping — legally the license text must be
+  reproduced verbatim, and {{text}} would turn `"`→`&quot;`, `<`→`&lt;`, `=`→
+  `&#x3D;`, corrupting it. `id` and `crate.*` are simple ASCII SPDX/name/version
+  strings, so double-mustache is fine for them.
+--}}
+{{#each overview}}
+- **{{{name}}}** (`{{id}}`) — {{count}} crate{{#if (gt count 1)}}s{{/if}}
+{{/each}}
+
+{{#each licenses}}
+### {{{name}}} (`{{id}}`)
+
+Used by:
+
+{{#each used_by}}
+- `{{crate.name}}` {{crate.version}}{{#if crate.repository}} — {{crate.repository}}{{/if}}
+{{/each}}
+
+<details><summary>License text — {{{name}}}</summary>
+
+```
+{{{text}}}
+```
+
+</details>
+
+{{/each}}

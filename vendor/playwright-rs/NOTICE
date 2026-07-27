@@ -1,0 +1,25 @@
+playwright-rs (vendored)
+========================
+
+This directory contains a vendored copy of `playwright-rs` version 0.13.0,
+originally authored by Paul Adamson and distributed under the Apache License,
+Version 2.0 (see the accompanying LICENSE file).
+
+Upstream source: https://github.com/padamson/playwright-rust
+
+Local modifications
+-------------------
+This copy has been modified from the upstream release. Per Apache-2.0 §4(b),
+the changes are:
+
+  * build.rs — the Playwright Node.js driver download now verifies a pinned
+    SHA-256 checksum of each platform's driver ZIP before extraction
+    (supply-chain integrity anchor). The unmodified upstream downloads the
+    archive without checksum verification.
+
+  * src/server/driver.rs — driver-resolution order reordered so a runtime
+    PLAYWRIGHT_NODE_EXE / PLAYWRIGHT_CLI_JS override takes priority over the
+    crate's bundled vanilla driver (lets the host point the driver at the
+    patchright stealth driver).
+
+All other files are redistributed unmodified.

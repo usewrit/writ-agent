@@ -1,0 +1,306 @@
+[package]
+name = "writ-agent"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Writ Agent — run browser automation on your machine"
+license = "AGPL-3.0-only"
+repository = "https://github.com/usewrit/writ-agent"
+homepage = "https://github.com/usewrit/writ-agent"
+readme = "README.md"
+keywords = ["browser-automation", "playwright", "self-hosted", "agent", "scraping"]
+categories = ["web-programming", "command-line-utilities"]
+
+# Cloud agent (managed product). Requires the `cloud` feature — the self-host
+# `--features local,fleet` build omits main.rs + all cloud modules entirely.
+[[bin]]
+name = "writ-agent"
+path = "src/main.rs"
+required-features = ["cloud"]
+
+# Desktop OSS daemon — only builds with the `local` feature (cloud build never compiles it).
+[[bin]]
+name = "writ-agentd"
+path = "src/bin/writ-agentd.rs"
+required-features = ["local"]
+
+# User-facing control CLI for the desktop daemon — only builds with the `local` feature.
+[[bin]]
+name = "writ"
+path = "src/bin/writ.rs"
+required-features = ["local"]
+
+# Self-host OSS FLEET worker — a cloud-free standalone agent that connects to a self-host
+# coordinator over its persistent `/ws/ai-gateway` WS, hosts a deployable LOCAL workflow catalog,
+# and runs those workflows fully on its own machine (definition/secrets/persona/data resolved
+# locally). It reuses the `local` engine/store/vault but runs NO daemon HTTP server / scheduler /
+# monitor. Requires BOTH `fleet` (the cloud-free bridge) AND `local` (the engine it drives). The
+# managed cloud build never compiles it (`fleet` is mutually exclusive with `cloud`). The resolved
+# OSS build is `cargo build --no-default-features --features local,fleet,openai --bin writ-agent-fleet`.
+[[bin]]
+name = "writ-agent-fleet"
+path = "src/bin/writ-agent-fleet.rs"
+required-features = ["fleet", "local"]
+
+# Auto-update verify/apply integration test (TASK 3.2/3.3). Needs `update-test-keys` (which implies
+# `local`) so the deterministic test verification key is compiled into the pinned map — an integration
+# test compiles the crate WITHOUT `cfg(test)`, so the test key must be gated on a real feature, not
+# `cfg(test)`. Run: `cargo test --features local,update-test-keys --test update_verify`.
+[[test]]
+name = "update_verify"
+path = "tests/update_verify.rs"
+required-features = ["update-test-keys"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = { version = "0.7", features = ["ws", "macros", "multipart"] }
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "timeout"] }
+hyper = { version = "1", features = ["full"] }
+
+# WebSocket client (gateway connection)
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+# preserve_order: extracted-data records must keep DOCUMENT key order (first-seen column order,
+# hash-identity field order) to reproduce the cross-engine lineage goldens (DATA_REDESIGN_SPEC
+# 1.3); indexmap is already in the dependency tree.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# HTTP client (AI providers, callbacks)
+# `multipart` is needed for the file-assets DIRECT-TO-STORAGE presigned POST upload
+# (browser/replay download capture → object storage, §4.4).
+reqwest = { version = "0.12", features = ["json", "native-tls", "blocking", "multipart", "stream", "gzip"] }
+
+# Browser automation (Playwright SDK — same API as Python Playwright/Patchright)
+playwright-rs = { version = "0.13", default-features = true }
+
+# Authentication
+jsonwebtoken = "9"
+hmac = "0.12"
+sha2 = "0.10"
+
+# Visual monitoring — decode PNG, resize, pixel-hash for screenshot-region checks.
+# `jpeg` is also enabled so AI-preview replay keyframes can be downscaled + re-encoded cheaply.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Encryption
+fernet = "0.2"
+
+# URL parsing & networking
+url = "2"
+
+# Identifiers
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Pattern matching
+regex = "1"
+lazy_static = "1"
+
+# HTML / CSS-selector extraction (HTTP fast-path content checks)
+scraper = "0.20"
+
+# HTML → clean Markdown (Dragnet crawl per-page extraction). Pure-Rust converter over the same
+# html5ever stack `scraper` already pulls; used on the isolated main-content subtree per page.
+#
+# NOT `html2md`: that crate is GPL-3.0-or-later, which our `deny.toml` copyleft policy rejects by
+# omission (and which broke `cargo about generate`, so THIRD_PARTY_NOTICES.md could not be built).
+# `htmd` is Apache-2.0 and maintained. See `crawl_shard::extract` — the input is always depth-capped
+# before conversion, because converters in this space walk the DOM recursively.
+htmd = "0.5"
+
+# Markdown → HTML (the Datasets API `?format=html` render). CommonMark, matching the cloud's
+# `markdown-it-py`, so a local and a cloud render of the same dataset agree. Raw HTML in the source
+# is ESCAPED rather than passed through and link/image URL schemes are allowlisted — the rendered
+# body is scraped third-party content. See `data_query::md_to_html`.
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+
+# Encoding
+base64 = "0.22"
+byteorder = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Environment
+dotenvy = "0.15"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Config file (YAML)
+serde_yaml = "0.9"
+
+# Directories
+dirs = "5"
+
+# Open URLs in browser
+opener = "0.7"
+
+# Hidden (non-echoing) terminal input for interactive secret prompts (`cli::setup`, `bridge::auth`).
+# Previously these read a plain line, so API keys and tokens landed in terminal scrollback,
+# tmux/`script` logs, screen shares and CI output.
+rpassword = "7"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Concurrent data structures
+dashmap = "5"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+# IANA timezone database for DST-aware structured schedule recurrence (daily/weekly). Optional +
+# gated behind the `local` feature so the cloud `writ-agent` build is byte-unchanged; the local
+# scheduler (src/local/scheduler/recurrence.rs) needs it. Compatible with the pinned chrono 0.4.
+chrono-tz = { version = "0.10", optional = true }
+
+# System info
+sysinfo = "0.30"
+
+# Temp files
+tempfile = "3"
+
+# OpenAI SDK (optional, for direct AI fallback)
+async-openai = { version = "0.23", optional = true }
+
+# --- Local desktop backend (feature = "local"); all optional so the default/cloud build is byte-unchanged ---
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"], optional = true }
+# Pinned to the version sqlx 0.8 resolves so the SQLCipher feature unifies onto sqlx's sqlite driver (spike-verified: cipher_version 4.5.7).
+libsqlite3-sys = { version = "0.30", features = ["bundled-sqlcipher-vendored-openssl"], optional = true }
+chacha20poly1305 = { version = "0.10", optional = true }   # Layer-B field AEAD (XChaCha20-Poly1305)
+age = { version = "0.10", optional = true }                # Layer-C file STREAM
+hkdf = { version = "0.12", optional = true }               # subkey derivation
+argon2 = { version = "0.5", optional = true }              # app-lock passphrase KDF
+keyring = { version = "3", features = ["apple-native"], optional = true } # OS keyring; add windows-native/sync-secret-service in P4 (cross-OS)
+secrecy = { version = "0.8", optional = true }             # in-memory key material
+zeroize = { version = "1", optional = true }
+data-encoding = { version = "2", optional = true }         # base32 for TOTP
+sha1 = { version = "0.10", optional = true }               # HMAC-SHA1 (RFC-6238 default TOTP digest)
+rand = { version = "0.8", optional = true }                # CSPRNG (root key, nonces)
+toml = { version = "0.8", optional = true }                # ~/.writ/config.toml loader/writer (schema_version=1)
+bip39 = { version = "2", optional = true }                 # BIP39 recovery mnemonic (vault root second-wrap)
+ed25519-dalek = { version = "2", optional = true }         # raw EdDSA verify for the auto-update manifest (detached sig over JCS bytes)
+semver = { version = "1", optional = true }                # monotonic version compare for the update downgrade/forward gates
+# Local HTTPS lane (`local::tls`): mkcert-style per-install CA + leaf so MCP/OpenAI clients that
+# REQUIRE an https:// base URL can reach the loopback daemon. ring-only (NO aws-lc-rs → no cmake).
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
+time = { version = "0.3", optional = true }                # rcgen validity windows (not_before/not_after)
+
+[features]
+# `cloud` is a DEFAULT feature so the managed cloud build (`cargo build`) and the
+# managed desktop build (`cargo build --features local`) are behaviourally unchanged.
+# The self-host fleet worker drops it: `cargo build --no-default-features --features local,fleet,openai`.
+# `captcha_solver` enables the automated CAPTCHA solver in the managed cloud build; the open-source
+# build ships the detection-only CAPTCHA path instead.
+# NOTE: `captcha_solver` is deliberately NOT in `default`. `docs/DISCLOSURES.md` tells readers the
+# agent "contains no solver", and that must be true of what a bare `cargo build` produces, not merely
+# of the OSS fleet feature set. The managed cloud build opts in explicitly with
+# `--features captcha_solver`. `step_captcha` already has a detection-only arm for every build
+# without it, so nothing else changes.
+default = ["openai", "cloud"]
+openai = ["dep:async-openai"]
+# Desktop OSS local backend. Off by default → cloud `writ-agent` build is byte-unchanged.
+local = [
+    "dep:sqlx", "dep:libsqlite3-sys", "dep:chacha20poly1305", "dep:age",
+    "dep:hkdf", "dep:argon2", "dep:keyring", "dep:secrecy", "dep:zeroize", "dep:data-encoding", "dep:sha1", "dep:rand",
+    "dep:toml", "dep:bip39", "dep:ed25519-dalek", "dep:semver", "dep:chrono-tz",
+    "dep:rcgen", "dep:rustls", "dep:axum-server", "dep:time",
+]
+# Cloud coupling: gates every cloud-standalone-agent surface (bridge/server/gateway/
+# streaming/api/cli/main + ai::relay) and the desktop cloud-link (local::cloud and the v1
+# cloud/cloud_agent routers). OMITTED from the OSS self-host export. NOTE: the IP-relay node is
+# NOT gated here — it moved to its own `ip_relay` feature (below) so it never compiles by default.
+cloud = []
+# IP relay (residential-proxy egress node) — a desktop cloud-link capability DEFERRED to phase 2.
+# Kept in-tree but OFF in every default build (deliberately not in `default`), so NO shipping binary
+# compiles it: the managed desktop build (`--features local`) and the managed cloud build both leave
+# it out, and the OSS agent mirror strips `src/local/` (where the relay lives) entirely. Implies
+# `local` + `cloud` — the node uses the SQLCipher store and the authenticated CloudClient. Build it
+# in phase 2 with `--features ip_relay` (or `--features local,ip_relay`).
+ip_relay = ["local", "cloud"]
+# Self-host fleet WORKER (the OSS product) — the execution node that connects OUT to the
+# self-host coordinator (the FastAPI app, github.com/usewrit/writ). Cloud-free by
+# construction. Mutually exclusive with `cloud` (enforced by a compile_error in src/lib.rs).
+fleet = []
+# Automated CAPTCHA solver (managed cloud feature). Gates `automation::captcha_solver`; the solver
+# only compiles when this is on AND `local` is off. The open-source build does not ship the solver
+# and falls back to detection-only in `automation::step_captcha`. Do NOT make that detection-only
+# path depend on any solver symbol — it must compile with the solver source absent.
+captcha_solver = []
+# TEST-ONLY: compiles the deterministic auto-update test keypair into the pinned key map so the
+# `tests/update_verify.rs` integration test can verify manifests it signs. NEVER ship this in any
+# release feature set — it is enabled only by that integration test's `required-features`. Depends on
+# `local` (the whole update module is `local`-gated).
+update-test-keys = ["local"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+# Vendored playwright-rs (0.13.0) with a tiny driver-resolution reorder so the
+# runtime PLAYWRIGHT_NODE_EXE/CLI_JS override (writ-agent points these at
+# patchright's STEALTH driver) takes priority over the crate's bundled VANILLA
+# 1.60 driver. Vanilla Playwright calls Runtime.enable → instant anti-bot
+# detection + a console/runtime event flood (huge per-action latency); patchright
+# suppresses both. See vendor/playwright-rs/src/server/driver.rs.
+[patch.crates-io]
+playwright-rs = { path = "vendor/playwright-rs" }
+
+# =============================================================================
+# Lint policy
+# =============================================================================
+# CI runs `cargo clippy --all-targets` and treats warnings as errors, so the levels below are the
+# contract: a warning that survives here is a real finding, not noise. Every `allow` names WHY,
+# because a silent blanket-allow is how a lint gate becomes decoration.
+
+[lints.rust]
+# Deny the rustc lints that catch genuine mistakes. Both build configurations are currently
+# warning-CLEAN, so this costs nothing to enforce and prevents backsliding.
+unsafe_code = "deny"            # There is ZERO `unsafe` in src/. Make that a guarantee, not a habit.
+unused_must_use = "deny"        # Ignoring a `Result` is how errors got swallowed historically.
+# NOT enabling `rust_2018_idioms`: its `elided_lifetimes_in_paths` member flags ~13 pre-existing
+# `Selector`/`Captures` signatures. Adding `<'_>` there is pure churn with no correctness value, and
+# a lint gate is only worth having if every warning in it is worth acting on.
+unexpected_cfgs = { level = "warn", check-cfg = [] }
+
+[lints.clippy]
+# --- Groups we hold ourselves to -------------------------------------------------------------
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+
+# --- Documented exceptions ---------------------------------------------------------------------
+# `await_holding_lock`: every instance is `config::test_env_guard()` — a process-wide
+# `std::sync::Mutex` held across `.await` **in tests on purpose**, to serialize mutation of the
+# `WRIT_HOME` environment variable (which is process-global, so a tokio mutex would not help and
+# dropping the guard early is precisely the bug it prevents). It guards the environment, not data
+# reachable from another task, so it cannot deadlock the runtime.
+await_holding_lock = "allow"
+# Doc-comment list formatting. This crate documents invariants heavily and uses indented
+# continuation lines for readability in source; rustdoc renders them correctly. Reformatting ~50
+# doc blocks to satisfy a style preference would churn the most valuable comments in the tree.
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+# Signature-shape lints. The offenders are engine/replay entry points whose parameters are all
+# genuinely required; bundling them into a struct purely to satisfy a counter would hide the
+# call-site contract rather than clarify it.
+too_many_arguments = "allow"
+type_complexity = "allow"
+# `LocalError` is intentionally a rich enum (it carries HTTP status mapping + operator-facing
+# detail). Boxing every `Err` to shrink the variant would obscure that for no measurable win on
+# these code paths.
+result_large_err = "allow"

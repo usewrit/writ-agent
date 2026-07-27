@@ -1,0 +1,115 @@
+# about.toml — cargo-about configuration for the Writ desktop agent.
+# ===========================================================================
+# Implements PRODUCTION_READINESS.md PROD-4: generate THIRD_PARTY_NOTICES from
+# the LOCKED Rust crate graph. cargo-about (https://github.com/EmbarkStudios/
+# cargo-about) walks Cargo.lock, resolves each crate's SPDX license expression,
+# locates the license TEXT, and renders it through about.hbs into the repo-root
+# THIRD_PARTY_NOTICES.md.
+#
+# This file governs the RUST-CRATE slice ONLY. The bundled Chromium + Node +
+# patchright driver are BINARIES, not crates: cargo-about cannot see them, so
+# their license/NOTICE text is appended MANUALLY to THIRD_PARTY_NOTICES.md from
+# the PKG-3 release manifest (see that file's "Bundled binaries" section). The
+# UI npm license notices are likewise merged in separately (license-checker /
+# cyclonedx) by the release pipeline.
+#
+# Generate (preferred — the assembler wraps the Rust section with the static
+# header/npm/binary sections):
+#   scripts/desktop/gen-third-party-notices.sh
+# Or the Rust section alone (run from playwright-recorder-rs/):
+#   cargo install cargo-about --locked
+#   cargo about generate --offline --all-features about.hbs
+# `--offline` disables the clearlydefined.io harvest so the output is reproducible
+# (depends only on the locked graph + vendored LICENSE files) and fast; it implies
+# --locked. Feature selection is a CLI flag (--all-features), NOT a config key.
+#
+# CI staleness gate (PROD-4): regenerate into a temp file and `diff --exit-code`
+# against the committed THIRD_PARTY_NOTICES.md so attribution can never silently
+# drift as deps change (gen-third-party-notices.sh --check). See SUPPLY_CHAIN.md
+# "Adding a dependency" + the security-supplychain.yml workflow.
+# ===========================================================================
+
+# Run against BOTH build surfaces. Feature selection is passed on the CLI
+# (`cargo about generate --all-features`, as the generate command above does),
+# NOT via config keys — cargo-about 0.6.x has no `all-features`/`no-default-features`
+# config fields (an unknown top-level key is mis-parsed as a per-crate clarify and
+# fails). --all-features pulls in the `local` desktop subtree (SQLCipher / age /
+# argon2 / keyring / chacha20poly1305 / jsonwebtoken) so the at-rest-crypto stack
+# is attributed, not just the default cloud build. This mirrors how cargo-deny is
+# invoked with --all-features (SUPPLY_CHAIN.md).
+
+# Targets we ship for. cargo-about resolves the dep graph per target so a
+# platform-only crate (e.g. windows-sys, security-framework) is attributed only
+# where it is actually pulled in. Launch ships macOS arm64 first (DESKTOP_APP_PLAN
+# §10), with Windows + Linux fanning out after; all are listed so the generated
+# notices cover every shipped artifact.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+# A crate with NO discoverable license is a hard failure — never silently omit
+# attribution. If this trips, either the crate genuinely has no license (remove
+# it) or its text needs a [crate] override below.
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+private = { ignore = true }            # the workspace's own crates are not third-party
+filter-noassertion = true
+
+# ---------------------------------------------------------------------------
+# Accepted SPDX licenses — kept IN SYNC with playwright-recorder-rs/deny.toml
+# [licenses].allow. deny.toml is the enforcement gate (a copyleft transitive dep
+# FAILS CI by omission); this list is what cargo-about will render attribution
+# for. If you add a license here, add it to deny.toml too (and vice-versa) — a
+# drift means CI accepts a license we don't attribute, or attributes one we ban.
+# STRONG copyleft ((A)GPL / SSPL / EUPL / CDDL) is deliberately absent: such a
+# transitive dep must fail and force a human decision (DESKTOP_APP_PLAN §1 D1).
+# ---------------------------------------------------------------------------
+accepted = [
+    # NOTE: our OWN first-party crate's AGPL license is NOT in this GLOBAL list —
+    # it is scoped to the `[writ-agent]` per-crate override below, so a THIRD-PARTY
+    # (A)GPL dependency is still absent here and would fail generation, forcing a
+    # human decision (DESKTOP_APP_PLAN §1 D1). This mirrors deny.toml's intent.
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",   # ring / rustls toolchain crates
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",                      # unicode-ident (newer SPDX id)
+    "Unicode-DFS-2016",                 # unicode-ident (older crates)
+    "CC0-1.0",                          # public-domain-equivalent (tiny-keccak, notify)
+    "MIT-0",
+    "BSL-1.0",                          # Boost Software License (NOT Business Source)
+    "OpenSSL",                          # bundled OpenSSL via libsqlite3-sys vendored build
+    "MPL-2.0",                          # file-level copyleft, reviewed+accepted (deny.toml)
+    "CDLA-Permissive-2.0",              # Mozilla CA-root DATA bundle via webpki-roots
+    "bzip2-1.0.6",                      # upstream bzip2/libbzip2 v1.0.6, permissive BSD-style
+]
+
+# The project's OWN license is AGPL-3.0-only (declared in Cargo.toml; OSS-license
+# decision D1 is locked to AGPL, see LICENSE at the crate root). cargo-about 0.6.x
+# still evaluates the root workspace crate's own license expression even with
+# `private = { ignore = true }` (private only removes it from the OUTPUT), so its
+# AGPL license must be ACCEPTED for generation to succeed — but scoped to just our
+# crate so the third-party allow list above stays copyleft-free.
+#
+# The bundled `spdx` crate in cargo-about 0.6.x accepts the deprecated bare
+# `AGPL-3.0` id but REJECTS the newer `AGPL-3.0-only` / `AGPL-3.0-or-later` forms
+# in a per-crate `accepted` entry ("not a valid SPDX licensee"). We therefore use
+# `AGPL-3.0` here; it resolves the SAME license family as deny.toml's
+# `AGPL-3.0-only` for our own crate only. (deny.toml, a different tool with a newer
+# spdx crate, keeps `AGPL-3.0-only`.)
+[writ-agent]
+accepted = ["AGPL-3.0"]
+
+# Example crate-level license clarification (use ONLY when a crate's license TEXT
+# cannot be auto-located — keep empty unless a generation run reports a gap):
+# [some-crate]
+# accepted = ["MIT"]

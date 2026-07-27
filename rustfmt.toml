@@ -1,0 +1,9 @@
+# Match the width this codebase was actually written at (p95 line length is ~101 chars), so a
+# contributor's editor-on-save does not reformat unrelated lines into a huge diff.
+#
+# Formatting is deliberately NOT a CI gate: the tree predates any rustfmt config, so `cargo fmt`
+# would rewrite ~14k lines and bury real changes in churn. `cargo clippy -D warnings` IS gated, and
+# it catches the things that matter. If you want to normalize formatting, do it as one isolated
+# commit that touches nothing else — not as a drive-by inside a functional change.
+max_width = 100
+use_small_heuristics = "Max"

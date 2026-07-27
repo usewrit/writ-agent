@@ -1,0 +1,184 @@
+name: Release
+
+# Publishes what the README promises: fleet-worker binaries on the Releases page and
+# ghcr.io/usewrit/writ-agent. Before this existed, both links were dead on arrival.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v1.0.0). Creates a draft release.'
+        required: true
+
+permissions:
+  contents: write   # create the release + upload assets
+  packages: write   # push to ghcr
+
+env:
+  CARGO_TERM_COLOR: always
+  OSS_FEATURES: --no-default-features --features local,fleet,openai
+
+jobs:
+  binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  name: writ-agent-fleet-linux-x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: writ-agent-fleet-linux-aarch64 }
+          - { os: macos-latest,   target: aarch64-apple-darwin,      name: writ-agent-fleet-macos-arm64 }
+          - { os: macos-13,       target: x86_64-apple-darwin,       name: writ-agent-fleet-macos-x86_64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    name: writ-agent-fleet-windows-x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache Playwright driver
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/playwright-rs-driver
+          key: pw-driver-${{ runner.os }}-${{ hashFiles('vendor/playwright-rs/build.rs') }}
+
+      - name: Build
+        run: cargo build --release --locked ${{ env.OSS_FEATURES }} --bin writ-agent-fleet --target ${{ matrix.target }}
+
+      # A BARE BINARY IS NOT A SHIPPABLE ARTIFACT HERE.
+      #
+      # `vendor/playwright-rs`'s build.rs bakes an absolute path to the Playwright driver into the
+      # binary — this runner's `target/…/out` or `~/.cache/playwright-rs-driver/…`. Neither exists
+      # on the machine that downloads the release, so a bare binary starts, connects to the
+      # coordinator and reports healthy, then fails EVERY run at browser launch with
+      # `ServerNotFound`. So ship the driver with it: the archive unpacks to a directory holding the
+      # binary and a `playwright-driver/` beside it, which `browser::install::find_sibling_driver`
+      # resolves with no configuration from the operator.
+      - name: Stage artifact (+ SHA-256)
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="stage/${{ matrix.name }}"
+          mkdir -p "$stage" dist
+
+          src="target/${{ matrix.target }}/release/writ-agent-fleet"
+          if [ -f "$src.exe" ]; then cp "$src.exe" "$stage/writ-agent-fleet.exe"; else cp "$src" "$stage/writ-agent-fleet"; fi
+
+          # build.rs either extracts into this build's OUT_DIR or reuses the machine cache that the
+          # `Cache Playwright driver` step above restores. Look in both; a miss is fatal, never a
+          # silently driver-less archive.
+          cli_js="$(find "target/${{ matrix.target }}/release/build" "$HOME/.cache/playwright-rs-driver" \
+                        -type f -path '*/package/cli.js' 2>/dev/null | head -n1 || true)"
+          if [ -z "$cli_js" ]; then echo "FATAL: no Playwright driver produced by build.rs" >&2; exit 1; fi
+          driver_dir="$(dirname "$(dirname "$cli_js")")"
+          cp -R "$driver_dir" "$stage/playwright-driver"
+          # `node` must survive as an executable or the archive is useless.
+          if [ ! -f "$stage/playwright-driver/node.exe" ]; then chmod +x "$stage/playwright-driver/node"; fi
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            asset="${{ matrix.name }}.zip"
+            (cd stage && 7z a -tzip "../dist/$asset" "${{ matrix.name }}" >/dev/null)
+          else
+            asset="${{ matrix.name }}.tar.gz"
+            tar -C stage -czf "dist/$asset" "${{ matrix.name }}"
+          fi
+
+          # Publish a checksum next to every archive so operators can verify what they downloaded.
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  image:
+    name: ghcr image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/usewrit/writ-agent
+          # Derive every tag from the SAME ref the checkout used. Without the explicit `value=`,
+          # `type=semver` reads `github.ref`, which on a `workflow_dispatch` is the BRANCH — so a
+          # manual run produced no version tags at all and (via `is_default_branch`) pushed a bare
+          # `latest` pointing at an untagged build, while the GitHub release beside it was still a
+          # recoverable draft. `latest=false` turns off the implicit flavor so the one rule below
+          # is the only thing that can publish `latest`, and it skips prereleases (`v1.1.0-rc.1`).
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ inputs.tag || github.ref_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag || github.ref_name }}
+            type=raw,value=latest,enable=${{ !contains(inputs.tag || github.ref_name, '-') }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Chromium is installed at build time per-arch, so both arches are built natively-ish.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: GitHub Release
+    needs: [binaries, image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          # A manual dispatch produces a DRAFT so a mis-tag is recoverable; a real tag push publishes.
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            Self-host fleet worker for `writ-agent-fleet`.
+
+            Each archive unpacks to a directory containing the binary and the Playwright driver it
+            needs (`playwright-driver/`) — keep them together, the worker finds the driver beside
+            itself. Chromium installs itself on first browser use.
+
+            ```sh
+            tar -xzf writ-agent-fleet-linux-x86_64.tar.gz
+            cd writ-agent-fleet-linux-x86_64
+            WRIT_SERVICE_TOKEN=… WRIT_COORDINATOR_URL=https://… ./writ-agent-fleet
+            ```
+
+            Verify a download against its `.sha256` before running it. Container image:
+            `ghcr.io/usewrit/writ-agent:${{ inputs.tag || github.ref_name }}`.
+
+            See [CHANGELOG.md](./CHANGELOG.md) for what changed, and the
+            [coordinator](https://github.com/usewrit/writ) for the control plane this connects to.

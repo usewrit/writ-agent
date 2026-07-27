@@ -1,0 +1,11 @@
+pub mod manager;
+pub mod context;
+pub mod stealth;
+pub mod page_actions;
+pub mod page_query;
+pub mod screenshot;
+pub mod navigation;
+pub mod captcha;
+pub mod tabs;
+pub mod install;
+pub mod chrome_profile;

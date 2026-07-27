@@ -1,0 +1,229 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref — a force-push shouldn't leave a stale red/green.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings in CI. The OSS fleet build is warning-clean; keep it that way.
+  RUSTFLAGS: -D warnings
+  # The OSS self-host fleet-worker feature set (see README "Feature flags"). This is the build
+  # actual users run, so it is the one every job below exercises first.
+  OSS_FEATURES: --no-default-features --features local,fleet,openai
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The build users actually run.
+  # ---------------------------------------------------------------------------
+  fleet:
+    name: Fleet worker (build + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The Playwright driver is fetched by vendor/playwright-rs/build.rs and cached OUTSIDE
+      # target/, so cache it explicitly — otherwise every cold run re-downloads ~45 MB.
+      - name: Cache Playwright driver
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/playwright-rs-driver
+          key: pw-driver-${{ runner.os }}-${{ hashFiles('vendor/playwright-rs/build.rs') }}
+      # `--locked` everywhere: a lockfile that does not match Cargo.toml is a CI failure, not a
+      # silent update. Without it, drift is invisible until a release build behaves differently.
+      - name: cargo build (release binary — the shippable artifact)
+        run: cargo build --release --locked ${{ env.OSS_FEATURES }} --bin writ-agent-fleet
+      - name: cargo test
+        run: cargo test --locked ${{ env.OSS_FEATURES }}
+      - name: cargo test (auto-update signature verification)
+        run: cargo test --locked --features local,update-test-keys --test update_verify
+
+  # ---------------------------------------------------------------------------
+  # The DESKTOP configuration. `README.md` ships `writ-agentd` and `writ` as two of the four
+  # binaries, and their documented build (`--no-default-features --features local,openai`) is a
+  # THIRD feature combination that neither of the other jobs type-checks: it has the local engine
+  # without `fleet` and without `cloud`, so cfg-gated code reachable only in that shape is otherwise
+  # never compiled. A binary we document has to be a binary we build.
+  # ---------------------------------------------------------------------------
+  desktop-build:
+    name: Desktop daemon + CLI (local only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache Playwright driver
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/playwright-rs-driver
+          key: pw-driver-${{ runner.os }}-${{ hashFiles('vendor/playwright-rs/build.rs') }}
+      - name: cargo check (desktop feature set)
+        run: cargo check --locked --no-default-features --features local,openai --all-targets
+      - name: build both desktop binaries
+        run: |
+          cargo build --release --locked --no-default-features --features local,openai \
+            --bin writ-agentd --bin writ
+      - name: cargo test (desktop feature set)
+        run: cargo test --locked --no-default-features --features local,openai --lib
+
+  # ---------------------------------------------------------------------------
+  # The build a visitor gets from a bare `cargo build`. It must also be clean —
+  # this configuration was previously unchecked and carried 17 warnings.
+  # ---------------------------------------------------------------------------
+  default-build:
+    name: Default build (managed cloud)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache Playwright driver
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/playwright-rs-driver
+          key: pw-driver-${{ runner.os }}-${{ hashFiles('vendor/playwright-rs/build.rs') }}
+      - run: cargo check --locked --all-targets
+      - name: cargo test (lib)
+        run: cargo test --locked --lib
+
+  # NOTE: there is deliberately NO `cargo fmt --check` gate. This tree predates any rustfmt config,
+  # so `cargo fmt` rewrites ~14k lines — a gate that fails on day one, and a reformat that would bury
+  # real changes in churn. `rustfmt.toml` pins the width the code was written at so editors behave;
+  # clippy below is the gate that catches things that matter. Both feature configurations are
+  # currently clippy-clean, so this is enforceable rather than aspirational.
+  clippy:
+    name: Clippy (both feature configurations)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache Playwright driver
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/playwright-rs-driver
+          key: pw-driver-${{ runner.os }}-${{ hashFiles('vendor/playwright-rs/build.rs') }}
+      - name: clippy (OSS fleet worker)
+        run: cargo clippy --locked ${{ env.OSS_FEATURES }} --all-targets
+      # The default/cloud configuration compiles a different half of the crate (saas_bridge, the
+      # gateway, the cloud API) that the OSS feature set never type-checks. Lint it too.
+      - name: clippy (default / managed cloud)
+        run: cargo clippy --locked --all-targets
+
+  # ---------------------------------------------------------------------------
+  # Cross-platform: detect_platform() claims macOS and Windows support, so prove it.
+  # ---------------------------------------------------------------------------
+  cross:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache Playwright driver
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/playwright-rs-driver
+          key: pw-driver-${{ runner.os }}-${{ hashFiles('vendor/playwright-rs/build.rs') }}
+      - run: cargo check --locked ${{ env.OSS_FEATURES }}
+
+  msrv:
+    name: MSRV (${{ steps.msrv.outputs.version || 'from Cargo.toml' }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache Playwright driver
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/playwright-rs-driver
+          key: pw-driver-${{ runner.os }}-${{ hashFiles('vendor/playwright-rs/build.rs') }}
+      # The declared MSRV must be real. If this fails, RAISE `rust-version` in Cargo.toml —
+      # do not delete this job.
+      - run: cargo check --locked ${{ env.OSS_FEATURES }}
+
+  # ---------------------------------------------------------------------------
+  # The primary documented install path. It was never exercised, and was broken.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: docker build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: writ-agent:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # Prove the binary actually starts in the runtime stage — this is what catches a
+      # builder/runtime glibc mismatch, which a successful `docker build` alone does not.
+      - name: Smoke test the image
+        run: docker run --rm --entrypoint /app/writ-agent-fleet writ-agent:ci --help
+
+      # `--help` deliberately touches nothing, so it cannot see a missing browser driver. The
+      # driver's compile-time path points into the BUILDER stage; if the copy into the runtime
+      # stage is ever dropped, the image still builds, still starts, still reports healthy — and
+      # fails every single run at browser launch. Assert the layout `find_sibling_driver` expects.
+      - name: The Playwright driver survived into the runtime stage
+        run: |
+          docker run --rm --entrypoint sh writ-agent:ci -c '
+            set -e
+            test -x /app/playwright-driver/node
+            test -f /app/playwright-driver/package/cli.js
+            /app/playwright-driver/node --version
+          '
+
+  # ---------------------------------------------------------------------------
+  # Attribution must never silently drift (AGPL §4/§5 obligation).
+  # ---------------------------------------------------------------------------
+  notices:
+    name: THIRD_PARTY_NOTICES is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked
+      - name: Regenerate and diff
+        run: |
+          cargo about generate --offline --all-features about.hbs > /tmp/notices.md
+          if ! diff -u THIRD_PARTY_NOTICES.md /tmp/notices.md; then
+            echo "::error::THIRD_PARTY_NOTICES.md is stale. Regenerate with:"
+            echo "::error::  cargo about generate --offline --all-features about.hbs > THIRD_PARTY_NOTICES.md"
+            exit 1
+          fi

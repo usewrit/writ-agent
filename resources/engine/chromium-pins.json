@@ -1,0 +1,13 @@
+{
+  "_comment": "Compiled-in SHA-256 integrity pins for the Chromium that POST /v1/runtime/install-chromium downloads. Keyed by the patchright/playwright Chromium REVISION (the NNNN in the `chromium-NNNN` cache dir, e.g. chromium-1148) -> platform-key -> lowercase-hex SHA-256 of the LAUNCHABLE browser executable (the exact per-OS binary chromium_exe_candidates() resolves). runtime_setup::verify_downloaded_chromium() consults this table after an install succeeds and BEFORE InstallState::Done; a mismatch OR a missing pin fails closed (InstallState::Error, refuse to proceed). Platform keys mirror the AUTO_UPDATE.md artifact keys: macos-aarch64, macos-x86_64, windows-x86_64, linux-x86_64.",
+  "_schema": "revision -> { platform-key -> sha256-hex }",
+  "_TODO": "PLACEHOLDER HASHES — replace every 64-zero sha256 below with the REAL SHA-256 of the launchable Chromium binary for the shipped chromium revision, per platform, then add a new top-level revision block on each Chromium bump (see RELEASE_CHECKLIST.md / chromium_revision in the update manifest). Compute with: shasum -a 256 <path-to-launchable-binary>. Until a revision has a real (non-placeholder) pin for the running platform, verify_downloaded_chromium() will FAIL CLOSED and the install will not complete.",
+  "pins": {
+    "1148": {
+      "macos-aarch64": "0000000000000000000000000000000000000000000000000000000000000000",
+      "macos-x86_64": "0000000000000000000000000000000000000000000000000000000000000000",
+      "windows-x86_64": "0000000000000000000000000000000000000000000000000000000000000000",
+      "linux-x86_64": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+}

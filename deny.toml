@@ -1,0 +1,220 @@
+# cargo-deny configuration for the `writ-agent` crate (Writ desktop OSS + cloud).
+# ---------------------------------------------------------------------------
+# This is the SUPPLY-CHAIN TEETH that PRODUCTION_READINESS.md PROD-2 requires,
+# layered ON TOP OF FOUND-8's plain `cargo audit` (advisory-only). cargo-deny
+# enforces FOUR independent checks against the committed Cargo.lock:
+#
+#   [advisories]  RUSTSEC vulnerabilities -> DENY; unmaintained -> WARN.
+#   [licenses]    permissive OSI allowlist; copyleft is NOT listed -> the
+#                 build FAILS so a human reviews it (see policy below).
+#   [bans]        duplicate + yanked crates flagged; explicit deny-list slot.
+#   [sources]     only crates.io + the vendored playwright-rs path; arbitrary
+#                 git/registry sources are blocked.
+#
+# RUN LOCALLY:   cd playwright-recorder-rs && cargo deny check
+# RUN ONE CHECK: cargo deny check licenses        (or: advisories | bans | sources)
+# CI: see .github/workflows/security-supplychain.yml (scheduled + PR, required gate).
+#
+# This config is checked against BOTH the default (cloud `writ-agent`) build and
+# the `--features local` (desktop `writ-agentd`) build. The `local` feature pulls
+# in the SQLCipher stack (libsqlite3-sys bundled-sqlcipher-vendored-openssl),
+# age, argon2, keyring, etc. — cargo-deny resolves over the whole lockfile, so
+# both surfaces are covered as long as the lockfile contains the local deps.
+# To force the local-only crates into scope for the dep-graph traversal, CI runs
+# `cargo deny --all-features check`.
+#
+# EXCEPTION POLICY (mirrors PROD-2 "documented, reviewer-required process"):
+#   Any allowlist entry (an ignored advisory, an allowed copyleft license, a
+#   skipped duplicate) MUST carry an inline comment with:
+#     (1) the RUSTSEC id / license / crate, (2) WHY it is safe / unavoidable,
+#     (3) a reviewer/owner, (4) an EXPIRY date (YYYY-MM-DD) to force re-review.
+#   Entries with no expiry are not allowed. An expired entry should fail review.
+# ---------------------------------------------------------------------------
+
+# This file targets the MODERN cargo-deny schema (the 2.0.x action / cargo-deny
+# 0.16+): there is no `version` key under [advisories]/[licenses] and no
+# `[licenses].deny` list — those were removed and now emit errors. All
+# vulnerability advisories error by default; licenses are deny-by-omission.
+[graph]
+# Evaluate the dependency graph for the host triples we actually ship. Limiting
+# targets keeps platform-specific transitive deps (e.g. windows-* / apple
+# security-framework) from producing spurious duplicate/license noise on the
+# triples where they are not even compiled.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "aarch64-pc-windows-msvc" },
+]
+# Include dev-dependencies in the graph so test-only crates are also vetted.
+all-features = true
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ===========================================================================
+# (a) ADVISORIES — RUSTSEC. Vulnerabilities are HARD-DENIED; unmaintained
+#     crates WARN (so an upstream going dormant is visible without blocking a
+#     release on something with no fix yet). This is the advisory hardening
+#     FOUND-8's plain `cargo audit` lacks (audit cannot enforce licenses/bans/
+#     sources, and treats everything as the same severity bucket).
+# ===========================================================================
+[advisories]
+# RUSTSEC advisory DB (default: GitHub mirror). Pinned to the canonical source.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# NOTE: modern cargo-deny REMOVED the `[advisories].version` key and the
+# `vulnerability`/`unmaintained="deny"` style severity knobs — ALL vulnerability
+# advisories now emit ERRORS unconditionally (that IS the fail-on-vuln behavior
+# PROD-2 wants), and you tune only the non-vuln advisory classes below. So there
+# is intentionally no `version`/`vulnerability` line here.
+#
+# unmaintained crates -> "workspace": only warn (error) about unmaintained
+# crates that are FIRST-PARTY / path deps, not every dormant transitive (which
+# is noisy and rarely actionable). Valid values: all | workspace | transitive |
+# none. We triage unmaintained transitives via the SUPPLY_CHAIN.md cadence.
+unmaintained = "workspace"
+# yanked -> "deny": a yanked crate in the committed lockfile is a real integrity
+# problem (the author pulled it for a reason) -> fail. (default is "warn".)
+yanked = "deny"
+# Time-boxed, reviewer-justified advisory exceptions go here. EMPTY at launch
+# (the pinned lockfile IS the fix). Each entry MUST be `{ id, reason }` with an
+# expiry baked into the reason, e.g.:
+#   { id = "RUSTSEC-2024-XXXX", reason = "no upstream fix; not reachable from our
+#     code path; owner=@writ-maintainers; EXPIRES 2026-09-30 — re-review then" }
+ignore = []
+
+# ===========================================================================
+# (b) LICENSES — allowlist the common PERMISSIVE set that an OSS-bundling core
+#     can safely redistribute. The project's OWN license (BSL / Sustainable-Use
+#     per DESKTOP_APP_PLAN §1 D1, or AGPL if that is chosen instead) is NOT a
+#     dependency, so it does not appear here; this list governs only what we
+#     PULL IN.
+#
+#     COPYLEFT IS DELIBERATELY ABSENT. A (L)GPL/MPL/EUPL transitive dep will
+#     FAIL the build and require a human to (i) remove/replace the dep, or
+#     (ii) add it here with a reviewer-approved, expiry-dated comment after
+#     confirming it is compatible with the chosen distribution license. This is
+#     the PROD-2 requirement "a copyleft transitive dep fails the build" and the
+#     §1-D1 reconciliation hook.
+# ===========================================================================
+[licenses]
+# NOTE: modern cargo-deny REMOVED the `[licenses].version` key AND the
+# `[licenses].deny` list — under the current schema EVERY license is denied
+# UNLESS it is in `allow` below. That is exactly the "deny copyleft by omission"
+# policy PROD-2 wants, so there is intentionally no `version`/`deny` line here.
+#
+# unused-allowed-license: an entry in `allow` that no crate actually uses ->
+# "allow" (don't warn). We keep the permissive set broad on purpose so a future
+# dep that brings, say, Zlib doesn't suddenly fail; unused entries are harmless.
+unused-allowed-license = "allow"
+# SPDX confidence threshold for license-file text matching (askalono; default 0.8).
+confidence-threshold = 0.8
+# The crate's OWN package (`writ-agent`) declares `license = "AGPL-3.0-only"` in
+# Cargo.toml (OSS-license decision D1 is locked to AGPL). `AGPL-3.0-only` is listed
+# in `allow` below SOLELY so our own first-party crate passes — it does NOT relax
+# the copyleft policy for third-party deps: a transitive (A)GPL DEPENDENCY is a
+# distinct concern that cargo-deny will still surface here for human review.
+# --- The permissive allowlist (SPDX identifiers) ---
+allow = [
+    "AGPL-3.0-only",  # OUR OWN crate's license (writ-agent); D1 locked to AGPL. Not a license we PULL IN.
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",   # ring / rustls toolchain crates
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",                      # unicode-ident (newer SPDX id)
+    "Unicode-DFS-2016",                 # unicode-ident (older crates)
+    "CC0-1.0",                          # public-domain-equivalent (e.g. tiny-keccak, notify)
+    "MIT-0",
+    "BSL-1.0",                          # Boost Software License (NOT the Business Source License)
+    "OpenSSL",                          # bundled OpenSSL via libsqlite3-sys vendored build
+    # --- Weak / file-level copyleft + data licenses: REVIEWED + accepted ---
+    # MPL-2.0 is FILE-LEVEL copyleft: obligations attach only to the licensed crate's OWN source,
+    # which we redistribute UNMODIFIED — no copyleft reaches our code. Present via: fernet (already
+    # a shipping cloud dep), cssparser / cssparser-macros / dtoa-short / selectors (scraper tree),
+    # option-ext (dirs tree). owner=@writ-maintainers; EXPIRES 2026-12-31 — re-confirm if any is forked/modified.
+    "MPL-2.0",
+    # webpki-roots ships Mozilla's CA bundle as DATA (not code) under CDLA-Permissive-2.0 — a
+    # permissive data license. owner=@writ-maintainers; EXPIRES 2026-12-31.
+    "CDLA-Permissive-2.0",
+    # libbz2-rs-sys carries the upstream bzip2/libbzip2 v1.0.6 license (permissive BSD-style).
+    # Present via bzip2 -> zip. owner=@writ-maintainers; EXPIRES 2026-12-31.
+    "bzip2-1.0.6",
+]
+# Per-crate license clarifications.
+# (Our own crate no longer needs a clarify: `writ-agent` now carries a real
+# `license = "AGPL-3.0-only"` SPDX field in Cargo.toml, allowed above.)
+# The `ring` crate famously has a non-SPDX composite license; clarify it so it
+# does not trip the confidence check.
+[[licenses.clarify]]
+crate = "ring"
+# ring's license is a mix of permissive terms (ISC/MIT/OpenSSL-style); upstream
+# ships a LICENSE file rather than an SPDX expression. Treat as ISC-equivalent
+# permissive. owner=@writ-maintainers; EXPIRES 2026-12-31 — re-confirm if ring is bumped.
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# STRONG copyleft families in a THIRD-PARTY DEPENDENCY remain DENIED-BY-OMISSION
+# (not in `allow` above). Listed here as intent so a future editor does not
+# "helpfully" add them without the review gate. (Our own crate is AGPL-3.0-only,
+# allowed above; that is a separate matter from pulling in a copyleft dep.)
+#   GPL-2.0 / GPL-3.0 / AGPL-3.0 — strong copyleft; a dep under these needs review.
+#   LGPL-2.1 / LGPL-3.0         — weak copyleft; dynamic-link nuance, review.
+#   EUPL-1.2 / SSPL-1.0 / CDDL  — review case-by-case.
+# (MPL-2.0 / CDLA-Permissive-2.0 / bzip2-1.0.6 are REVIEWED + accepted in `allow` above.)
+
+# ===========================================================================
+# (c) BANS — duplicate versions and a deny-list slot for known-bad crates.
+#     Duplicates bloat the binary + widen the attack surface; for a SHIPPED
+#     desktop binary that matters. We WARN (not deny) on duplicates because the
+#     transitive graph legitimately carries a few (e.g. two `windows-sys`
+#     majors); escalate to "deny" once the tree is deduped.
+# ===========================================================================
+[bans]
+multiple-versions = "warn"     # tighten to "deny" after a dedup pass (PROD-2)
+wildcards = "deny"             # forbid `*` version requirements (non-reproducible)
+# Path-based wildcards (workspace-internal) are fine; only registry `*` reqs are the hazard.
+allow-wildcard-paths = true
+# Prefer the lowest dup count; highlight where a dup is introduced.
+highlight = "all"
+# Crates we never want, regardless of version. Empty at launch; populate with
+# e.g. unmaintained-and-superseded crates. Each entry MUST carry a reason.
+deny = [
+    # { crate = "openssl-sys", reason = "we vendor OpenSSL via libsqlite3-sys; a
+    #   second system-openssl link is a footgun. owner=@writ-maintainers; EXPIRES 2026-12-31" },
+]
+# Crates allowed to appear multiple times (skip the duplicate check for them),
+# with a reason + expiry. Empty at launch.
+skip = []
+# Skip entire sub-trees from the duplicate check (e.g. a build-only tool).
+skip-tree = []
+
+# ===========================================================================
+# (d) SOURCES — only crates.io and the ONE vendored path (playwright-rs fork)
+#     are permitted. Arbitrary git deps are a supply-chain hole (a tag/branch
+#     can be re-pointed at malicious code) and are DENIED. The vendored fork is
+#     a `[patch.crates-io] path = "vendor/playwright-rs"` in Cargo.toml, which
+#     resolves to a LOCAL PATH source — path sources are inherently in-repo and
+#     are allowed by `allow-org`/by being part of the workspace, NOT via git.
+# ===========================================================================
+[sources]
+unknown-registry = "deny"      # any registry other than crates.io -> fail
+unknown-git = "deny"           # any git source -> fail (forces vendoring instead)
+# The only registry we trust.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# No git sources are allowed at all. If a fork MUST be used, VENDOR it under
+# vendor/ and reference it via `[patch.crates-io] path = ...` (as playwright-rs
+# is), which is a path source and does not need a git allowlist entry.
+allow-git = []
+
+[sources.allow-org]
+# No org-wide git allowlists. (Vendoring is the policy.)
+github = []
+gitlab = []
+bitbucket = []

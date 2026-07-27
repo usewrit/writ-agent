@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "kind": "http",
+  "http": true,
+  "probe": {
+    "request": { "method": "GET", "url": "https://site.example/api/me" },
+    "expect": { "status": [200] }
+  },
+  "login": {
+    "steps": [
+      {
+        "id": "csrf_prefetch",
+        "request": { "method": "GET", "url": "https://site.example/login" },
+        "extract": {
+          "csrf": { "from": "html_css", "selector": "input[name=_csrf]", "attribute": "value" }
+        },
+        "expect": { "status": [200] }
+      },
+      {
+        "id": "credentials",
+        "request": {
+          "method": "POST",
+          "url": "https://site.example/api/login",
+          "headers": { "Content-Type": "application/x-www-form-urlencoded" },
+          "body": "username={{secret:username}}&password={{secret:password}}&_csrf={{extracted:csrf}}"
+        },
+        "extract": {
+          "access": {
+            "from": "json",
+            "path": "$.token",
+            "store": { "as": "header", "header": "Authorization", "prefix": "Bearer " }
+          }
+        },
+        "expect": { "status": [200, 302], "not_url_patterns": ["/login"] },
+        "challenges": [
+          {
+            "type": "totp",
+            "detect": { "status": [401], "body_regex": "two.?factor|totp|verification code" },
+            "submit": {
+              "method": "POST",
+              "url": "https://site.example/api/login/2fa",
+              "headers": { "Content-Type": "application/json" },
+              "body": "{\"code\":\"{{challenge:code}}\"}"
+            },
+            "expect": { "status": [200] },
+            "max_wait_seconds": 60
+          }
+        ]
+      }
+    ],
+    "tokens": {
+      "access": { "header": "Authorization", "prefix": "Bearer ", "value": "{{extracted:access}}" }
+    }
+  },
+  "refresh": {
+    "request": {
+      "method": "POST",
+      "url": "https://site.example/oauth/token",
+      "headers": { "Content-Type": "application/json" },
+      "body": "{\"refresh_token\":\"{{token:refresh_token}}\"}"
+    },
+    "extract": {
+      "access": {
+        "from": "json",
+        "path": "$.access_token",
+        "store": { "as": "header", "header": "Authorization", "prefix": "Bearer " }
+      }
+    },
+    "expect": { "status": [200] }
+  },
+  "stale": {
+    "status": [401, 403],
+    "url_patterns": ["/login", "/signin"],
+    "html_when_json_expected": true
+  }
+}

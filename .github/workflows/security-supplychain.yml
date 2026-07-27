@@ -1,0 +1,29 @@
+# Supply-chain gate referenced by deny.toml: cargo-deny (advisories, licenses,
+# bans, sources) against the committed Cargo.lock, on every PR and on a weekly
+# schedule so newly published RUSTSEC advisories are caught between releases.
+name: Security / supply chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, Monday 06:00 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    name: cargo-deny check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # deny.toml targets the modern (cargo-deny 0.16+ / action 2.x) schema.
+      # --all-features forces the local-only crates (SQLCipher stack, age,
+      # argon2, keyring, ...) into the dependency-graph traversal so both the
+      # cloud and local/fleet surfaces are covered by one run.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --all-features
+          command: check

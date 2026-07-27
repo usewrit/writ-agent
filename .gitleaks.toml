@@ -1,0 +1,80 @@
+# ---------------------------------------------------------------------------
+# gitleaks configuration
+# ---------------------------------------------------------------------------
+# The publish pipeline (`scripts/publish-agent.sh` in the upstream monorepo) and
+# CI run `gitleaks detect --no-git` over this tree and FAIL CLOSED on any
+# finding. That is the behaviour we want: a scanner that can be quietly ignored
+# is not a gate.
+#
+# The consequence is that this crate's *negative* tests — the ones that prove
+# the redaction layer, the prompt builder and the signature verifier actually
+# refuse to leak — must feed those components realistic-looking secrets. Every
+# entry below is one of those fixtures.
+#
+# EXCEPTION POLICY (same as `deny.toml` and `.cargo/audit.toml`): each entry
+# states (1) exactly what it exempts, (2) why the value is not a real secret,
+# (3) what would break if we removed it. Entries are pinned to a single file
+# and a single literal wherever possible — never a blanket path exclusion — so
+# a *real* secret landing in one of these files is still caught.
+# ---------------------------------------------------------------------------
+
+title = "writ-agent"
+
+[extend]
+useDefault = true
+
+# --- Fake credentials fed to the prompt/redaction tests -------------------
+#
+# `src/automation/network_capture.rs` builds the network summary that is shown
+# to an AI model. Its tests assert that a bearer token the agent does NOT hold
+# is redacted, and that one it DOES hold is replaced by a `{{placeholder}}`.
+# Both require a token-shaped literal. Removing these entries does not remove
+# a secret — it removes the test that proves tokens never reach the model.
+[[allowlists]]
+description = "network_capture.rs — synthetic bearer/API-key fixtures in the redaction tests"
+targetRules = ["generic-api-key"]
+paths = ['''src/automation/network_capture\.rs$''']
+regexes = [
+    '''ps_x3y0yik38tzEgEG_NvsZrPUNrRqwESK3gkthQ50h5mM''',
+    '''abc123def456ghi789''',
+]
+
+# `src/util/logging.rs` is the log redaction layer. This fixture is a
+# deliberately malformed, non-resolvable Google-API-key lookalike used to
+# assert that `?key=` query values are masked before a line is written.
+[[allowlists]]
+description = "logging.rs — fake Google API key in the log-redaction test"
+targetRules = ["generic-api-key"]
+paths = ['''src/util/logging\.rs$''']
+regexes = ['''AIzaSyLEAKED12345''']
+
+# `src/local/api/v1/personas.rs` creates a persona over the real HTTP handler
+# to assert the plaintext password is sealed into the vault and never returned
+# on read-back. The literal is the canonical joke password.
+[[allowlists]]
+description = "personas.rs — 'hunter2-PLAIN' fixture password in the vault round-trip test"
+targetRules = ["generic-api-key"]
+paths = ['''src/local/api/v1/personas\.rs$''']
+regexes = ['''hunter2-PLAIN''']
+
+# --- Published-on-purpose test signing keys --------------------------------
+#
+# `src/local/cloud/entitlements.rs` verifies entitlement documents against a
+# `kid`-pinned table. `PINNED_KEYS` ships EMPTY and the verifier fails closed,
+# so no shipped build trusts anything. Its tests need to mint documents, so the
+# test module carries two Ed25519 private keys: one whose public half is the
+# `writ-ent-test-2026` entry in `TEST_PINNED_KEYS`, and one that is not pinned
+# at all (used to forge a wrong-signature token the verifier must reject).
+#
+# `TEST_PINNED_KEYS` is compiled only under `cfg(test)` or the
+# `update-test-keys` feature, which is absent from `default` and from every
+# release feature set — so these keys grant nothing anywhere a user runs the
+# software. They are published deliberately; that is the point of a test key.
+[[allowlists]]
+description = "entitlements.rs — deliberately published Ed25519 test signing keys (never trusted by a shipped build)"
+targetRules = ["private-key"]
+paths = ['''src/local/cloud/entitlements\.rs$''']
+regexes = [
+    '''MC4CAQAwBQYDK2VwBCIEIBMEPOENF9Y3zw6g6zdoVAOl5Q038xOdz7ehDN5rOc7r''',
+    '''MC4CAQAwBQYDK2VwBCIEIFX1E58aiUvuNvrj37al8UfjJxaQw\+\+dYUKSyZnOPzx8''',
+]

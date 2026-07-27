@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# cargo-audit configuration
+# ---------------------------------------------------------------------------
+# The enforced supply-chain gate for this crate is `cargo deny check`
+# (see `deny.toml` and `.github/workflows/security-supplychain.yml`): it
+# resolves the real dependency GRAPH for the six triples we ship, so a crate
+# that sits in `Cargo.lock` but is never compiled does not count against us.
+#
+# `cargo audit` has no graph resolution — it scans `Cargo.lock` flat, so it
+# reports advisories for optional dependencies of our dependencies that no
+# feature of ours ever turns on. This file exists so that a visitor who runs
+# `cargo audit` (a reasonable first thing to do on a security-sensitive
+# project) gets the same clean answer the gate gives, rather than a finding
+# they have to re-derive from scratch.
+#
+# EXCEPTION POLICY (identical to `deny.toml`): every entry below MUST state
+#   (1) the RUSTSEC id, (2) why it is not reachable / not fixable,
+#   (3) how to verify that claim yourself, (4) an owner, (5) an EXPIRY date.
+# An expired entry fails review.
+# ---------------------------------------------------------------------------
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in `rsa` 0.9.x.
+    #
+    # NOT REACHABLE. `rsa` enters `Cargo.lock` only as a dependency of
+    # `sqlx-mysql`. We depend on sqlx with `default-features = false` and the
+    # feature list `["sqlite", "runtime-tokio", "migrate", "macros"]`
+    # (Cargo.toml) — the MySQL driver is never enabled, so `rsa` is never
+    # compiled into any binary this repository produces. Cargo's lockfile is
+    # feature-agnostic and records the union of every optional dependency,
+    # which is why it appears there at all.
+    #
+    # VERIFY: `cargo tree -i rsa --all-features --target all` prints
+    # "nothing to print" — the crate is absent from the resolved graph for
+    # every feature/target combination. `cargo deny --all-features check`
+    # likewise reports `advisories ok`.
+    #
+    # NO FIX EXISTS upstream: the advisory has no patched release (constant-
+    # time RSA in pure Rust is unsolved), so there is nothing to upgrade to
+    # even if we did use MySQL.
+    #
+    # owner=@writ-maintainers · EXPIRES 2027-01-31 — re-review then (drop this
+    # entry the moment `rsa` ships a fixed release, or sqlx stops pulling it).
+    "RUSTSEC-2023-0071",
+]

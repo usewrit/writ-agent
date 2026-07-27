@@ -1,0 +1,9 @@
+# `**/target/` and not just `target/`: the vendored `playwright-rs` crate builds its own
+# `vendor/playwright-rs/target/` (~650 MB), and a root-anchored `target/` does not match it — so a
+# contributor who had already built the vendor shipped all of it into the build context.
+target/
+**/target/
+.git/
+*.md
+tests/
+.dockerignore

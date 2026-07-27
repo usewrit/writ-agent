@@ -1,0 +1,36 @@
+# Rust build artifacts.
+#
+# `**/target/` (not just `/target`) is deliberate: the vendored crate under
+# `vendor/playwright-rs/` builds its own `target/` (~650 MB). A root-anchored `/target` does NOT
+# match it, so in a standalone repo `git add -A` would stage the whole thing. Keep both patterns.
+/target
+**/target/
+**/*.rs.bk
+
+# Prebuilt engine binaries. These are release artifacts (tens of MB) that are published via GitHub
+# Releases / ghcr, never committed — a binary blob in git history cannot be removed after a push.
+.fleet-engine-*
+writ-agent-fleet
+writ-agentd
+
+# Local runtime logs (see RECORDER_LOG_FILE) — never commit; they leak local
+# paths, gateway-discovery attempts, and driver stack traces.
+recorder.log*
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local SQLCipher database + WAL/SHM siblings, and the vault key. Never committable.
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+vault.key
+
+# OS cruft
+.DS_Store
+
+# Logs
+*.log
