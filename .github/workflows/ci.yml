@@ -149,7 +149,11 @@ jobs:
       - run: cargo check --locked ${{ env.OSS_FEATURES }}
 
   msrv:
-    name: MSRV (${{ steps.msrv.outputs.version || 'from Cargo.toml' }})
+    # NOT `${{ steps.msrv.outputs.version }}` — a job-level `name` can only see the github, needs,
+    # strategy, matrix, vars and inputs contexts. Referencing `steps` there is a workflow-file
+    # validation error that rejects the WHOLE file, so no job in it runs at all. The resolved
+    # version is echoed by the "Read rust-version from Cargo.toml" step below instead.
+    name: MSRV (rust-version from Cargo.toml)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
