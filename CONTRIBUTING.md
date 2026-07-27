@@ -74,6 +74,12 @@ cargo fetch --locked        # `--offline` below resolves the whole graph from th
 cargo about generate --offline --all-features about.hbs
 ```
 
+**If your local regeneration differs from the committed file by whitespace only, trust CI, not your
+machine.** `cargo fetch` fills `registry/cache/` with `.crate` archives but never extracts them to
+`registry/src/`, so cargo-about harvests some license texts differently on a cold runner than on a
+machine that has built the tree. The committed file is kept matching the clean-room output, because
+that is the environment the check actually runs in and it derives entirely from `Cargo.lock`.
+
 The version pin is not optional. Different `cargo-about` releases render the notices differently,
 so an unpinned install makes the CI check fail on a file nobody touched — and from 0.9 onwards the
 binary sits behind a `cli` feature, so a plain `cargo install cargo-about` installs **nothing** and
