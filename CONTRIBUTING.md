@@ -70,6 +70,7 @@ Third-party license notices are generated with `cargo-about` (config in
 
 ```sh
 cargo install cargo-about --locked --version 0.6.6
+cargo fetch --locked        # `--offline` below resolves the whole graph from the local cache
 cargo about generate --offline --all-features about.hbs
 ```
 

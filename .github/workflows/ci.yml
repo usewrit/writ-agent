@@ -231,6 +231,14 @@ jobs:
       # it, regenerate the file in the same commit.
       - name: Install cargo-about
         run: cargo install cargo-about --locked --version 0.6.6
+      # `cargo about generate --offline` runs `cargo metadata`, which resolves the WHOLE graph out
+      # of the local registry cache — including optional deps like `age` that no default build
+      # pulls. A developer's cache is warm so this is invisible locally; a fresh runner's is empty
+      # and resolution fails with a misleading "no matching package named `age`". Populate the cache
+      # from the lockfile first, which is also what keeps `--offline` meaningful: nothing outside
+      # Cargo.lock can be reached afterwards.
+      - name: Populate the registry cache from Cargo.lock
+        run: cargo fetch --locked
       - name: Regenerate and diff
         run: |
           cargo about generate --offline --all-features about.hbs > /tmp/notices.md
