@@ -213,10 +213,25 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Attribution must never silently drift (AGPL §4/§5 obligation).
+  #
+  # ADVISORY HERE, ENFORCED AT PUBLISH. This job reports drift but does not block, because in a
+  # cold CI environment it is NOT DETERMINISTIC: `cargo-about` reads each crate's license text out
+  # of `registry/src/`, which only `cargo build` populates — `cargo fetch` leaves `.crate` archives
+  # unextracted. For whichever crates happen to be missing, cargo-about silently falls back to the
+  # generic SPDX text instead of the crate's own LICENSE file, and *which* crates those are moves
+  # with whatever `rust-cache` restored. Two consecutive runs on near-identical trees produced two
+  # entirely different diffs. A check that disagrees with itself cannot gate a merge.
+  #
+  # The real gate is `scripts/publish-agent.sh`, which runs the same comparison AFTER a full build,
+  # so every crate's source is extracted and the output is stable. That is also the only moment the
+  # attribution actually ships. Read a failure here as "look at the notices", not "the tree is bad".
+  # To make this blocking again, build the whole dependency graph first — note `--all-features`
+  # cannot be used for that, since `captcha_solver` and `ip_relay` have no source in this repo.
   # ---------------------------------------------------------------------------
   notices:
-    name: THIRD_PARTY_NOTICES is current
+    name: THIRD_PARTY_NOTICES is current (advisory)
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
