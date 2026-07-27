@@ -142,7 +142,7 @@ impl PlaywrightRecorder {
             selector: None,
             url: Some(start_url.clone()),
             value: None,
-            description: Some(format!("Navigate to {}", &start_url)),
+            description: Some(format!("Navigate to {start_url}")),
             coordinates: None,
             viewport: None,
             options: None,

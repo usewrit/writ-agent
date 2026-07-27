@@ -82,7 +82,7 @@ pub async fn setup_page_listeners(
                         selector: None,
                         url: Some(frame_url.clone()),
                         value: None,
-                        description: Some(format!("Navigate to {}", &frame_url)),
+                        description: Some(format!("Navigate to {frame_url}")),
                         coordinates: None,
                         viewport: None,
                         options: None,
@@ -178,7 +178,7 @@ pub async fn setup_page_listeners(
                                         selector: None,
                                         url: Some(frame_url.clone()),
                                         value: None,
-                                        description: Some(format!("Navigate to {}", &frame_url)),
+                                        description: Some(format!("Navigate to {frame_url}")),
                                         coordinates: None,
                                         viewport: None,
                                         options: None,
@@ -229,9 +229,9 @@ pub async fn setup_page_listeners(
                         url: Some(url.clone()),
                         value: None,
                         description: Some(if site_opened {
-                            format!("New tab opened by site: {}", &url)
+                            format!("New tab opened by site: {url}")
                         } else {
-                            format!("Opened new tab: {}", &url)
+                            format!("Opened new tab: {url}")
                         }),
                         coordinates: None,
                         viewport: None,

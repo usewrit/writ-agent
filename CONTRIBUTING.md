@@ -69,9 +69,14 @@ Third-party license notices are generated with `cargo-about` (config in
 `about.toml`, template in `about.hbs`):
 
 ```sh
-cargo install cargo-about --locked
+cargo install cargo-about --locked --version 0.6.6
 cargo about generate --offline --all-features about.hbs
 ```
+
+The version pin is not optional. Different `cargo-about` releases render the notices differently,
+so an unpinned install makes the CI check fail on a file nobody touched — and from 0.9 onwards the
+binary sits behind a `cli` feature, so a plain `cargo install cargo-about` installs **nothing** and
+merely warns. Bump the pin and regenerate the file in the same commit.
 
 ## Pull requests
 

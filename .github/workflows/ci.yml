@@ -221,8 +221,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # PIN THE VERSION. Two separate traps here, both of which made this job unrunnable:
+      #   1. `cargo-about` 0.9.x puts its binary behind a `cli` feature, so a plain
+      #      `cargo install cargo-about` compiles the LIBRARY, installs no binary, and exits 0 with
+      #      only a warning — the next step then dies on `no such command: about`.
+      #   2. Different cargo-about versions render different output, so an unpinned installer turns
+      #      this gate into a coin flip that fails on an unrelated day.
+      # The pin must match whatever generated the committed THIRD_PARTY_NOTICES.md. When you bump
+      # it, regenerate the file in the same commit.
       - name: Install cargo-about
-        run: cargo install cargo-about --locked
+        run: cargo install cargo-about --locked --version 0.6.6
       - name: Regenerate and diff
         run: |
           cargo about generate --offline --all-features about.hbs > /tmp/notices.md
