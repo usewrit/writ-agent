@@ -484,13 +484,12 @@ mod tests {
         std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
         std::fs::write(&inside, b"#!/usr/bin/python3\n").unwrap();
 
-        // Preserve and override the env for a deterministic check. The guard is what makes
-        // "preserve and restore" actually deterministic: HOME/WRIT_HOME are process-global, so
-        // without it a sibling test mutating them on another thread lands mid-assertion.
-        let _lock = env_lock();
-        #[cfg(feature = "local")]
-        let _g = crate::local::config::test_env_guard();
-
+        // Preserve and override the env for a deterministic check. The guards taken at the top of
+        // this test are what make "preserve and restore" deterministic: HOME/WRIT_HOME are
+        // process-global, so without them a sibling test mutating them on another thread lands
+        // mid-assertion. They are NOT re-acquired here — `std::sync::Mutex` is not reentrant, and a
+        // second `env_lock()` on this thread deadlocks against the guard still held above (shadowing
+        // a `let _lock` does not drop the previous one; it lives until end of scope).
         let prev_home = std::env::var("HOME").ok();
         let prev_writ = std::env::var("WRIT_HOME").ok();
         std::env::set_var("WRIT_HOME", &tmp);

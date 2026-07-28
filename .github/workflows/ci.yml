@@ -214,13 +214,23 @@ jobs:
       # driver's compile-time path points into the BUILDER stage; if the copy into the runtime
       # stage is ever dropped, the image still builds, still starts, still reports healthy — and
       # fails every single run at browser launch. Assert the layout `find_sibling_driver` expects.
-      - name: The Playwright driver survived into the runtime stage
+      - name: Both drivers survived into the runtime stage
         run: |
           docker run --rm --entrypoint sh writ-agent:ci -c '
             set -e
+            # Vanilla driver — without it the first browser launch dies with ServerNotFound,
+            # because the compile-time path points into the builder stage.
             test -x /app/playwright-driver/node
             test -f /app/playwright-driver/package/cli.js
             /app/playwright-driver/node --version
+
+            # patchright STEALTH driver. Its absence is silent: `find_patchright_driver` simply
+            # falls through to the vanilla one, logs a warning, and every run goes out with
+            # Runtime.enable on — detectable, and slower. The image looked healthy in exactly
+            # that state before it was staged here, so assert it rather than trust the build.
+            test -x /app/patchright-driver/node
+            test -f /app/patchright-driver/package/cli.js
+            /app/patchright-driver/node --version
           '
 
   # ---------------------------------------------------------------------------
