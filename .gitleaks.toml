@@ -23,6 +23,21 @@ title = "writ-agent"
 [extend]
 useDefault = true
 
+# --- Cargo build output ----------------------------------------------------
+#
+# `gitleaks detect --no-git` walks the working directory, so on a tree that has been built it also
+# reads `target/`. The `.rmeta` files there embed dependency source and doc text, which trips the
+# `private-key` and `curl-auth-header` heuristics ~20 times — all from vendored crates (openssl,
+# ed25519-dalek, pem), none of it ours and none of it reachable.
+#
+# This is the one place a whole-path exclusion is right rather than lazy: `target/` is in
+# `.gitignore` AND excluded by the publish carve, so nothing under it can ever reach the published
+# repository. Without this, the scan result depends on whether you happened to run `cargo build`
+# first — which is exactly the kind of non-determinism that teaches people to ignore a scanner.
+[[allowlists]]
+description = "Cargo build output — gitignored, carve-excluded, and full of vendored crate text that trips binary heuristics"
+paths = ['''(^|/)target/''']
+
 # --- Fake credentials fed to the prompt/redaction tests -------------------
 #
 # `src/automation/network_capture.rs` builds the network summary that is shown

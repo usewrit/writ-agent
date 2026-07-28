@@ -254,12 +254,15 @@ impl PlaywrightRecorder {
                     }
                 });
 
-                // Start screencast with same params as Python
+                // Start the screencast at the page's REAL viewport, never a fixed
+                // constant — see `screencast_bounds` for why the two must agree.
+                let (cast_w, cast_h) =
+                    screencast_bounds(page.viewport_size().map(|vp| (vp.width, vp.height)));
                 let start_result = cdp.send("Page.startScreencast", Some(serde_json::json!({
                     "format": "jpeg",
                     "quality": 60,
-                    "maxWidth": constants::VIEWPORT_WIDTH,
-                    "maxHeight": constants::VIEWPORT_HEIGHT,
+                    "maxWidth": cast_w,
+                    "maxHeight": cast_h,
                     "everyNthFrame": 1
                 }))).await;
 
@@ -475,6 +478,47 @@ impl PlaywrightRecorder {
         }
 
         tracing::info!("Recorder shut down");
+    }
+}
+
+/// The `maxWidth`/`maxHeight` to start the CDP screencast with, given the page's
+/// viewport (`None` for a context with no fixed viewport, where the page tracks
+/// the window).
+///
+/// THE INVARIANT: a screencast frame's pixel space must equal the page's CSS
+/// viewport space. CDP scales a frame DOWN to fit `maxWidth`/`maxHeight`
+/// (preserving aspect ratio), so any cap below the viewport re-scales every
+/// frame — and the recorder frontend maps pointer input through the decoded
+/// frame size, which the agent then replays as CSS-viewport coordinates. Cap and
+/// viewport must agree or every click, hover and drag lands off-target by the
+/// ratio between them.
+fn screencast_bounds(viewport: Option<(u32, u32)>) -> (u32, u32) {
+    viewport.unwrap_or((constants::VIEWPORT_WIDTH, constants::VIEWPORT_HEIGHT))
+}
+
+#[cfg(test)]
+mod screencast_tests {
+    use super::*;
+
+    #[test]
+    fn bounds_follow_the_recording_viewport() {
+        // `create_stealth_context` (the recorder's context) is 1920x1080. Capping
+        // at the 1280x800 constant made CDP emit 1280x720 frames, putting every
+        // click 1.5x off — the regression this exists to prevent.
+        assert_eq!(screencast_bounds(Some((1920, 1080))), (1920, 1080));
+    }
+
+    #[test]
+    fn bounds_follow_a_pinned_monitoring_viewport() {
+        assert_eq!(screencast_bounds(Some((1280, 800))), (1280, 800));
+    }
+
+    #[test]
+    fn bounds_fall_back_to_the_constants_without_a_viewport() {
+        assert_eq!(
+            screencast_bounds(None),
+            (constants::VIEWPORT_WIDTH, constants::VIEWPORT_HEIGHT)
+        );
     }
 }
 

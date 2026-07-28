@@ -17,6 +17,7 @@ pub mod grouping;
 pub mod incremental;
 pub mod models;
 pub mod scheduler;
+pub mod visual_region;
 pub mod workflow_scheduler;
 
 // Available to the managed cloud recorder AND the OSS fleet worker (both dispatch monitor targets

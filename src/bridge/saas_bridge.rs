@@ -2010,10 +2010,14 @@ async fn run_session_loop(
                                     "html": if html.is_null() { serde_json::json!("") } else { html.clone() },
                                 })).await;
                             }
-                            // select_options / native_picker overlays → forward directly
-                            // so the frontend can render the dropdown / picker UI.
+                            // Payloads that are already a complete UI frame (select /
+                            // picker overlays, the extraction highlight box, a live
+                            // extract test result) → forward directly so the frontend
+                            // can render them. One shared allowlist with the local
+                            // record driver so neither transport can silently lack a
+                            // frame the other forwards.
                             if let Some(dtype) = data.get("type").and_then(|v| v.as_str()) {
-                                if dtype == "select_options" || dtype == "native_picker" {
+                                if crate::recorder::action_handler::is_passthrough_frame(dtype) {
                                     relay.send_json(data.clone()).await;
                                 }
                             }

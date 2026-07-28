@@ -311,8 +311,16 @@ async fn run_one_agent_action(
                 Ok(serde_json::json!({"action": atype, "success": true, "url": page.url()}))
             }
             "back" => {
-                navigation::go_back(page, Duration::from_secs(30)).await?;
-                Ok(serde_json::json!({"action": atype, "success": true, "url": page.url()}))
+                // `false` = no history entry. Report it so the AI sees a refused
+                // action and picks another move instead of looping on a no-op it
+                // was told succeeded.
+                let moved = navigation::go_back(page, Duration::from_secs(30)).await?;
+                Ok(serde_json::json!({
+                    "action": atype,
+                    "success": moved,
+                    "url": page.url(),
+                    "error": if moved { serde_json::Value::Null } else { serde_json::json!("no history entry to go back to") },
+                }))
             }
             "twofa_enter" => {
                 // Runner-internal: the 2FA code was minted SERVER-SIDE and handed to

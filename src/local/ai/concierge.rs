@@ -1178,24 +1178,16 @@ async fn probe_http_viable(url: &str, selector: &str) -> Option<bool> {
     }
 }
 
-/// The MONITOR viewport (see `monitor/checker.rs` — checks run in 1280x800). A visual_region's coords
-/// are viewport-relative, so they are ONLY valid if captured at the SAME resolution the check clips at.
-const MONITOR_VIEWPORT: playwright_rs::Viewport = playwright_rs::Viewport { width: 1280, height: 800 };
-
 /// Measure the element on the WARM page for a VISUAL (screenshot-zone) watch: its bounding box + the
 /// page scroll (viewport-relative — the coordinate model `extract_visual` clips at). Returns the region
 /// object `{x,y,width,height,scroll_x,scroll_y,viewport}` (rounded) or `None` (element gone / zero-area).
 ///
-/// CRITICAL: the warm/discovery browser runs at 1920x1080 but the monitor checks at 1280x800 — a box
-/// measured at the wrong resolution clips the wrong pixels and the zone is invalid. So we RESIZE the
-/// page to the monitor viewport, let it reflow, measure there, then RESTORE the original size (so the
-/// live preview + later tools are unaffected). Best-effort — a `None` means fall back to a text selector.
+/// A visual_region's coords are viewport-relative, so they only mean anything alongside the resolution
+/// they were measured at. We record it (`viewport`, from the live `window.innerWidth/Height`) and the
+/// check opens its context at that size — see `monitor::visual_region`. So we measure IN PLACE: no
+/// resize to a fixed "monitor viewport", no 250ms reflow wait, and no restore step that could leave the
+/// live preview at the wrong size if it failed. Best-effort — `None` falls back to a text selector.
 async fn probe_visual_region(page: &playwright_rs::Page, selector: &str) -> Option<Value> {
-    let prev_vp = page.viewport_size();
-    let resized = page.set_viewport_size(MONITOR_VIEWPORT).await.is_ok();
-    if resized {
-        tokio::time::sleep(Duration::from_millis(250)).await; // let the reflow settle before measuring
-    }
     let sel_json = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
     let js = format!(
         "() => {{ try {{ const el = document.querySelector({sel_json}); if (!el) return null; \
@@ -1203,21 +1195,13 @@ async fn probe_visual_region(page: &playwright_rs::Page, selector: &str) -> Opti
          const rd = (n) => Math.round(n * 10) / 10; \
          return {{ x: rd(r.x), y: rd(r.y), width: rd(r.width), height: rd(r.height), \
          scroll_x: rd(window.scrollX), scroll_y: rd(window.scrollY), \
-         viewport: {{ width: {mw}, height: {mh} }} }}; }} catch (e) {{ return null; }} }}",
-        mw = MONITOR_VIEWPORT.width,
-        mh = MONITOR_VIEWPORT.height,
+         viewport: {{ width: window.innerWidth, height: window.innerHeight }} }}; \
+         }} catch (e) {{ return null; }} }}",
     );
-    let region = match page.evaluate::<(), Value>(&js, None::<&()>).await {
+    match page.evaluate::<(), Value>(&js, None::<&()>).await {
         Ok(v) if v.is_object() => Some(v),
         _ => None,
-    };
-    // Restore the warm page's original viewport so the live preview + subsequent tools see it unchanged.
-    if resized {
-        if let Some(vp) = prev_vp {
-            let _ = page.set_viewport_size(vp).await;
-        }
     }
-    region
 }
 
 /// Create the Target + watched target_selector (+ a text/price extractor for non-visual watches) from

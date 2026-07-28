@@ -590,9 +590,14 @@ impl BrowserManager {
     }
 
     /// Like `create_stealth_context_with_fingerprint` but lets the caller pin the
-    /// viewport. Monitoring passes 1280x800 so a visual_region clips the same
-    /// pixels the zone was drawn over in the recorder preview; workflows pass
-    /// None to keep the 1920x1080 automation parity.
+    /// viewport. Workflows pass None to keep the 1920x1080 automation parity.
+    ///
+    /// Monitoring passes the size a target's `visual_region` zones were DRAWN at
+    /// (`monitor::visual_region::context_viewport`) so the page lays out the way it
+    /// did in the recorder preview and the zone clips the same pixels. It is NOT a
+    /// fixed 1280x800: this context runs the recorder at 1920x1080, so pinning
+    /// 1280x800 clipped every recorder-drawn zone ~1.5x off and at the wrong aspect
+    /// ratio.
     pub async fn create_stealth_context_full(
         &self,
         fingerprint: Option<Fingerprint>,

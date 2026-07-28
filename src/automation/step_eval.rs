@@ -172,6 +172,50 @@ pub async fn execute_extract(page: &Page, config: &WorkflowStepConfig) -> StepRe
         }
     }
 
+    // TYPED extract: the recorder's picker offers text / attribute / all_text
+    // alongside computed (handled above). Without these arms an `attribute` or
+    // `all_text` step recorded in the UI silently replayed as the first match's
+    // text — the step ran "successfully" and produced the wrong value.
+    let extract_type = config
+        .extra
+        .get("extract_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("text");
+
+    if extract_type == "attribute" {
+        let attribute = config
+            .extra
+            .get("attribute")
+            .and_then(|v| v.as_str())
+            .filter(|a| !a.is_empty())
+            .unwrap_or("href");
+        let value = page_query::evaluate_with_args::<serde_json::Value>(
+            page,
+            "(a) => { const el = document.querySelector(a.selector); \
+             return el ? el.getAttribute(a.attribute) : null; }",
+            serde_json::json!({"selector": selector, "attribute": attribute}),
+        )
+        .await
+        .map_err(|e| StepError::Execution(format!("extract (attribute) failed: {}", e)))?;
+        let mut result = HashMap::new();
+        result.insert(variable.to_string(), value);
+        return Ok(Some(result));
+    }
+
+    if extract_type == "all_text" {
+        let value = page_query::evaluate_with_args::<serde_json::Value>(
+            page,
+            "(sel) => Array.from(document.querySelectorAll(sel)) \
+             .map(el => (el.textContent || '').trim())",
+            serde_json::json!(selector),
+        )
+        .await
+        .map_err(|e| StepError::Execution(format!("extract (all_text) failed: {}", e)))?;
+        let mut result = HashMap::new();
+        result.insert(variable.to_string(), value);
+        return Ok(Some(result));
+    }
+
     // Extract text content from the element
     let text = page_query::locator_text_content(page, selector)
         .await

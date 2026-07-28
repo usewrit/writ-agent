@@ -340,9 +340,12 @@ impl<S: RecordSink> SessionDriver<S> {
                 let html = if html.is_null() { json!("") } else { html.clone() };
                 self.sink.send_json(json!({"type": "dom_content", "html": html})).await;
             }
-            // select_options / native_picker overlays → forward verbatim.
+            // Payloads that are already a complete UI frame (select/picker overlays,
+            // the extraction highlight box, a live extract test result) → forward
+            // verbatim. One shared allowlist with the cloud bridge so neither
+            // transport can silently lack a frame the other forwards.
             if let Some(dtype) = data.get("type").and_then(|v| v.as_str()) {
-                if dtype == "select_options" || dtype == "native_picker" {
+                if crate::recorder::action_handler::is_passthrough_frame(dtype) {
                     self.sink.send_json(data.clone()).await;
                 }
             }

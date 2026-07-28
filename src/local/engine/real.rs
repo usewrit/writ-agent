@@ -2216,7 +2216,21 @@ mod tests {
         }
         let status = terminal.expect("run finalized within the poll budget");
         assert_ne!(status, "running", "run reached a terminal state");
-        // Once finalized the run is no longer live in the registry.
+
+        // A terminal row does NOT imply a quiesced registry. `run_body` writes the terminal status in
+        // `finalize`, and only THEN emits the terminal frame + de-registers (`guard.finish()`) and
+        // drops its `ActiveRunGuard` on scope exit. That order is deliberate — releasing the slot
+        // before the row is terminal would under-report "busy" and let the coordinator dispatch onto a
+        // run that is still finalizing — so the window between the two is real, and asserting the
+        // counters the instant the row flipped raced the spawned task (~1 failure in 10, even alone).
+        // Wait for the release with the same bounded loop the status poll uses, so the test still
+        // never hangs; the asserts below stay as the verdict and name which half did not release.
+        for _ in 0..2_400 {
+            if !eng.registry.is_live(started.run_id) && eng.active_runs() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
         assert!(!eng.registry.is_live(started.run_id), "finalized run de-registered");
         assert_eq!(eng.active_runs(), 0, "active count released");
     }

@@ -253,12 +253,16 @@ impl Checker {
             .and_then(|a| a.get("fingerprint"))
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-        // Monitor in a 1280x800 viewport so a visual_region (captured in the
-        // recorder's 1280x800 zone-drawing preview) clips the same pixels here.
+        // Open the check at the viewport the target's visual zones were DRAWN at, so the
+        // page lays out exactly as it did under the recorder's zone-drawing overlay and a
+        // `visual_region` clips the same pixels. Targets with no zone (and zones saved
+        // before the viewport was recorded) get the historical 1280x800 — see
+        // `visual_region::context_viewport`.
+        let (cvw, cvh) = super::visual_region::context_viewport(target);
         let (context, page, _fp) = match browser
             .create_stealth_context_full(
                 restored_fp,
-                Some(playwright_rs::Viewport { width: 1280, height: 800 }),
+                Some(playwright_rs::Viewport { width: cvw, height: cvh }),
             )
             .await
         {
@@ -519,21 +523,29 @@ async fn extract_in_page(page: &playwright_rs::Page, sel: &Selector) -> Option<S
 
 /// Visual (screenshot-region) check: clip the region, return (pixel_hash, png_bytes).
 /// `None` if the region is malformed or the screenshot fails.
+///
+/// The clip resolves against the page's LIVE viewport rather than a hardcoded size —
+/// `check_content_browser` opens the context at the zone's own viewport, and
+/// [`visual_region::clip_rect`] rescales anything that still doesn't line up.
 async fn extract_visual(page: &playwright_rs::Page, sel: &Selector) -> Option<(String, Vec<u8>)> {
-    let region = sel.visual_region.as_ref()?.as_object()?;
-    let num = |k: &str, d: f64| region.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
-    let mut x = num("x", 0.0);
-    let mut y = num("y", 0.0);
-    let width = num("width", 100.0);
-    let height = num("height", 100.0);
-    let sx0 = num("scroll_x", 0.0);
-    let sy0 = num("scroll_y", 0.0);
+    use super::visual_region;
+
+    let region = sel.visual_region.as_ref()?;
+    // The live viewport is the authority: the requested size can be refused, and a
+    // pre-check workflow may have resized the page out from under us.
+    let (vw, vh) = page
+        .viewport_size()
+        .map(|vp| (vp.width, vp.height))
+        .unwrap_or(visual_region::DEFAULT_ZONE_VIEWPORT);
+    let mut clip = visual_region::clip_rect(region, vw, vh)?;
+
     // Restore the scroll the zone was drawn at before clipping — the clip is
     // viewport-relative, so a zone the user drew below the fold only lines up once
     // we scroll back to where they drew it. Correct for scroll clamping on short
-    // pages. Skip for top-of-page zones (sx0==sy0==0) so legacy baselines stay
-    // byte-identical and the check keeps its old timing.
-    if sx0 != 0.0 || sy0 != 0.0 {
+    // pages. Skip for top-of-page zones so legacy baselines stay byte-identical and
+    // the check keeps its old timing.
+    if clip.needs_scroll() {
+        let (sx0, sy0) = (clip.scroll_x, clip.scroll_y);
         let js = format!(
             "() => {{ window.scrollTo({{left: {sx0}, top: {sy0}, behavior: 'instant'}}); \
              return {{x: window.scrollX, y: window.scrollY}}; }}"
@@ -541,22 +553,22 @@ async fn extract_visual(page: &playwright_rs::Page, sel: &Selector) -> Option<(S
         if let Ok(pos) =
             crate::browser::page_query::evaluate::<serde_json::Value>(page, &js).await
         {
-            x += sx0 - pos.get("x").and_then(|v| v.as_f64()).unwrap_or(sx0);
-            y += sy0 - pos.get("y").and_then(|v| v.as_f64()).unwrap_or(sy0);
+            visual_region::apply_scroll_shortfall(
+                &mut clip,
+                pos.get("x").and_then(|v| v.as_f64()).unwrap_or(sx0),
+                pos.get("y").and_then(|v| v.as_f64()).unwrap_or(sy0),
+                vw,
+                vh,
+            );
         }
         // let scroll-triggered content settle before the snapshot
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    // Clamp to the 1280x800 monitor viewport so a clamped-scroll residual (page
-    // resized since capture) can't push the clip outside the image — Playwright
-    // errors on an out-of-bounds clip. A no-op for the normal/legacy path.
-    let x = x.clamp(0.0, 1279.0);
-    let y = y.clamp(0.0, 799.0);
-    let width = width.min(1280.0 - x).max(1.0);
-    let height = height.min(800.0 - y).max(1.0);
-    let png = crate::browser::page_query::screenshot_png_clip(page, x, y, width, height)
-        .await
-        .ok()?;
+    let png = crate::browser::page_query::screenshot_png_clip(
+        page, clip.x, clip.y, clip.width, clip.height,
+    )
+    .await
+    .ok()?;
     let hash = pixel_hash(&png)?;
     Some((hash, png))
 }

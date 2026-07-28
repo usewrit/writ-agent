@@ -1342,31 +1342,91 @@ async fn post_webhook(url: &str, title: &str, message: &str) -> bool {
     }
 }
 
+/// Cap on the OS-toast backlog: a closed/backgrounded app never polls, so the queue would otherwise
+/// grow without limit. Oldest entries are dropped first.
+const MAX_PENDING_TOASTS: usize = 100;
+
 /// Process-global queue of native OS-toast notifications the app drains via
 /// `GET /v1/notifications/pending`. The daemon can't reach the Tauri shell directly, so
 /// `desktop`-channel automation notifications land here for the webview poller to raise as
-/// real OS toasts. Bounded so a closed/backgrounded app can't grow it without limit.
+/// real OS toasts. Bounded by [`MAX_PENDING_TOASTS`].
+///
+/// Tests must not assert against this queue directly — it is shared by every test in the process
+/// and `cargo test` runs them in parallel threads. Call [`isolate_toasts`] instead.
 static PENDING_TOASTS: OnceLock<Mutex<VecDeque<Value>>> = OnceLock::new();
 fn pending_toasts() -> &'static Mutex<VecDeque<Value>> {
     PENDING_TOASTS.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test override of the toast queue, installed by [`isolate_toasts`]. Non-`None` only on a
+    /// test thread that asked for isolation; production always uses [`PENDING_TOASTS`].
+    static TEST_TOASTS: std::cell::RefCell<Option<VecDeque<Value>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` against the toast queue this caller should use: the calling thread's test-scoped queue
+/// when one is installed, otherwise the process-global one. A poisoned global lock degrades to a
+/// no-op (`f` is not run) — queuing a toast is best-effort and must never panic a run.
+fn with_toast_queue<R: Default>(f: impl FnOnce(&mut VecDeque<Value>) -> R) -> R {
+    #[cfg(test)]
+    {
+        if TEST_TOASTS.with(|slot| slot.borrow().is_some()) {
+            return TEST_TOASTS.with(|slot| {
+                f(slot
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("test toast queue installed"))
+            });
+        }
+    }
+    match pending_toasts().lock() {
+        Ok(mut q) => f(&mut q),
+        Err(_) => R::default(),
+    }
+}
+
+/// Give the calling test its own toast queue for as long as the returned guard lives, so
+/// `push_pending_toast` / `drain_pending_toasts` can be asserted on deterministically even though
+/// the real queue is process-global and `cargo test` runs tests in parallel threads.
+///
+/// `#[tokio::test]` uses a current-thread runtime, so the whole test future (and anything it awaits)
+/// stays on the thread that installed the guard. A `flavor = "multi_thread"` test that pushes toasts
+/// from a worker thread would fall through to the global queue — isolate on the thread that both
+/// pushes and drains, or serialize such a test by other means.
+#[cfg(test)]
+#[must_use = "the isolated queue is torn down when the guard is dropped"]
+pub(crate) fn isolate_toasts() -> ToastQueueGuard {
+    TEST_TOASTS.with(|slot| *slot.borrow_mut() = Some(VecDeque::new()));
+    ToastQueueGuard(())
+}
+
+/// RAII handle from [`isolate_toasts`]; restores the global queue for this thread on drop.
+#[cfg(test)]
+pub(crate) struct ToastQueueGuard(());
+
+#[cfg(test)]
+impl Drop for ToastQueueGuard {
+    fn drop(&mut self) {
+        TEST_TOASTS.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 /// Queue a native OS toast (title + body) for the app's poller to raise.
 pub fn push_pending_toast(title: &str, body: &str) {
-    if let Ok(mut q) = pending_toasts().lock() {
-        while q.len() >= 100 {
+    let toast = json!({ "title": title, "body": body });
+    with_toast_queue(|q| {
+        while q.len() >= MAX_PENDING_TOASTS {
             q.pop_front();
         }
-        q.push_back(json!({ "title": title, "body": body }));
-    }
+        q.push_back(toast);
+    });
 }
 
 /// Drain all queued OS toasts (called by the app's `/v1/notifications/pending` poll).
 pub fn drain_pending_toasts() -> Vec<Value> {
-    match pending_toasts().lock() {
-        Ok(mut q) => q.drain(..).collect(),
-        Err(_) => Vec::new(),
-    }
+    with_toast_queue(|q| q.drain(..).collect())
 }
 
 /// Deliver a `notification` action locally. Outbound webhooks fire real HTTP; `desktop` queues a
@@ -2203,6 +2263,9 @@ mod tests {
 
     #[tokio::test]
     async fn desktop_channel_queues_an_os_toast() {
+        // Own queue for this test: the real one is process-global and other tests push/drain it
+        // concurrently, which would otherwise steal this test's entry.
+        let _toasts = isolate_toasts();
         let block = FlowBlock {
             id: "n".into(),
             kind: "action".into(),
@@ -2217,14 +2280,14 @@ mod tests {
         assert_eq!(rec["delivered"][0]["channel"], "desktop");
         assert_eq!(rec["delivered"][0]["via"], "os_toast");
         let drained = drain_pending_toasts();
-        assert!(drained.iter().any(|t| t["title"] == "Hi" && t["body"] == "price 9.99"));
+        assert_eq!(drained, vec![json!({ "title": "Hi", "body": "price 9.99" })]);
         // Draining is one-shot: a second drain does not re-surface it.
-        assert!(!drain_pending_toasts().iter().any(|t| t["title"] == "Hi"));
+        assert!(drain_pending_toasts().is_empty());
     }
 
     #[tokio::test]
     async fn direct_notifications_desktop_defaults_and_renders_message() {
-        drain_pending_toasts(); // clear any residue from other tests
+        let _toasts = isolate_toasts(); // own queue: other tests push/drain the global one
         let pool = test_pool().await;
         let mut scope = Map::new();
         scope.insert("url".into(), json!("https://example.com/watch"));
@@ -2238,27 +2301,30 @@ mod tests {
             &scope,
         )
         .await;
-        let drained = drain_pending_toasts();
-        let toast = drained
-            .iter()
-            .find(|t| t["title"] == "Writ: Change Detected")
-            .expect("desktop toast queued with default title");
-        assert_eq!(toast["body"], "changed at https://example.com/watch");
-        // email was enabled but is cloud-only → no extra toast.
-        assert_eq!(drained.len(), 1);
+        // Exactly one toast: the default title with the rendered body. `email` was enabled too but
+        // is cloud-only, so it adds nothing here.
+        assert_eq!(
+            drain_pending_toasts(),
+            vec![json!({ "title": "Writ: Change Detected", "body": "changed at https://example.com/watch" })]
+        );
     }
 
     #[tokio::test]
     async fn direct_notifications_default_body_and_empty_map_noop() {
-        drain_pending_toasts();
+        let _toasts = isolate_toasts();
         let pool = test_pool().await;
         let mut scope = Map::new();
         scope.insert("url".into(), json!("https://shop.test/item"));
 
         // No message → plain default body including the url.
         dispatch_direct_notifications(&pool, Some(r#"{"desktop": true}"#), None, None, &scope).await;
-        let drained = drain_pending_toasts();
-        assert!(drained.iter().any(|t| t["body"] == "A change was detected on https://shop.test/item."));
+        assert_eq!(
+            drain_pending_toasts(),
+            vec![json!({
+                "title": "Writ: Change Detected",
+                "body": "A change was detected on https://shop.test/item."
+            })]
+        );
 
         // Empty / none providers → no delivery at all.
         dispatch_direct_notifications(&pool, Some("{}"), None, None, &scope).await;

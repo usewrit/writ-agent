@@ -158,26 +158,39 @@ pub async fn reload(page: &Page, timeout: Duration) -> Result<()> {
     Ok(())
 }
 
-pub async fn go_back(page: &Page, timeout: Duration) -> Result<()> {
+/// Go back one history entry.
+///
+/// Returns `Ok(false)` when there was nothing to go back TO. Playwright resolves
+/// `goBack` with a null response in that case, which used to be reported as plain
+/// success — so the recorder's Back button did nothing and said nothing, which
+/// reads as a broken button. Callers surface the distinction.
+pub async fn go_back(page: &Page, timeout: Duration) -> Result<bool> {
     let opts = GotoOptions {
         timeout: Some(timeout),
         wait_until: None,
     };
-    page.go_back(Some(opts)).await
-        .map_err(|e| anyhow::anyhow!("Go back failed: {}", e))?;
-    reinject_stealth(page).await;
-    Ok(())
+    let moved = page.go_back(Some(opts)).await
+        .map_err(|e| anyhow::anyhow!("Go back failed: {}", e))?
+        .is_some();
+    if moved {
+        reinject_stealth(page).await;
+    }
+    Ok(moved)
 }
 
-pub async fn go_forward(page: &Page, timeout: Duration) -> Result<()> {
+/// Go forward one history entry. `Ok(false)` = no forward entry (see [`go_back`]).
+pub async fn go_forward(page: &Page, timeout: Duration) -> Result<bool> {
     let opts = GotoOptions {
         timeout: Some(timeout),
         wait_until: None,
     };
-    page.go_forward(Some(opts)).await
-        .map_err(|e| anyhow::anyhow!("Go forward failed: {}", e))?;
-    reinject_stealth(page).await;
-    Ok(())
+    let moved = page.go_forward(Some(opts)).await
+        .map_err(|e| anyhow::anyhow!("Go forward failed: {}", e))?
+        .is_some();
+    if moved {
+        reinject_stealth(page).await;
+    }
+    Ok(moved)
 }
 
 #[cfg(test)]

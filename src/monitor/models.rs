@@ -48,8 +48,12 @@ pub struct Selector {
     pub baseline_hash: Option<String>,
     #[serde(default)]
     pub baseline_content: Option<String>,
-    /// For content_type == "visual": the screenshot region {x,y,width,height}
-    /// to clip and pixel-hash. Absent for text/html selectors.
+    /// For content_type == "visual": the screenshot region to clip and pixel-hash —
+    /// `{x, y, width, height, scroll_x, scroll_y, viewport}`. Absent for text/html
+    /// selectors. Kept as raw JSON because it is stored and forwarded verbatim;
+    /// interpret it ONLY through [`super::visual_region`], which owns the meaning of
+    /// `viewport` (x/y are viewport-relative and mean nothing without the frame size
+    /// they were measured in).
     #[serde(default)]
     pub visual_region: Option<serde_json::Value>,
 }

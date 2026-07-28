@@ -25,6 +25,27 @@ pub struct ActionResult {
     pub data: Option<serde_json::Value>,
 }
 
+/// `ActionResult::data` payloads that are ALREADY a complete frontend frame (they
+/// carry their own `type`) and are forwarded to the UI verbatim.
+///
+/// Both transports that surface action results — the local/fleet record driver
+/// (`local::record::session`) and the cloud bridge (`bridge::saas_bridge`) — gate
+/// on this one list, so a new overlay frame can never reach one UI and not the
+/// other.
+pub const PASSTHROUGH_FRAME_TYPES: &[&str] = &[
+    "select_options",
+    "native_picker",
+    // Extraction lane: hover highlight box, and the live "test this extraction" result.
+    "highlight",
+    "extract_test_result",
+];
+
+/// Whether `frame_type` is a complete UI frame to forward verbatim (see
+/// [`PASSTHROUGH_FRAME_TYPES`]).
+pub fn is_passthrough_frame(frame_type: &str) -> bool {
+    PASSTHROUGH_FRAME_TYPES.contains(&frame_type)
+}
+
 impl ActionResult {
     pub fn ok() -> Self {
         Self {
@@ -84,6 +105,14 @@ async fn handle_action_inner(
         "close_tab" => handle_close_tab(session, &action).await,
         "test_streaming_script" => handle_test_streaming_script(session, &action).await,
         "add_wait_for_change_step" => handle_add_wait_for_change_step(session, &action).await,
+        // Extraction lane (the recorder's "Extract" mode). Every one of these was
+        // missing, so the UI's own frames fell to the `Unknown action type` arm
+        // below: hovering in extraction mode raised an error toast every 100ms and
+        // "Add Step" silently recorded nothing.
+        "highlight_element" => handle_highlight_element(session, &action).await,
+        "clear_highlight" => handle_clear_highlight().await,
+        "add_extract_step" => handle_add_extract_step(session, &action).await,
+        "test_extract" => handle_test_extract(session, &action).await,
         other => {
             tracing::warn!(action_type = other, "Unknown action type");
             ActionResult::err(format!("Unknown action type: {}", other))
@@ -827,10 +856,14 @@ async fn handle_navigate(
 /// recorder (`recorder.py`): perform the history move, then RECORD it as a `navigate` to the
 /// resulting URL (only if the URL changed) so a monitor's setup steps reproduce the page the user
 /// reached — the engine replays `navigate` reliably, whereas a literal back/forward step would not.
+/// A history move that had nowhere to go is reported to the user rather than
+/// swallowed — an unexplained no-op reads as a dead button.
 async fn handle_back(session: &mut RecordingSession) -> ActionResult {
     let prev_url = session.page.url();
-    if let Err(e) = crate::browser::navigation::go_back(&session.page, Duration::from_secs(30)).await {
-        return ActionResult::err(format!("Go back failed: {}", e));
+    match crate::browser::navigation::go_back(&session.page, Duration::from_secs(30)).await {
+        Err(e) => return ActionResult::err(format!("Go back failed: {}", e)),
+        Ok(false) => return ActionResult::err("Nothing to go back to — this is the first page of the session"),
+        Ok(true) => {}
     }
     record_history_nav(session, &prev_url, "Back");
     ActionResult::ok_with_data(serde_json::json!({ "url": session.current_url }))
@@ -838,8 +871,10 @@ async fn handle_back(session: &mut RecordingSession) -> ActionResult {
 
 async fn handle_forward(session: &mut RecordingSession) -> ActionResult {
     let prev_url = session.page.url();
-    if let Err(e) = crate::browser::navigation::go_forward(&session.page, Duration::from_secs(30)).await {
-        return ActionResult::err(format!("Go forward failed: {}", e));
+    match crate::browser::navigation::go_forward(&session.page, Duration::from_secs(30)).await {
+        Err(e) => return ActionResult::err(format!("Go forward failed: {}", e)),
+        Ok(false) => return ActionResult::err("Nothing to go forward to"),
+        Ok(true) => {}
     }
     record_history_nav(session, &prev_url, "Forward");
     ActionResult::ok_with_data(serde_json::json!({ "url": session.current_url }))
@@ -1412,6 +1447,251 @@ async fn handle_add_wait_for_change_step(
     ActionResult::ok()
 }
 
+// ---------------------------------------------------------------------------
+// Extraction lane
+// ---------------------------------------------------------------------------
+// The recorder's "Extract" mode: hover to highlight the element under the cursor,
+// click to inspect it (`get_element_info`), confirm to record an `extract` step,
+// and optionally run that extraction live to see what it would yield.
+//
+// The UI has always sent these four frames; no agent implemented them, so they
+// hit the `Unknown action type` arm and came back as `error` frames — a red toast
+// per hover sample, and an "Add Step" button that recorded nothing.
+
+/// The attribute an `extract_type: "attribute"` step reads when the UI didn't name
+/// one. The picker offers the type without an attribute field, so fall back to the
+/// attribute that actually carries the value for that tag.
+pub fn default_extract_attribute(tag: &str) -> &'static str {
+    match tag.to_lowercase().as_str() {
+        "a" | "area" | "link" => "href",
+        "img" | "script" | "iframe" | "source" | "audio" | "video" | "embed" => "src",
+        "input" | "option" | "param" => "value",
+        "meta" => "content",
+        "time" => "datetime",
+        "form" => "action",
+        _ => "title",
+    }
+}
+
+/// `highlight_element {x, y}` — the element under the cursor, as a `highlight` frame
+/// the UI draws as an overlay box over the screencast. Rect is in CSS-viewport
+/// pixels, the same space the incoming x/y are in.
+///
+/// This runs on every throttled mouse sample, so it must stay cheap and must never
+/// surface an error: a transient failure (mid-navigation teardown) just clears the
+/// box rather than raising a toast the user cannot act on.
+async fn handle_highlight_element(
+    session: &mut RecordingSession,
+    action: &IncomingAction,
+) -> ActionResult {
+    let x = action.data.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let y = action.data.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let args = serde_json::json!({"mode": "point", "x": x, "y": y});
+    // Short deadline on purpose. The record driver handles frames SERIALLY, so a
+    // probe that blocks on a busy page's JS thread also delays the click behind it
+    // — and a highlight the user waited a second for is stale anyway, since the
+    // cursor has already moved. `get_element_info` (click-driven, rare) can afford
+    // its 5s; a 10-per-second hover stream cannot.
+    let info = match tokio::time::timeout(
+        Duration::from_millis(750),
+        crate::browser::page_query::evaluate_with_args::<Option<serde_json::Value>>(
+            &session.page,
+            ELEMENT_PICKER_JS,
+            args,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(Some(info))) => info,
+        // Empty page chrome, a probe failure, or a timeout — all mean "nothing to
+        // highlight right now". A frame with no `rect` clears the UI's overlay.
+        _ => return ActionResult::ok_with_data(serde_json::json!({"type": "highlight"})),
+    };
+
+    ActionResult::ok_with_data(serde_json::json!({
+        "type": "highlight",
+        "rect": info.get("rect").cloned().unwrap_or(serde_json::Value::Null),
+        "selector": info.get("selector").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+/// `clear_highlight` — drop the overlay (the user left extraction mode or moved off
+/// the canvas). The box is drawn by the UI, not injected into the page, so this is
+/// just the "no rect" frame; it exists so the UI's own teardown frame isn't an error.
+async fn handle_clear_highlight() -> ActionResult {
+    ActionResult::ok_with_data(serde_json::json!({"type": "highlight"}))
+}
+
+/// Build the recorded `options` for an extract step from the UI's payload. Shared by
+/// `add_extract_step` and `test_extract` so a test runs EXACTLY the step that gets
+/// recorded.
+///
+/// `variable` mirrors `output_name` because replay reads `variable`
+/// (`automation::step_eval::execute_extract`) while the UI shows `output_name`.
+fn extract_step_options(action: &IncomingAction) -> HashMap<String, serde_json::Value> {
+    let d = &action.data;
+    let get_str = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or("");
+
+    let output_name = {
+        let n = get_str("output_name");
+        if n.is_empty() { "extracted_data" } else { n }
+    };
+    let extract_type = {
+        let t = get_str("extract_type");
+        if t.is_empty() { "text" } else { t }
+    };
+
+    let mut opts: HashMap<String, serde_json::Value> = HashMap::new();
+    opts.insert("output_name".into(), serde_json::json!(output_name));
+    opts.insert("variable".into(), serde_json::json!(output_name));
+    opts.insert("extract_type".into(), serde_json::json!(extract_type));
+
+    if extract_type == "attribute" {
+        let attr = get_str("attribute");
+        let attr = if attr.is_empty() {
+            // The picker's tag, when it sent one, decides the sensible default.
+            default_extract_attribute(get_str("tag")).to_string()
+        } else {
+            attr.to_string()
+        };
+        opts.insert("attribute".into(), serde_json::json!(attr));
+    }
+    if let Some(script) = d.get("script").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        opts.insert("script".into(), serde_json::json!(script));
+    }
+    opts
+}
+
+/// A `WorkflowStepConfig` equivalent to the recorded extract step, so a live test
+/// goes through the REAL replay executor rather than a second implementation that
+/// could drift from it.
+fn extract_step_config(
+    selector: &str,
+    opts: &HashMap<String, serde_json::Value>,
+) -> crate::models::workflow::WorkflowStepConfig {
+    let mut config = crate::models::workflow::WorkflowStepConfig {
+        selector: Some(selector.to_string()),
+        script: opts.get("script").and_then(|v| v.as_str()).map(String::from),
+        ..Default::default()
+    };
+    // `extra` is the flattened catch-all the executor reads (`variable`,
+    // `extract_type`, `attribute`, …).
+    for (k, v) in opts {
+        config.extra.insert(k.clone(), v.clone());
+    }
+    config
+}
+
+/// `add_extract_step` — record an `extract` step for the element the user confirmed
+/// in the picker popover. The recorded step is what replay runs, so its options are
+/// built by the shared `extract_step_options`.
+async fn handle_add_extract_step(
+    session: &mut RecordingSession,
+    action: &IncomingAction,
+) -> ActionResult {
+    let d = &action.data;
+    let selector = d.get("selector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let extract_type = d
+        .get("extract_type")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("text");
+
+    // A `computed` extract carries its own script and needs no selector; every other
+    // type reads a DOM element, so a missing selector could only ever fail at replay.
+    let has_script = d
+        .get("script")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    if extract_type == "computed" && !has_script {
+        // Replay falls back to a plain text extract when a computed step has no
+        // script — it would "succeed" while extracting something else entirely.
+        // Refuse it here instead, where the user can still fix it.
+        return ActionResult::err("add_extract_step: a custom-script extract needs a script");
+    }
+    if selector.is_empty() && !(extract_type == "computed" && has_script) {
+        return ActionResult::err("add_extract_step: selector required");
+    }
+
+    let opts = extract_step_options(action);
+    let output_name = opts
+        .get("output_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("extracted_data")
+        .to_string();
+
+    let desc = d
+        .get("description")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| format!("Extract {extract_type} → {output_name}"));
+
+    let step = RecordedStep {
+        step_type: StepType::Extract,
+        timestamp: super::step_recording::current_timestamp(),
+        id: uuid::Uuid::new_v4().to_string(),
+        selector: if selector.is_empty() { None } else { Some(selector) },
+        url: None,
+        value: None,
+        description: Some(desc),
+        coordinates: None,
+        viewport: None,
+        options: Some(opts),
+    };
+    super::step_recording::record_step_with_delay(session, step);
+
+    ActionResult::ok()
+}
+
+/// `test_extract` — run an extraction against the LIVE page and return what it
+/// yields, so the user can check a selector before trusting it in a run. Goes
+/// through the same executor as replay; nothing is recorded.
+async fn handle_test_extract(
+    session: &mut RecordingSession,
+    action: &IncomingAction,
+) -> ActionResult {
+    let selector = action
+        .data
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let opts = extract_step_options(action);
+    let output_name = opts
+        .get("output_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("extracted_data")
+        .to_string();
+    let config = extract_step_config(&selector, &opts);
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(15),
+        crate::automation::step_eval::execute_extract(&session.page, &config),
+    )
+    .await;
+
+    let (value, error) = match outcome {
+        Ok(Ok(Some(map))) => (
+            map.get(&output_name).cloned().unwrap_or(serde_json::Value::Null),
+            None,
+        ),
+        Ok(Ok(None)) => (serde_json::Value::Null, None),
+        Ok(Err(e)) => (serde_json::Value::Null, Some(e.to_string())),
+        Err(_) => (serde_json::Value::Null, Some("Extraction timed out".to_string())),
+    };
+
+    ActionResult::ok_with_data(serde_json::json!({
+        "type": "extract_test_result",
+        "selector": selector,
+        "output_name": output_name,
+        "extract_type": opts.get("extract_type").cloned().unwrap_or(serde_json::Value::Null),
+        "success": error.is_none(),
+        "value": value,
+        "error": error,
+    }))
+}
+
 async fn handle_test_streaming_script(
     _session: &mut RecordingSession,
     _action: &IncomingAction,
@@ -1419,4 +1699,110 @@ async fn handle_test_streaming_script(
     // Expose Playwright bridge functions, run script in eval harness
     // This is a complex feature that will be ported in a future iteration
     ActionResult::ok()
+}
+
+#[cfg(test)]
+mod extraction_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn action(data: serde_json::Value) -> IncomingAction {
+        serde_json::from_value(data).expect("action frame")
+    }
+
+    #[test]
+    fn passthrough_covers_the_extraction_frames() {
+        // These two are the reason the allowlist is shared: a frame the agent emits
+        // but neither transport forwards is invisible, with nothing in any log.
+        assert!(is_passthrough_frame("highlight"));
+        assert!(is_passthrough_frame("extract_test_result"));
+        // Pre-existing overlays must keep working.
+        assert!(is_passthrough_frame("select_options"));
+        assert!(is_passthrough_frame("native_picker"));
+        // A step/event frame is NOT an overlay — it has its own emit path.
+        assert!(!is_passthrough_frame("step_recorded"));
+    }
+
+    #[test]
+    fn attribute_default_follows_the_tag() {
+        assert_eq!(default_extract_attribute("a"), "href");
+        assert_eq!(default_extract_attribute("A"), "href");
+        assert_eq!(default_extract_attribute("img"), "src");
+        assert_eq!(default_extract_attribute("input"), "value");
+        assert_eq!(default_extract_attribute("meta"), "content");
+        assert_eq!(default_extract_attribute("div"), "title");
+    }
+
+    #[test]
+    fn options_mirror_output_name_into_variable() {
+        // Replay reads `variable`; the UI shows `output_name`. A step that set only
+        // one of them extracts into the wrong key.
+        let opts = extract_step_options(&action(json!({
+            "type": "action", "action": "add_extract_step",
+            "selector": "h1", "output_name": "title", "extract_type": "text",
+        })));
+        assert_eq!(opts["output_name"], json!("title"));
+        assert_eq!(opts["variable"], json!("title"));
+        assert_eq!(opts["extract_type"], json!("text"));
+        assert!(!opts.contains_key("attribute"));
+    }
+
+    #[test]
+    fn options_default_a_blank_output_name_and_type() {
+        let opts = extract_step_options(&action(json!({
+            "type": "action", "action": "add_extract_step",
+            "selector": "h1", "output_name": "", "extract_type": "",
+        })));
+        assert_eq!(opts["output_name"], json!("extracted_data"));
+        assert_eq!(opts["variable"], json!("extracted_data"));
+        assert_eq!(opts["extract_type"], json!("text"));
+    }
+
+    #[test]
+    fn attribute_extract_resolves_from_the_tag_when_unnamed() {
+        let opts = extract_step_options(&action(json!({
+            "type": "action", "action": "add_extract_step",
+            "selector": "a.result", "output_name": "link",
+            "extract_type": "attribute", "attribute": "", "tag": "a",
+        })));
+        assert_eq!(opts["attribute"], json!("href"));
+    }
+
+    #[test]
+    fn an_explicit_attribute_wins_over_the_tag_default() {
+        let opts = extract_step_options(&action(json!({
+            "type": "action", "action": "add_extract_step",
+            "selector": "a.result", "output_name": "link",
+            "extract_type": "attribute", "attribute": "data-id", "tag": "a",
+        })));
+        assert_eq!(opts["attribute"], json!("data-id"));
+    }
+
+    #[test]
+    fn step_config_carries_the_options_replay_reads() {
+        // `test_extract` must exercise the SAME config replay builds, or a green
+        // test would say nothing about the recorded step.
+        let opts = extract_step_options(&action(json!({
+            "type": "action", "action": "test_extract",
+            "selector": "a", "output_name": "link",
+            "extract_type": "attribute", "attribute": "href",
+        })));
+        let config = extract_step_config("a", &opts);
+        assert_eq!(config.selector.as_deref(), Some("a"));
+        assert_eq!(config.extra["variable"], json!("link"));
+        assert_eq!(config.extra["extract_type"], json!("attribute"));
+        assert_eq!(config.extra["attribute"], json!("href"));
+    }
+
+    #[test]
+    fn computed_extract_carries_its_script_into_the_config() {
+        let opts = extract_step_options(&action(json!({
+            "type": "action", "action": "test_extract",
+            "selector": "", "output_name": "rows",
+            "extract_type": "computed", "script": "() => 1 + 1",
+        })));
+        let config = extract_step_config("", &opts);
+        assert_eq!(config.script.as_deref(), Some("() => 1 + 1"));
+        assert_eq!(config.extra["extract_type"], json!("computed"));
+    }
 }
