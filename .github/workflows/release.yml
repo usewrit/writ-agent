@@ -215,10 +215,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
+      # FILTER. Without `pattern` this downloads EVERY artifact in the run, which is no longer just
+      # the release archives: the per-arch image jobs upload `image-digest-*`, and
+      # `docker/build-push-action` uploads a `*.dockerbuild` build record of its own. Pulling all
+      # nine (~290 MB) is how this job died on a blob-download retry — and had it succeeded,
+      # `files: dist/*` below would have published the digest files and build records as release
+      # assets. Only the archives and their checksums belong on the release page.
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: writ-agent-fleet-*
           merge-multiple: true
+      - name: Show what will be attached
+        run: ls -lh dist/
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
