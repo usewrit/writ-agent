@@ -63,9 +63,11 @@ fn find_installed_browser() -> bool {
 /// Rust bindings drive it unchanged — they just go through patchright's stealth
 /// layer underneath.
 ///
-/// Resolution: `WRIT_PATCHRIGHT_DRIVER` (operator override → a `.../driver` dir),
-/// else `python3`/`python -c "import patchright"` to find the installed package.
-/// Returns `None` when patchright isn't installed, so the caller transparently
+/// Resolution, in order: `WRIT_PATCHRIGHT_DRIVER` (operator override → a `.../driver` dir),
+/// `WRIT_BUNDLED_DRIVER` (what an installer shipped), a
+/// `patchright-driver/` shipped NEXT TO the executable (or under `WRIT_HOME`) so a release needs no
+/// Python at all, then `python3`/`python -c "import patchright"` to find an installed package, then
+/// common site-packages globs. Returns `None` when nothing is found, so the caller transparently
 /// falls back to the bundled vanilla driver.
 pub fn find_patchright_driver() -> Option<(PathBuf, PathBuf)> {
     // 1. Explicit operator override — a `.../patchright/driver` directory.
@@ -74,7 +76,35 @@ pub fn find_patchright_driver() -> Option<(PathBuf, PathBuf)> {
             return Some(r);
         }
     }
-    // 2. Interpreters that can `import patchright`: the patchright CLI's OWN python
+    // 2. The driver the INSTALLER bundled.
+    //
+    // The desktop app ships a patchright driver and hands the daemon `WRIT_BUNDLED_DRIVER`
+    // ("wiring bundled patchright driver for writ-agentd"), but only `runtime_setup`'s
+    // chromium-install resolver ever read that variable — this lookup checked a DIFFERENT name
+    // (`WRIT_PATCHRIGHT_DRIVER`). So the bundle installed Chromium and was then ignored for the
+    // stealth path: the daemon reported the driver as bundled while launching VANILLA. Read the
+    // same variable here, with the same dir-or-node-exe tolerance `resolve_install_command` uses.
+    if let Ok(raw) = std::env::var("WRIT_BUNDLED_DRIVER") {
+        let p = PathBuf::from(raw);
+        let dir = if p.is_dir() { p.clone() } else { p.parent().map(Path::to_path_buf).unwrap_or(p) };
+        if let Some(r) = driver_from_dir(&dir) {
+            return Some(r);
+        }
+    }
+    // 3. A patchright driver that TRAVELS WITH the binary.
+    //
+    // Every probe below this point needs a Python interpreter that can `import patchright`. A
+    // downloaded release binary / container image has no such interpreter, so a SHIPPED agent
+    // always fell through to the vanilla driver — silently, since the fallback only logs a warning.
+    // Vanilla leaves `Runtime.enable` on, which is an instant anti-bot tell, so the stealth path
+    // existed but was dead in exactly the deployments that need it most. Probing a sibling
+    // directory first lets the release drop the driver in with no Python anywhere in the image.
+    for dir in sibling_patchright_candidates() {
+        if let Some(r) = driver_from_dir(&dir) {
+            return Some(r);
+        }
+    }
+    // 4. Interpreters that can `import patchright`: the patchright CLI's OWN python
     //    (via its shebang — most reliable, it's by definition the env that has it),
     //    then python3 / python on PATH.
     let mut interps: Vec<String> = Vec::new();
@@ -90,13 +120,42 @@ pub fn find_patchright_driver() -> Option<(PathBuf, PathBuf)> {
             }
         }
     }
-    // 3. Glob common site-packages layouts (user-site + nearby venvs).
+    // 5. Glob common site-packages layouts (user-site + nearby venvs).
     for dir in candidate_patchright_dirs() {
         if let Some(r) = driver_from_dir(&dir) {
             return Some(r);
         }
     }
     None
+}
+
+/// Directory name a PATCHRIGHT (stealth) driver shipped alongside the binary uses.
+/// Kept next to [`SIBLING_DRIVER_DIRNAME`] because the same three things must agree on it: this
+/// lookup, the release archive layout, and the container image. Deliberately a DIFFERENT directory
+/// from the vanilla one so a release can carry both and the stealth driver is chosen on merit
+/// rather than by overwriting.
+pub const SIBLING_PATCHRIGHT_DIRNAME: &str = "patchright-driver";
+
+/// Candidate directories for a bundled patchright driver, most specific first.
+///
+/// SECURITY: mirrors [`sibling_driver_candidates`] exactly — the resolved `node` is EXECUTED, so
+/// every candidate is anchored to the running executable's own directory or `WRIT_HOME`, never to
+/// the CWD and never to anything remote.
+fn sibling_patchright_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            out.push(dir.join(SIBLING_PATCHRIGHT_DIRNAME));
+        }
+    }
+    let writ_home = std::env::var("WRIT_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs_home().map(|h| h.join(".writ")));
+    if let Some(home) = writ_home {
+        out.push(home.join(SIBLING_PATCHRIGHT_DIRNAME));
+    }
+    out
 }
 
 /// Directory name a driver shipped **alongside** the binary is expected to use.
@@ -392,6 +451,20 @@ async fn try_install_command(program: &str, args: &[&str]) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Serializes every env-mutating test in this module.
+    ///
+    /// `local::config::test_env_guard` is gated behind the `local` feature, which is NOT in
+    /// `default` — so under a plain `cargo test` it compiled to nothing and these tests raced each
+    /// other on `HOME`/`WRIT_HOME` (process-global). The symptom was a failing assertion in a test
+    /// that had not changed, which reads like a real regression rather than a flake. This lock is
+    /// unconditional, so it holds for every feature combination.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        // Do not let one panicking test poison the rest of the module.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     use super::*;
 
     #[test]
@@ -401,6 +474,7 @@ mod tests {
         // test's `Paths::resolve()` (e.g. the backup snapshot opening the wrong keyed DB). The shared
         // guard lives in `local::config`; the WRIT_HOME-based tests it serializes with only exist in
         // the `local` build, so the guard is only needed there.
+        let _lock = env_lock();
         #[cfg(feature = "local")]
         let _g = crate::local::config::test_env_guard();
         // A poisoned $PATH could resolve `patchright` anywhere; only paths under a
@@ -410,7 +484,13 @@ mod tests {
         std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
         std::fs::write(&inside, b"#!/usr/bin/python3\n").unwrap();
 
-        // Preserve and override the env for a deterministic check.
+        // Preserve and override the env for a deterministic check. The guard is what makes
+        // "preserve and restore" actually deterministic: HOME/WRIT_HOME are process-global, so
+        // without it a sibling test mutating them on another thread lands mid-assertion.
+        let _lock = env_lock();
+        #[cfg(feature = "local")]
+        let _g = crate::local::config::test_env_guard();
+
         let prev_home = std::env::var("HOME").ok();
         let prev_writ = std::env::var("WRIT_HOME").ok();
         std::env::set_var("WRIT_HOME", &tmp);
@@ -442,6 +522,7 @@ mod tests {
     /// `WRIT_HOME` is the documented second place to drop one.
     #[test]
     fn sibling_driver_is_found_next_to_the_executable_and_under_writ_home() {
+        let _lock = env_lock();
         #[cfg(feature = "local")]
         let _g = crate::local::config::test_env_guard();
 
@@ -491,5 +572,49 @@ mod tests {
             None => std::env::remove_var("WRIT_HOME"),
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A release ships the stealth driver next to the binary; no Python is involved. This pins the
+    /// directory name the release archive must use — if it drifts, a shipped agent silently falls
+    /// back to the vanilla driver (Runtime.enable on = detectable), which is exactly the failure
+    /// this lookup was added to end.
+    #[test]
+    fn sibling_patchright_dir_is_probed_from_writ_home() {
+        // `WRIT_HOME` is process-global and several tests in this file drive it. Without the shared
+        // guard this races them (they run on parallel threads), which is exactly how it first went
+        // red — a flake, not a real failure, and the worst kind to leave behind.
+        let _lock = env_lock();
+        #[cfg(feature = "local")]
+        let _g = crate::local::config::test_env_guard();
+
+        let tmp = std::env::temp_dir().join(format!("writ-pr-{}", std::process::id()));
+        let dir = tmp.join(SIBLING_PATCHRIGHT_DIRNAME);
+        std::fs::create_dir_all(dir.join("package")).unwrap();
+        let node = dir.join(if cfg!(windows) { "node.exe" } else { "node" });
+        std::fs::write(&node, b"").unwrap();
+        std::fs::write(dir.join("package").join("cli.js"), b"").unwrap();
+
+        // SAFETY: single-threaded test process; restored immediately below.
+        let prev = std::env::var_os("WRIT_HOME");
+        std::env::set_var("WRIT_HOME", &tmp);
+        let found = sibling_patchright_candidates()
+            .into_iter()
+            .find_map(|d| driver_from_dir(&d));
+        match prev {
+            Some(v) => std::env::set_var("WRIT_HOME", v),
+            None => std::env::remove_var("WRIT_HOME"),
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+
+        let (n, c) = found.expect("a patchright driver under WRIT_HOME must be found");
+        assert_eq!(n, node);
+        assert!(c.ends_with("package/cli.js") || c.ends_with("package\\cli.js"));
+    }
+
+    /// The stealth and vanilla sibling directories must stay DISTINCT, so a release can carry both
+    /// and the stealth one wins on merit instead of one silently overwriting the other.
+    #[test]
+    fn sibling_driver_dirnames_are_distinct() {
+        assert_ne!(SIBLING_PATCHRIGHT_DIRNAME, SIBLING_DRIVER_DIRNAME);
     }
 }

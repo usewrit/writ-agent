@@ -355,6 +355,25 @@ pub async fn get_by_id(pool: &SqlitePool, id: i64) -> LocalResult<Option<Target>
     Ok(row)
 }
 
+/// Fetch many targets by id in ONE round trip. Empty input ⇒ empty result. Ids that do not exist are
+/// simply absent from the result, so the caller must not assume a 1:1 index with `ids`.
+///
+/// Mirrors [`super::monitor_state::get_many`]. Callers that hold a set of ids should use this rather
+/// than looping over [`get_by_id`] — the scheduler's stale sweep runs on every tick and was issuing
+/// one query per monitored target.
+pub async fn get_many(pool: &SqlitePool, ids: &[i64]) -> LocalResult<Vec<Target>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT {SELECT_COLS} FROM targets WHERE id IN ({placeholders})");
+    let mut q = sqlx::query_as::<_, Target>(&sql);
+    for id in ids {
+        q = q.bind(id);
+    }
+    Ok(q.fetch_all(pool).await?)
+}
+
 /// List targets newest-first, capped at `limit`.
 pub async fn list(pool: &SqlitePool, limit: i64) -> LocalResult<Vec<Target>> {
     let rows = sqlx::query_as::<_, Target>(&format!(

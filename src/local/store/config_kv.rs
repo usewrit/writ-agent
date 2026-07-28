@@ -11,6 +11,17 @@ use super::super::error::LocalResult;
 use sqlx::sqlite::SqlitePool;
 use sqlx::Row;
 
+/// `config` key holding the gateway-assigned recorder `agent_id` for a cloud-linked desktop.
+///
+/// This lives HERE, with the other `config` key names, rather than in `cloud::gateway` — it is a
+/// row NAME in this table, not cloud transport. Keeping it in the cloud module forced non-cloud
+/// callers (`api::v1::cloud_agent`, `relay::cloud`) to `use crate::local::cloud::gateway::…` just to
+/// read a string constant, which trips `scripts/desktop/offline-first-guard.sh` (the `cloud::gateway`
+/// pattern) even though no cloud reach is involved. `cloud::gateway` re-exports it for continuity.
+///
+/// The value is non-secret routing metadata (see the module note above: no secrets in `config`).
+pub const LINKED_AGENT_ID_KEY: &str = "cloud.linked_agent_id";
+
 /// One row of the `config` table.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
 pub struct ConfigEntry {

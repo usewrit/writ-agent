@@ -33,11 +33,15 @@ WORKDIR /app
 
 # Install build dependencies. `make` + `perl` are required by the `local` feature's
 # bundled SQLCipher + vendored OpenSSL (libsqlite3-sys bundled-sqlcipher-vendored-openssl).
+# `python3`/`venv` exist ONLY to unpack patchright's stealth driver below; neither python nor pip
+# reaches the runtime stage.
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     make \
     perl \
+    python3 \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # Browsers are installed into a stable, image-wide path (not $HOME/.cache) so the
@@ -109,6 +113,35 @@ RUN set -eux; \
     test -x /opt/playwright-driver/node; \
     /opt/playwright-driver/node /opt/playwright-driver/package/cli.js install --with-deps chromium
 
+# Stage patchright's STEALTH driver — the one the agent actually prefers at runtime.
+#
+# Vanilla Playwright issues `Runtime.enable`, which is both the #1 anti-bot signature and the source
+# of a console/runtime event flood. `browser::install::find_patchright_driver` prefers patchright
+# whenever it can find it, but every one of its other probes needs a Python that can
+# `import patchright` — which this runtime image deliberately does not ship. So without this stage
+# the image silently ran VANILLA and only a warning line said so. Staging the driver at a fixed path
+# lets the runtime stage carry it as `<exe dir>/patchright-driver`, which that lookup now checks
+# FIRST, with no interpreter anywhere in the final image.
+#
+# Pinned to the 1.60 line on purpose: patchright bundles `playwright-core` 1.60, which is the exact
+# wire protocol the vendored playwright-rs 0.13 speaks. A different minor would drive a protocol the
+# Rust bindings were not built against.
+#
+# Chromium is installed THROUGH this driver because it is the one that launches at runtime. Both
+# drivers are playwright-core 1.60, so they resolve the same browser revision and the shared
+# PLAYWRIGHT_BROWSERS_PATH makes the second install a no-op rather than a second download.
+RUN set -eux; \
+    python3 -m venv /tmp/pr-venv; \
+    /tmp/pr-venv/bin/pip install --no-cache-dir --quiet "patchright==1.60.*"; \
+    PR_DIR="$(/tmp/pr-venv/bin/python -c 'import patchright, pathlib; print(pathlib.Path(patchright.__file__).parent / "driver")')"; \
+    test -f "$PR_DIR/package/cli.js"; \
+    mkdir -p /opt/patchright-driver; \
+    cp -a "$PR_DIR/." /opt/patchright-driver/; \
+    test -x /opt/patchright-driver/node; \
+    test -f /opt/patchright-driver/package/cli.js; \
+    /opt/patchright-driver/node /opt/patchright-driver/package/cli.js install --with-deps chromium; \
+    rm -rf /tmp/pr-venv
+
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 
@@ -163,6 +196,12 @@ COPY --from=builder /app/target/release/writ-agent-fleet /app/writ-agent-fleet
 # `<exe dir>/playwright-driver` precisely so this copy is all that is needed. Without it the image
 # starts, connects, reports healthy — and then fails every run at browser launch.
 COPY --from=builder /opt/playwright-driver /app/playwright-driver
+
+# ...and patchright's STEALTH driver, which `find_patchright_driver` checks BEFORE the vanilla
+# sibling above. Kept as a SEPARATE directory so the image carries both and the stealth one is
+# chosen on merit — overwriting the vanilla one would leave no way to A/B them via
+# WRIT_DISABLE_PATCHRIGHT. Without this copy the container runs detectable (Runtime.enable on).
+COPY --from=builder /opt/patchright-driver /app/patchright-driver
 
 # Create a dedicated non-root user. Chromium runs under this user; its own
 # sandbox is managed by the app (see browser/context.rs) — we deliberately do NOT

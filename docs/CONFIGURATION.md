@@ -110,18 +110,28 @@ Resolved once at process start (`browser::manager::init_driver_env`), in this or
 
 1. `PLAYWRIGHT_DRIVER_PATH`, or `PLAYWRIGHT_NODE_EXE` + `PLAYWRIGHT_CLI_JS` — an operator override
    wins outright and nothing below runs.
-2. **patchright's stealth driver**, if installed (unless `WRIT_DISABLE_PATCHRIGHT=1`). Preferred
-   because it suppresses `Runtime.enable`, the biggest anti-bot signature.
-3. **A driver shipped alongside the binary** — `<directory of the executable>/playwright-driver`,
-   then `$WRIT_HOME/playwright-driver`. This is how the release archives and the container image
-   ship it.
+2. **patchright's stealth driver** (unless `WRIT_DISABLE_PATCHRIGHT=1`), looked up as
+   `WRIT_PATCHRIGHT_DRIVER` → `<directory of the executable>/patchright-driver` →
+   `$WRIT_HOME/patchright-driver` → a Python that can `import patchright`. Preferred because it
+   suppresses `Runtime.enable`, the biggest anti-bot signature.
+3. **The vanilla driver shipped alongside the binary** — `<directory of the executable>/playwright-driver`,
+   then `$WRIT_HOME/playwright-driver`.
 4. The **compile-time bundled** driver baked in by `vendor/playwright-rs/build.rs`.
 
-Step 4 is an absolute path on the machine that *compiled* the binary, so it only resolves for a
-build you made yourself and did not move. That is exactly why step 3 exists: keep
-`playwright-driver/` next to `writ-agent-fleet` and a downloaded release works with no
-configuration. A binary with none of the four available starts and connects normally, then fails
-at the first browser launch — check the startup log line naming the driver it chose.
+The two sibling lookups are why a downloaded release or the container image needs no configuration:
+step 4 is an absolute path on the machine that *compiled* the binary, so it only resolves for a
+build you made yourself and did not move. Keep `playwright-driver/` (and, in the image,
+`patchright-driver/`) next to `writ-agent-fleet` and everything resolves on its own.
+
+The sibling lookup in step 2 matters for exactly the deployments that need stealth most. Every
+other patchright probe requires an interpreter that can `import patchright`, and neither the
+container image nor a release archive ships Python — so before it existed those deployments silently
+ran **vanilla** (detectable, `Runtime.enable` on) with only a warning line to say so. The container
+image now carries both drivers side by side, so the stealth one is chosen on merit and
+`WRIT_DISABLE_PATCHRIGHT=1` still falls back cleanly to the vanilla one.
+
+A binary with none of the four available starts and connects normally, then fails at the first
+browser launch — check the startup log line naming the driver it chose.
 
 #### Dangerous browser-security toggles (all default `false` = secure)
 

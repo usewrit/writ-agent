@@ -885,6 +885,15 @@ struct FrontierItem {
     depth: i64,
 }
 
+/// A host refusal (429 / 403 / captcha wall), carried around so an escalation can report the
+/// ORIGINAL refusal if the escalated attempt doesn't pan out.
+#[derive(Clone)]
+struct BlockInfo {
+    kind: &'static str,
+    status: Option<u16>,
+    retry_after: Option<u32>,
+}
+
 /// What a worker (or the browser fallback) produced for one page.
 enum PageOutcome {
     Extracted {
@@ -904,7 +913,15 @@ enum PageOutcome {
     },
     /// HTTP came back but the content is a thin JS shell / an error status — retry with a browser.
     /// `thin_html` carries the HTTP body (if any) so a failed browser attempt can still degrade to it.
-    NeedsBrowser { thin_html: Option<String> },
+    ///
+    /// `blocked_fallback` is set when the HTTP lane was REFUSED (403/429/…) and we are escalating to
+    /// the browser to see whether a real Chromium gets through. It carries the original refusal so a
+    /// missing/failed browser reports that refusal verbatim instead of a generic failure — the URL is
+    /// still not dead, and the coordinator must still be told to retry it elsewhere.
+    NeedsBrowser {
+        thin_html: Option<String>,
+        blocked_fallback: Option<BlockInfo>,
+    },
     /// The host REFUSED us (429 / 403 / captcha wall). Distinct from `Failed`: the URL is not dead,
     /// so the coordinator requeues it to a different agent instead of dropping it.
     Blocked {
@@ -1349,8 +1366,17 @@ async fn resolve_outcome(
     outcome: PageOutcome,
     now: &str,
 ) -> PageOutcome {
-    let PageOutcome::NeedsBrowser { thin_html } = outcome else {
+    let PageOutcome::NeedsBrowser { thin_html, blocked_fallback } = outcome else {
         return outcome;
+    };
+    // Escalating a refusal: if the browser can't run or can't get through, the page is still
+    // REFUSED, not failed — reporting it as a failure would drop a live URL instead of requeueing it.
+    let refused = |info: Option<BlockInfo>| -> Option<PageOutcome> {
+        info.map(|i| PageOutcome::Blocked {
+            kind: i.kind,
+            status: i.status,
+            retry_after: i.retry_after,
+        })
     };
     // Try the warm browser for a JS-rendered render, when one is available.
     if let Some(browser) = browser {
@@ -1363,7 +1389,11 @@ async fn resolve_outcome(
             // refusal so the coordinator retries elsewhere rather than banking an empty page.
             // Checked BEFORE extraction so a wall never pays for a full parse.
             if let Some(kind) = classify_block(None, &html) {
-                return PageOutcome::Blocked { kind, status: None, retry_after: None };
+                // The render hit a wall too. Prefer the ORIGINAL refusal when this was an
+                // escalation — it carries the real status / Retry-After, which the rendered
+                // wall (status None) does not.
+                return refused(blocked_fallback)
+                    .unwrap_or(PageOutcome::Blocked { kind, status: None, retry_after: None });
             }
             let ex = match extract_offloaded(
                 html,
@@ -1424,7 +1454,12 @@ async fn resolve_outcome(
             };
         }
     }
-    // Browser unavailable / failed — degrade to the HTTP body if we captured one.
+    // Browser unavailable / failed. An escalated refusal reports as refused (there is no usable
+    // body — see the `thin_html: None` note at the escalation site), so it is checked first.
+    if let Some(blocked) = refused(blocked_fallback) {
+        return blocked;
+    }
+    // Otherwise degrade to the HTTP body if we captured one.
     if let Some(html) = thin_html {
         let ex = match extract_offloaded(
             html,
@@ -1471,7 +1506,7 @@ async fn fetch_and_extract(client: reqwest::Client, cfg: Arc<CrawlConfig>, item:
         Ok(f) => f,
         Err(reason) => {
             let outcome = if may_browser {
-                PageOutcome::NeedsBrowser { thin_html: None }
+                PageOutcome::NeedsBrowser { thin_html: None, blocked_fallback: None }
             } else {
                 PageOutcome::Failed { reason }
             };
@@ -1481,23 +1516,37 @@ async fn fetch_and_extract(client: reqwest::Client, cfg: Arc<CrawlConfig>, item:
 
     if fetched.status >= 400 {
         // REFUSAL vs failure. A 429/403/407/451 is the host turning US away — the URL is fine, this
-        // agent (or its IP) isn't welcome. Report it `blocked` so the coordinator retries it on a
-        // different agent rather than counting a dead link; a browser retry here would just burn a
-        // render against the same wall. Anything else (404, 500, …) is a genuine failure, and an
+        // agent (or its IP) isn't welcome. Anything else (404, 500, …) is a genuine failure, and an
         // HTML page may still render, so it keeps the browser-retry path.
+        //
+        // A refusal ESCALATES to the browser once before it is reported. This lane is a `reqwest`
+        // client that sends a real Chrome User-Agent, so its TLS/HTTP2 fingerprint contradicts the
+        // UA it claims — which is exactly what a bot-management edge (Cloudflare et al.) 403s, while
+        // serving the very same URL to a real browser. Treating the refusal as terminal here meant a
+        // whole site could be reported "blocked" without one render ever being attempted, and the
+        // coordinator would then requeue those URLs to other agents that fail identically.
+        //
+        // `thin_html` is deliberately None: the body of a 403 is the wall's own error page, and
+        // banking it as content would be worse than reporting the refusal.
         if let Some(kind) = classify_block(Some(fetched.status), "") {
-            return WorkerOut {
-                url: item.url,
-                depth: item.depth,
-                outcome: PageOutcome::Blocked {
-                    kind,
-                    status: Some(fetched.status),
-                    retry_after: fetched.retry_after,
-                },
+            let info = BlockInfo {
+                kind,
+                status: Some(fetched.status),
+                retry_after: fetched.retry_after,
             };
+            let outcome = if may_browser {
+                PageOutcome::NeedsBrowser { thin_html: None, blocked_fallback: Some(info) }
+            } else {
+                PageOutcome::Blocked {
+                    kind: info.kind,
+                    status: info.status,
+                    retry_after: info.retry_after,
+                }
+            };
+            return WorkerOut { url: item.url, depth: item.depth, outcome };
         }
         let outcome = if may_browser {
-            PageOutcome::NeedsBrowser { thin_html: None }
+            PageOutcome::NeedsBrowser { thin_html: None, blocked_fallback: None }
         } else {
             PageOutcome::Failed { reason: format!("HTTP {}", fetched.status) }
         };
@@ -1577,7 +1626,7 @@ async fn fetch_and_extract(client: reqwest::Client, cfg: Arc<CrawlConfig>, item:
         return WorkerOut {
             url: item.url,
             depth: item.depth,
-            outcome: PageOutcome::NeedsBrowser { thin_html: Some(html) },
+            outcome: PageOutcome::NeedsBrowser { thin_html: Some(html), blocked_fallback: None },
         };
     }
 
@@ -1605,7 +1654,7 @@ async fn fetch_and_extract(client: reqwest::Client, cfg: Arc<CrawlConfig>, item:
     };
     // auto: escalate a thin JS shell to the browser.
     let outcome = if keep_for_browser && ex.text_len < MIN_TEXT_FOR_HTTP {
-        PageOutcome::NeedsBrowser { thin_html }
+        PageOutcome::NeedsBrowser { thin_html, blocked_fallback: None }
     } else {
         let mut rows = ex.rows;
         tag_content_kind(&mut rows, "html");
@@ -2067,9 +2116,22 @@ fn build_config(crawl: &CrawlJob, browser_available: bool) -> CrawlConfig {
 
 /// Build the crawl's shared reqwest client — same UA + per-hop redirect SSRF re-vetting as the
 /// monitor checker's fast-HTTP tier.
+///
+/// The client presents as the same Chrome the browser lane launches: matching UA major and Chrome's
+/// real navigation header set (see [`crate::monitor::checker::browser_headers`]). Before this, the
+/// lane sent `accept: */*` under a Chrome User-Agent — a contradiction bot-management edges score
+/// on, and the reason a plain `curl` with no UA is served pages this lane is 403'd for.
+///
+/// KNOWN GAP: this does not change the TLS ClientHello or HTTP/2 SETTINGS fingerprint (JA3/JA4),
+/// which still says native-tls, not Chrome. A determined edge fingerprints the handshake, not just
+/// the headers, so a page that is refused here escalates to the real browser rather than being
+/// reported blocked outright (see `fetch_and_extract`). Closing the handshake gap means swapping
+/// this client for an impersonating one (e.g. `rquest`/BoringSSL) — a dependency change, not a
+/// tweak, and deliberately not folded into this fix.
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(CRAWL_UA)
+        .default_headers(crate::monitor::checker::browser_headers())
         .timeout(Duration::from_secs(30))
         // reqwest's default connect timeout is None, so a black-holing host (SYN sent, nothing back)
         // would hold a crawl worker slot for the FULL 30 s total budget. Bound the handshake itself.

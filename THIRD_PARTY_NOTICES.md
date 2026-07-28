@@ -1,7 +1,7 @@
-- **MIT License** (`MIT`) — 444 crates
+- **MIT License** (`MIT`) — 446 crates
 - **Unicode License v3** (`Unicode-3.0`) — 19 crates
 - **Apache License 2.0** (`Apache-2.0`) — 16 crates
-- **BSD 3-Clause "New" or "Revised" License** (`BSD-3-Clause`) — 7 crates
+- **BSD 3-Clause "New" or "Revised" License** (`BSD-3-Clause`) — 10 crates
 - **ISC License** (`ISC`) — 6 crates
 - **Mozilla Public License 2.0** (`MPL-2.0`) — 6 crates
 - **Creative Commons Zero v1.0 Universal** (`CC0-1.0`) — 4 crates
@@ -2333,6 +2333,33 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
+- `alloc-no-stdlib` 2.0.4 — https://github.com/dropbox/rust-alloc-no-stdlib
+- `brotli` 8.0.4 — https://github.com/dropbox/rust-brotli
+
+<details><summary>License text — BSD 3-Clause "New" or "Revised" License</summary>
+
+```
+Copyright (c) 2016 Dropbox, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+```
+
+</details>
+
+### BSD 3-Clause "New" or "Revised" License (`BSD-3-Clause`)
+
+Used by:
+
 - `subtle` 2.6.1 — https://github.com/dalek-cryptography/subtle
 
 <details><summary>License text — BSD 3-Clause "New" or "Revised" License</summary>
@@ -2502,6 +2529,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
+- `alloc-stdlib` 0.2.4 — https://github.com/dropbox/rust-alloc-no-stdlib
 - `curve25519-dalek` 4.1.3 — https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek
 
 <details><summary>License text — BSD 3-Clause "New" or "Revised" License</summary>
@@ -3283,6 +3311,39 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
+- `brotli` 8.0.4 — https://github.com/dropbox/rust-brotli
+
+<details><summary>License text — MIT License</summary>
+
+```
+Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 
 ```
 
@@ -8929,6 +8990,7 @@ Used by:
 - `age` 0.10.1 — https://github.com/str4d/rage
 - `async-openai` 0.23.4 — https://github.com/64bit/async-openai
 - `bech32` 0.9.1 — https://github.com/rust-bitcoin/rust-bech32
+- `brotli-decompressor` 5.0.3 — https://github.com/dropbox/rust-brotli-decompressor
 - `chrono-tz` 0.10.4 — https://github.com/chronotope/chrono-tz
 - `chrono` 0.4.44 — https://github.com/chronotope/chrono
 - `cookie-factory` 0.3.3 — https://github.com/rust-bakery/cookie-factory

@@ -23,7 +23,7 @@
 //! Net-new Rust (behind the `local` feature).
 
 use crate::local::cloud::agent::manager;
-use crate::local::cloud::gateway::LINKED_AGENT_ID_KEY;
+use crate::local::store::config_kv::LINKED_AGENT_ID_KEY;
 use crate::local::cloud::state::LinkState;
 use crate::local::config;
 use crate::local::error::{LocalError, LocalResult};

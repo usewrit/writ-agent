@@ -75,7 +75,12 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # HTTP client (AI providers, callbacks)
 # `multipart` is needed for the file-assets DIRECT-TO-STORAGE presigned POST upload
 # (browser/replay download capture → object storage, §4.4).
-reqwest = { version = "0.12", features = ["json", "native-tls", "blocking", "multipart", "stream", "gzip"] }
+# `brotli`/`deflate`/`zstd` are enabled so the crawl's HTTP lane can advertise the SAME
+# Accept-Encoding a real Chrome does. reqwest derives that header from the enabled features and
+# decompresses accordingly, so advertising and decoding can never drift apart — hand-writing the
+# Chrome list without these features would hand us br/zstd bodies we cannot read, and the crawl
+# would silently extract binary garbage instead of text.
+reqwest = { version = "0.12", features = ["json", "native-tls", "blocking", "multipart", "stream", "gzip", "brotli", "deflate", "zstd"] }
 
 # Browser automation (Playwright SDK — same API as Python Playwright/Patchright)
 playwright-rs = { version = "0.13", default-features = true }

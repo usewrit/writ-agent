@@ -156,11 +156,33 @@ pub(crate) fn require_secure_cloud_url(url: &str) -> LocalResult<()> {
     let after = lower.splitn(2, "://").nth(1).unwrap_or(lower.as_str());
     let authority = after.split(['/', '?', '#']).next().unwrap_or("");
     let hostport = authority.rsplit('@').next().unwrap_or(authority);
-    let is_local = hostport.starts_with("localhost")
-        || hostport.starts_with("127.")
-        || hostport.starts_with("0.0.0.0")
-        || hostport.starts_with("[::1]")
-        || hostport == "::1";
+    // Split host from port EXACTLY. A prefix match here (`starts_with("localhost")` /
+    // `starts_with("127.")`) is a bypass: `http://localhost.attacker.example/` and
+    // `http://127.attacker.example/` both satisfy it, so the loopback exemption would ship the
+    // device code and the `wto_`/`wtr_` tokens in cleartext to an attacker-controlled host.
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        // Bracketed IPv6 literal: `[::1]` / `[::1]:8131`. Whatever follows `]` must be nothing or a
+        // port — otherwise the authority is malformed (`[::1].attacker.example`) and we must not
+        // lift a loopback host out of it.
+        match rest.split_once(']') {
+            Some((inner, tail)) if tail.is_empty() || tail.starts_with(':') => inner,
+            _ => "",
+        }
+    } else if hostport.matches(':').count() > 1 {
+        // Bare IPv6 literal (`::1`). Not valid URL authority syntax, but accept it whole rather
+        // than mangling it with a port split.
+        hostport
+    } else {
+        hostport.split(':').next().unwrap_or("")
+    };
+    let is_local = host == "localhost"
+        || host == "0.0.0.0"
+        || host == "::1"
+        // The whole 127.0.0.0/8 block, parsed as an address rather than matched as a string.
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
     let allow_insecure = std::env::var("WRIT_ALLOW_INSECURE_CLOUD")
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
@@ -651,11 +673,23 @@ mod tests {
         assert!(require_secure_cloud_url("http://127.0.0.1:8080").is_ok());
         assert!(require_secure_cloud_url("http://localhost:9000/path").is_ok());
         assert!(require_secure_cloud_url("http://[::1]:9000").is_ok());
+        // The whole 127.0.0.0/8 block is loopback, not just 127.0.0.1.
+        assert!(require_secure_cloud_url("http://127.1.2.3:8080").is_ok());
+        assert!(require_secure_cloud_url("http://0.0.0.0:8131").is_ok());
         // A plaintext REMOTE base is refused (would leak the device code + wto_/wtr_ tokens).
         assert!(require_secure_cloud_url("http://api.usewrit.app").is_err());
         assert!(require_secure_cloud_url("http://evil.example.com/api").is_err());
+        // The loopback exemption is an EXACT host match — a hostname that merely STARTS WITH a
+        // loopback string is a remote, attacker-controlled host and must be refused.
+        assert!(require_secure_cloud_url("http://localhost.attacker.example/api").is_err());
+        assert!(require_secure_cloud_url("http://127.attacker.example/api").is_err());
+        assert!(require_secure_cloud_url("http://0.0.0.0.attacker.example/api").is_err());
+        assert!(require_secure_cloud_url("http://[::1].attacker.example/api").is_err());
+        // Userinfo cannot smuggle a loopback host past the authority split either.
+        assert!(require_secure_cloud_url("http://localhost@evil.example.com/api").is_err());
         // with_token rejects an insecure remote base too.
         assert!(CloudClient::with_token("http://api.usewrit.app", dummy_token()).is_err());
+        assert!(CloudClient::with_token("http://localhost.attacker.example", dummy_token()).is_err());
     }
 
     #[test]

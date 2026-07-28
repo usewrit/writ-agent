@@ -317,7 +317,7 @@ pub async fn handle(msg: &Value, browser: Option<&Arc<BrowserManager>>) -> Optio
         _ => return None,
     };
     tracing::info!(msg_type, session_id = %session_id_of(msg), live = live_count(),
-        "LinkedAgentBridge handled interactive-browsing frame");
+        "linked-agent bridge handled interactive-browsing frame");
     Some(frame)
 }
 

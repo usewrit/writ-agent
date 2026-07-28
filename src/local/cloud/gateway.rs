@@ -42,7 +42,11 @@ use super::state::LinkState;
 /// Reserved `config` kv key under which the gateway-assigned recorder `agent_id` is persisted, so the
 /// same id is reused across daemon restarts (gateway honors a re-presented id for warm affinity).
 /// Non-secret routing metadata — never holds token material.
-pub const LINKED_AGENT_ID_KEY: &str = "cloud.linked_agent_id";
+///
+/// DEFINED in [`crate::local::store::config_kv`] alongside the other `config` row names and
+/// re-exported here so this module (and its doc links) keep referring to it by the same path. A
+/// non-cloud module that only needs the key name imports it from `config_kv`, not from here.
+pub use crate::local::store::config_kv::LINKED_AGENT_ID_KEY;
 
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;

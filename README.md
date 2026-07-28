@@ -250,6 +250,7 @@ download. Every destination:
 | `https://api.usewrit.app` | **Only** if you link the *desktop daemon* to Writ Cloud (optional). | Default cloud base URL; override with `WRIT_CLOUD_URL`. HTTPS required. The `fleet` build has no cloud link at all. |
 | `api.openai.com`, `api.anthropic.com`, `generativelanguage.googleapis.com` (Gemini), or your OpenAI-compatible / Ollama endpoint | Only when you configure an AI provider **and** run an AI-assisted task. | Prompts + page DOM/screenshots go **directly** to *your* provider on *your* key — never through anyone else's infrastructure. |
 | `https://files.pythonhosted.org` (PyPI) | **Build time** (`vendor/playwright-rs/build.rs`). | The `playwright` wheel, from which the bundled Node.js driver is extracted. **SHA-256 pinned** against PyPI's published digest; the archive contains a `node` binary that is later executed, so the pin is the supply-chain anchor. Redirect to a mirror with `PLAYWRIGHT_DRIVER_URL` + `PLAYWRIGHT_DRIVER_SHA256`, or skip the download entirely with `PLAYWRIGHT_DRIVER_PATH`. |
+| `https://pypi.org` + `https://files.pythonhosted.org` | **Docker image build only** (`Dockerfile`). | `pip install "patchright==1.60.*"` in a throwaway venv, to stage the stealth driver into the image. Version-pinned to the 1.60 line (patchright bundles `playwright-core` 1.60, the wire protocol the vendored bindings speak) but **not digest-pinned** — see [`docs/DISCLOSURES.md`](./docs/DISCLOSURES.md) §5. Building the image is the only thing that does this; release binaries and `cargo build` never do. |
 | Chromium download | First browser use, via the bundled driver CLI. | See [`docs/DISCLOSURES.md`](./docs/DISCLOSURES.md) §5 "Silent binary / package downloads". Pre-install into `PLAYWRIGHT_BROWSERS_PATH` to avoid it entirely; the container image already does. |
 | Telemetry endpoint | Never, by default. | Telemetry is **default no-op**: it requires both `WRIT_TELEMETRY` opt-in **and** a configured `WRIT_TELEMETRY_DSN`. There is no built-in DSN. |
 | The sites your workflows target | When you run them. | Whatever URLs you automate. |
@@ -322,6 +323,11 @@ modified version.
 
 Third-party license notices are generated from the locked dependency graph with `cargo-about`
 (see [`about.toml`](./about.toml)) and checked in as
-[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md); CI fails if they drift. The Writ name,
-wordmark, glyph and tile are trademarks and are **not** covered by the AGPL grant — read that
-file before rebranding a fork.
+[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md); CI fails if they drift. That covers Rust
+crates only — the programs redistributed as **binaries** (the Playwright and patchright drivers,
+Node.js, Chromium) are attributed in [`BUNDLED_BINARIES.md`](./BUNDLED_BINARIES.md), because no
+Cargo tool can see them. All of them are permissively licensed and shipped unmodified; **no
+dependency of this project is AGPL** — that license is ours alone.
+
+The Writ name, wordmark, glyph and tile are trademarks and are **not** covered by the AGPL grant —
+read that file before rebranding a fork.

@@ -17,12 +17,63 @@ use crate::browser::manager::BrowserManager;
 use crate::models::session::SessionState;
 use super::models::{CheckOutcome, ReportItem, Selector, Target};
 
+/// The Chrome major this agent presents as. MUST track the Chromium that the bundled Playwright
+/// driver actually launches: the HTTP lane and the browser lane are two faces of ONE crawler, and a
+/// site that sees `Chrome/120` over HTTP and Chrome/148 from the renderer has been handed a free
+/// bot signal. `ua_matches_declared_major` pins the two together.
+pub const CHROME_MAJOR: &str = "148";
+
 /// A consistent, real-browser User-Agent. The desktop-agent picks one UA per
 /// checker instance and sticks with it so content hashes don't flip from
 /// UA-dependent server responses; we do the same.
 pub const DEFAULT_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+     (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
+
+/// The request headers a real Chrome sends on a top-level navigation, minus the ones reqwest owns.
+///
+/// A bare `reqwest` request carries `accept: */*` and nothing else while CLAIMING to be Chrome in
+/// its User-Agent. That contradiction — plus a rustls/native-tls handshake that does not look like
+/// Chrome's — is what a bot-management edge scores on, and it is why an honest `curl` with NO
+/// User-Agent is served a page that this lane gets a 403 for. Sending Chrome's actual header set
+/// closes the cheap half of that gap.
+///
+/// Deliberately NOT set here:
+/// * `accept-encoding` — reqwest derives it from its enabled codec features and decompresses to
+///   match. Hand-writing Chrome's list would advertise br/zstd we might not be built to decode.
+/// * `user-agent` — set via `ClientBuilder::user_agent` so there is one owner for it.
+///
+/// This does NOT change the TLS/HTTP2 fingerprint, which is the other half of the signal; see the
+/// note on the crawl client builder.
+pub fn browser_headers() -> reqwest::header::HeaderMap {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let mut h = HeaderMap::new();
+    let sec_ch_ua = format!(
+        "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"{m}\", \"Google Chrome\";v=\"{m}\"",
+        m = CHROME_MAJOR
+    );
+    // Insertion order is preserved by HeaderMap for distinct names, so this also reproduces
+    // Chrome's ordering rather than an alphabetical giveaway.
+    let pairs: [(HeaderName, HeaderValue); 10] = [
+        (HeaderName::from_static("sec-ch-ua"),
+         HeaderValue::from_str(&sec_ch_ua).unwrap_or(HeaderValue::from_static(""))),
+        (HeaderName::from_static("sec-ch-ua-mobile"), HeaderValue::from_static("?0")),
+        (HeaderName::from_static("sec-ch-ua-platform"), HeaderValue::from_static("\"macOS\"")),
+        (HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1")),
+        (HeaderName::from_static("accept"), HeaderValue::from_static(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,\
+             image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")),
+        (HeaderName::from_static("sec-fetch-site"), HeaderValue::from_static("none")),
+        (HeaderName::from_static("sec-fetch-mode"), HeaderValue::from_static("navigate")),
+        (HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1")),
+        (HeaderName::from_static("sec-fetch-dest"), HeaderValue::from_static("document")),
+        (HeaderName::from_static("accept-language"), HeaderValue::from_static("en-US,en;q=0.9")),
+    ];
+    for (k, v) in pairs {
+        h.insert(k, v);
+    }
+    h
+}
 
 pub struct Checker {
     http: reqwest::Client,
@@ -905,5 +956,29 @@ mod tests {
         assert!(!mk("content", false, false).needs_browser());
         assert!(mk("content", true, false).needs_browser());
         assert!(mk("content", false, true).needs_browser());
+    }
+
+    /// The HTTP lane and the browser lane must present as ONE browser. A UA claiming a different
+    /// Chrome major than the Chromium the bundled driver launches is a free bot signal, and it is
+    /// exactly the drift this caught (UA said 120 while the shipped Chromium was 148).
+    #[test]
+    fn ua_matches_declared_major() {
+        assert!(
+            DEFAULT_UA.contains(&format!("Chrome/{}.", CHROME_MAJOR)),
+            "DEFAULT_UA ({DEFAULT_UA}) must advertise Chrome major {CHROME_MAJOR}"
+        );
+    }
+
+    /// Whatever we advertise must be decodable. `accept-encoding` is reqwest's to set (it derives it
+    /// from the enabled codec features), so hand-setting it here would risk advertising br/zstd we
+    /// cannot decompress and silently extracting binary garbage.
+    #[test]
+    fn browser_headers_leave_encoding_and_ua_to_reqwest() {
+        let h = browser_headers();
+        assert!(h.get("accept-encoding").is_none(), "accept-encoding must stay reqwest's to derive");
+        assert!(h.get("user-agent").is_none(), "user-agent has exactly one owner: ClientBuilder");
+        assert_eq!(h.get("accept").unwrap().to_str().unwrap().starts_with("text/html"), true);
+        let ua_ch = h.get("sec-ch-ua").unwrap().to_str().unwrap().to_string();
+        assert!(ua_ch.contains(CHROME_MAJOR), "sec-ch-ua must agree with the UA major");
     }
 }

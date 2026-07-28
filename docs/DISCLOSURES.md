@@ -140,6 +140,20 @@ image carries it at `/app/playwright-driver`, both covered by the release
 checksum / image digest. See CONFIGURATION §"Which Playwright driver gets used"
 for the resolution order.
 
+**The container image also stages patchright's stealth driver, and that one is
+version-pinned but not digest-pinned.** The image build runs
+`pip install "patchright==1.60.*"` into a throwaway venv and copies the driver to
+`/app/patchright-driver`; the agent prefers it at runtime, so its `node` is the
+binary that actually launches your browsers. The `1.60.*` pin is a compatibility
+constraint (patchright bundles `playwright-core` 1.60, the protocol the vendored
+bindings speak), **not** an integrity one — unlike the build-time Playwright
+wheel, there is no SHA-256 to compare against, so a patch release within that
+line is trusted on PyPI's word. This applies to **building the image only**:
+release archives and a plain `cargo build` never invoke pip. If that matters for
+your threat model, build the image with `WRIT_DISABLE_PATCHRIGHT=1` in the
+runtime environment (the vanilla driver beside it is digest-pinned), or pin an
+exact version and vendor the driver yourself.
+
 ---
 
 ## 6. Anti-detection interval floors

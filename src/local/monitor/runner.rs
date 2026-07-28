@@ -1,6 +1,7 @@
 //! The check runner: select due targets, check each (bounded + isolated), persist change-only
 //! results, and dispatch `change_detected` automations through the engine.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -998,20 +999,34 @@ pub async fn sweep_stale_health(
     target_ids.sort_unstable();
     target_ids.dedup();
 
+    // Load both sides in TWO queries, not two-per-target. This sweep runs on every scheduler tick,
+    // so the previous `get_by_id` + `monitor_state::get` inside the loop cost 2×N round trips per
+    // tick for N monitored targets.
+    let targets_by_id: HashMap<i64, targets::Target> = match targets::get_many(db, &target_ids).await
+    {
+        Ok(rows) => rows.into_iter().map(|t| (t.id, t)).collect(),
+        Err(_) => return out,
+    };
+    let state_by_id: HashMap<i64, monitor_state::MonitorState> =
+        match monitor_state::get_many(db, &target_ids).await {
+            Ok(rows) => rows.into_iter().map(|s| (s.target_id, s)).collect(),
+            Err(_) => return out,
+        };
+
     let now_ms = now.timestamp_millis();
     for tid in target_ids {
-        let Some(target) = targets::get_by_id(db, tid).await.ok().flatten() else { continue };
+        let Some(target) = targets_by_id.get(&tid) else { continue };
         if target.enabled == 0 {
             continue; // a paused monitor isn't "stale"
         }
-        let Some(st) = monitor_state::get(db, tid).await.ok().flatten() else { continue };
+        let Some(st) = state_by_id.get(&tid) else { continue };
         let state = st.state.as_deref().unwrap_or("");
         // Already unhealthy (don't re-fire) or never actually checked (empty checked_at).
         if matches!(state, "stale" | "down" | "error") || st.checked_at.is_empty() {
             continue;
         }
         let Ok(checked) = DateTime::parse_from_rfc3339(&st.checked_at) else { continue };
-        let expected = effective_interval_ms(&target).max(MIN_CHECK_INTERVAL_MS);
+        let expected = effective_interval_ms(target).max(MIN_CHECK_INTERVAL_MS);
         if (now_ms - checked.timestamp_millis()) as f64 > expected as f64 * 2.5 {
             let _ = monitor_state::upsert(
                 db,
@@ -1025,7 +1040,7 @@ pub async fn sweep_stale_health(
                 },
             )
             .await;
-            let d = dispatch_health_automations(db, engine, &target, EVENT_MONITOR_STALE).await;
+            let d = dispatch_health_automations(db, engine, target, EVENT_MONITOR_STALE).await;
             out.matched += d.matched;
             out.succeeded += d.succeeded;
             out.failed += d.failed;

@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] - 2026-07-27
+## [1.0.0] - 2026-07-28
 
 ### Added
 
@@ -45,6 +45,20 @@ and this project adheres to
   compile-time path is an absolute path on the *build* machine. See
   [`docs/CONFIGURATION.md`](./docs/CONFIGURATION.md) §"Which Playwright driver
   gets used".
+- The container image ships **patchright's stealth driver** alongside the vanilla one, and
+  `find_patchright_driver` looks for `patchright-driver/` next to the executable (and under
+  `WRIT_HOME`) before falling back to probing for a Python that can `import patchright`. Every
+  previous probe needed an interpreter, which neither the image nor a release archive ships — so
+  those deployments silently ran **vanilla** (detectable: `Runtime.enable` on, plus the console
+  event flood that inflates per-action latency) with only a warning line to say so. Both drivers are
+  kept as separate directories so the stealth one is chosen on merit and `WRIT_DISABLE_PATCHRIGHT=1`
+  still falls back cleanly. See [`docs/CONFIGURATION.md`](./docs/CONFIGURATION.md) §"Which Playwright
+  driver gets used" and [`docs/DISCLOSURES.md`](./docs/DISCLOSURES.md) §5 — the patchright install is
+  version-pinned to the 1.60 line but, unlike the Playwright wheel, **not digest-pinned**.
+- The crawl's HTTP lane advertises the same `Accept-Encoding` a real Chrome does. `reqwest` gains the
+  `brotli`, `deflate` and `zstd` features so the header it derives and the bodies it can decode can
+  never drift apart — hand-writing Chrome's list without them would return `br`/`zstd` bodies the
+  lane cannot read, and the crawl would extract binary garbage instead of text.
 - Supply-chain gate: `cargo deny` (advisories, licenses, bans, sources) on every
   PR and weekly on a schedule, and `THIRD_PARTY_NOTICES.md` generated from the
   locked dependency graph with `cargo-about` (CI fails if it drifts).
