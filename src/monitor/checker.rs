@@ -977,7 +977,7 @@ mod tests {
         let h = browser_headers();
         assert!(h.get("accept-encoding").is_none(), "accept-encoding must stay reqwest's to derive");
         assert!(h.get("user-agent").is_none(), "user-agent has exactly one owner: ClientBuilder");
-        assert_eq!(h.get("accept").unwrap().to_str().unwrap().starts_with("text/html"), true);
+        assert!(h.get("accept").unwrap().to_str().unwrap().starts_with("text/html"));
         let ua_ch = h.get("sec-ch-ua").unwrap().to_str().unwrap().to_string();
         assert!(ua_ch.contains(CHROME_MAJOR), "sec-ch-ua must agree with the UA major");
     }
