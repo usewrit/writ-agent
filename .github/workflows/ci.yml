@@ -195,8 +195,20 @@ jobs:
           cache-to: type=gha,mode=max
       # Prove the binary actually starts in the runtime stage — this is what catches a
       # builder/runtime glibc mismatch, which a successful `docker build` alone does not.
+      #
+      # ASSERT ON THE OUTPUT, not just the exit code. The Dockerfile primes dependencies with stub
+      # `fn main() {}` sources, and a cargo freshness misfire can leave those stubs as the shipped
+      # binary — which starts, exits 0, prints nothing, and sails through an exit-code-only check.
+      # This image did precisely that until it was caught. Grepping the real version string is what
+      # makes the stub fail.
       - name: Smoke test the image
-        run: docker run --rm --entrypoint /app/writ-agent-fleet writ-agent:ci --help
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm --entrypoint /app/writ-agent-fleet writ-agent:ci --version)
+          echo "$out"
+          echo "$out" | grep -qE '^writ-agent-fleet [0-9]+\.[0-9]+\.[0-9]+' \
+            || { echo "::error::binary produced no version banner — is this the stub build?"; exit 1; }
+          docker run --rm --entrypoint /app/writ-agent-fleet writ-agent:ci --help | grep -q 'WRIT_COORDINATOR_URL'
 
       # `--help` deliberately touches nothing, so it cannot see a missing browser driver. The
       # driver's compile-time path points into the BUILDER stage; if the copy into the runtime

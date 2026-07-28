@@ -58,10 +58,33 @@ RUN mkdir -p src/bin \
 RUN cargo build --release --no-default-features --features local,fleet,openai --bin writ-agent-fleet || true
 RUN rm -rf src
 
-# Copy full source (migrations/ is embedded at compile time via sqlx::migrate!).
+# Copy full source. Anything reached by a COMPILE-TIME include must be here, or the build fails
+# inside the container while a native `cargo build` on a full checkout succeeds. Today that is:
+#   js/         — include_str! from ai/, automation/, browser/, dom/, recorder/, streaming/
+#   resources/  — include_str!("../../resources/engine/chromium-pins.json") in local/runtime_setup.rs
+#   migrations/ — embedded via sqlx::migrate!
+# (`tests/fixtures/auth_recipe_v1.json` is also include_str!'d, but only inside a `#[cfg(test)]`
+# module, so a plain `cargo build` never expands it — and `.dockerignore` drops `tests/`.)
+#
+# To re-check after adding an include:
+#   grep -rhoE 'include_(str|bytes)!\("[^"]+"\)' src/ | sed -E 's/.*\("([^"]+)"\).*/\1/' | grep '\.\.'
 COPY src/ src/
 COPY js/ js/
+COPY resources/ resources/
 COPY migrations/ migrations/
+
+# FORCE A REBUILD OF THIS CRATE — do not remove.
+#
+# Cargo decides freshness by mtime, and `COPY` stamps files with their mtime from the build
+# CONTEXT. When the real sources land older than the artifacts the stub-priming build above
+# produced, cargo concludes everything is up to date, the build below exits 0 in under a second,
+# and the image ships the binary compiled from `fn main() {}`. It starts, exits 0 silently, and
+# passes a `--help` smoke test — so nothing downstream notices.
+#
+# That is not hypothetical: it is exactly what this image did until a source file with a fresh
+# mtime happened to force a real compile. Touching the sources costs nothing and only invalidates
+# OUR crate — the primed dependency artifacts, which are the entire point of the split, stay warm.
+RUN find src js resources migrations -type f -exec touch {} +
 
 # Build the release fleet worker (cloud-free OSS feature set).
 RUN cargo build --release --no-default-features --features local,fleet,openai --bin writ-agent-fleet
