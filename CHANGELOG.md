@@ -55,6 +55,21 @@ and this project adheres to
   still falls back cleanly. See [`docs/CONFIGURATION.md`](./docs/CONFIGURATION.md) §"Which Playwright
   driver gets used" and [`docs/DISCLOSURES.md`](./docs/DISCLOSURES.md) §5 — the patchright install is
   version-pinned to the 1.60 line but, unlike the Playwright wheel, **not digest-pinned**.
+- **The recorder no longer wedges on a navigation that races a user action.** The session table is
+  a `DashMap`, whose guards are synchronous `RwLock`s: calling `sessions.get()` from an async task
+  does not yield, it parks the tokio worker. An action handler held a write guard across its awaits
+  while the page navigated; the spawned `frameNavigated` task then blocked a worker waiting for that
+  guard, and with the workers parked nothing was left to pump the Playwright driver pipe — which is
+  what the action was awaiting. Circular wait, permanently frozen, on a small VPS or a CPU-limited
+  container where the worker count is 1 or 2. Earlier mitigations addressed the lock *holder*; the
+  new `recorder::session_lock` addresses the *waiter*, acquiring with `try_get` and yielding on
+  contention so the worker stays free.
+- **SSRF hostname verdicts are cached and time-bounded.** Resolution results are memoised for 60s —
+  short enough that a DNS rebind is caught on the next page load — and DNS lookups now have explicit
+  timeouts: subresource checks fail **open** after 2s so a slow resolver can never hold the browser's
+  route handler open, while navigation targets get 5s and fail **closed**. The guard screens
+  obviously-internal targets; it has never been able to pin the address the browser ultimately
+  connects to, since the browser resolves independently.
 - The crawl's HTTP lane advertises the same `Accept-Encoding` a real Chrome does. `reqwest` gains the
   `brotli`, `deflate` and `zstd` features so the header it derives and the bodies it can decode can
   never drift apart — hand-writing Chrome's list without them would return `br`/`zstd` bodies the

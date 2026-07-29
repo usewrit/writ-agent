@@ -302,7 +302,13 @@ impl<S: RecordSink> SessionDriver<S> {
         let data: HashMap<String, Value> = serde_json::from_value(msg.clone()).unwrap_or_default();
         let action = IncomingAction { action_type: action_type.to_string(), data };
 
-        let result = if let Some(mut session_ref) = self.recorder.get_session_mut(&sid) {
+        // Async acquire: this runs ON the record WebSocket read loop, and the guard
+        // is then held across every await of the action (page I/O included). A
+        // blocking acquire here would park the reader's worker thread; combined
+        // with a Playwright event handler blocking on the same shard, that is the
+        // circular wait that froze the recorder on navigation. See
+        // `recorder::session_lock`.
+        let result = if let Some(mut session_ref) = self.recorder.get_session_mut_async(&sid).await {
             handle_action(session_ref.value_mut(), action).await
         } else {
             ActionResult::err("Session not found")

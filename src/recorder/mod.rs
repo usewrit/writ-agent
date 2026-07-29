@@ -5,3 +5,4 @@ pub mod pending;
 pub mod step_recording;
 pub mod page_listeners;
 pub mod helpers;
+pub mod session_lock;

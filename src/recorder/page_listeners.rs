@@ -44,13 +44,21 @@ pub async fn setup_page_listeners(
                     return Ok(());
                 }
 
-                // IMPORTANT: never hold the DashMap lock across an await. A CAPTCHA /
-                // Cloudflare challenge page navigates in a tight loop, firing this
-                // handler rapidly; holding the session lock across page.evaluate would
-                // starve tokio workers and hang the agent. So: brief read to dedup +
-                // clone the page, evaluate UNLOCKED, then brief write to record.
+                // TWO rules here, and the recorder used to keep only the first:
+                //
+                // 1. Never HOLD the session lock across an await. A CAPTCHA /
+                //    Cloudflare page navigates in a tight loop, firing this handler
+                //    rapidly; holding it across page.evaluate would starve tokio
+                //    workers. Hence: brief read to dedup + clone the page, evaluate
+                //    UNLOCKED, then a brief write to record.
+                // 2. Never BLOCK on the session lock either. `sessions.get()` parks
+                //    the worker thread, and the thread it parks is one of the few
+                //    that could pump the Playwright driver — which is what the
+                //    action handler (holding the write guard across its own page
+                //    I/O) is waiting on. That circular wait is what froze the
+                //    recorder mid-navigation. See `session_lock`.
                 let page_for_eval = {
-                    match sessions.get(&sid) {
+                    match super::session_lock::session_ref(&sessions, &sid).await {
                         Some(s) => {
                             if frame_url == s.current_url {
                                 return Ok(()); // same URL (challenge reload) — skip
@@ -69,7 +77,7 @@ pub async fn setup_page_listeners(
                 let _: Result<serde_json::Value, _> = page_for_eval.evaluate(helper, None::<&()>).await;
 
                 // Brief write lock to update URL + record the step (no await held).
-                if let Some(mut session) = sessions.get_mut(&sid) {
+                if let Some(mut session) = super::session_lock::session_mut(&sessions, &sid).await {
                     if frame_url == session.current_url {
                         return Ok(());
                     }
@@ -167,7 +175,7 @@ pub async fn setup_page_listeners(
                             if frame_url == "about:blank" {
                                 return Ok(());
                             }
-                            if let Some(mut session) = sessions.get_mut(&sid) {
+                            if let Some(mut session) = super::session_lock::session_mut(&sessions, &sid).await {
                                 if frame_url != session.current_url {
                                     session.current_url = frame_url.clone();
                                     step_recording::send_navigation_event(&session, &frame_url);
@@ -197,7 +205,7 @@ pub async fn setup_page_listeners(
 
                 // Switch the session to the new page (brief lock, no await held).
                 {
-                    match sessions.get_mut(&sid) {
+                    match super::session_lock::session_mut(&sessions, &sid).await {
                         Some(mut session) => {
                             if !session.is_recording {
                                 return Ok(());
@@ -218,7 +226,7 @@ pub async fn setup_page_listeners(
                 let _: Result<serde_json::Value, _> = new_page.evaluate(helper, None::<&()>).await;
 
                 // Brief write lock to record the wait_for_tab step + tab list (no await held).
-                if let Some(mut session) = sessions.get_mut(&sid) {
+                if let Some(mut session) = super::session_lock::session_mut(&sessions, &sid).await {
                     let pages = session.context.pages();
                     let tab_index = pages.len().saturating_sub(1);
                     let step = RecordedStep {
@@ -287,7 +295,7 @@ async fn on_page_closed(
     session_id: &str,
     closed_url: &str,
 ) {
-    if let Some(mut session) = sessions.get_mut(session_id) {
+    if let Some(mut session) = super::session_lock::session_mut(sessions, session_id).await {
         if !session.is_recording {
             return;
         }
@@ -363,7 +371,7 @@ async fn register_file_listeners(
                 tracing::info!(session_id = %sid, filename = %suggested, "Download detected during recording");
 
                 // Brief write lock to record the step (no await held while locked).
-                if let Some(mut session) = sessions.get_mut(&sid) {
+                if let Some(mut session) = super::session_lock::session_mut(&sessions, &sid).await {
                     if !session.is_recording {
                         return Ok(());
                     }
@@ -414,7 +422,7 @@ async fn register_file_listeners(
                 let selector = derive_file_input_selector(fc.page(), is_multiple).await;
                 tracing::info!(session_id = %sid, selector = %selector, is_multiple, "File chooser detected during recording");
 
-                if let Some(mut session) = sessions.get_mut(&sid) {
+                if let Some(mut session) = super::session_lock::session_mut(&sessions, &sid).await {
                     if session.is_recording {
                         let step = RecordedStep {
                             step_type: StepType::Upload,

@@ -1964,9 +1964,18 @@ async fn run_session_loop(
                         }
                     };
 
-                    if let (Some(action), Some(mut session)) =
-                        (action, recorder.get_session_mut(sid))
-                    {
+                    // Async acquire — this runs ON the bridge's frame loop and the
+                    // guard is then held across every await of the action. A
+                    // blocking acquire parks the worker thread, and a Playwright
+                    // event handler blocking on the same shard completes a circular
+                    // wait that wedges the whole session mid-navigation. See
+                    // `recorder::session_lock`; the local record transport and
+                    // `api::ws_record` carry the identical fix.
+                    let session_guard = match action.as_ref() {
+                        Some(_) => recorder.get_session_mut_async(sid).await,
+                        None => None,
+                    };
+                    if let (Some(action), Some(mut session)) = (action, session_guard) {
                         let result = crate::recorder::action_handler::handle_action(
                             session.value_mut(),
                             action,

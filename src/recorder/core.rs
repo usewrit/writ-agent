@@ -38,28 +38,51 @@ impl PlaywrightRecorder {
         }));
     }
 
-    async fn cleanup_idle_sessions(sessions: &DashMap<String, RecordingSession>) {
-        let now = Instant::now();
-        let idle_ids: Vec<String> = sessions
-            .iter()
-            .filter(|entry| {
-                now.duration_since(entry.value().last_activity)
-                    > constants::SESSION_IDLE_TIMEOUT
-            })
-            .map(|entry| entry.key().clone())
-            .collect();
+    async fn cleanup_idle_sessions(sessions: &Arc<DashMap<String, RecordingSession>>) {
+        // `DashMap::iter` and `remove` take BLOCKING shard locks, and this runs on
+        // a timer inside the async runtime — so on every tick it could park a
+        // worker thread for as long as an in-flight action holds its write guard
+        // across page I/O. That is the same thread-starvation ingredient that
+        // wedged the recorder during navigation (see `session_lock`), just on a
+        // slower fuse. There is no `try_iter` in dashmap 5, so the scan+remove
+        // moves to a blocking thread, where blocking is legal, and only the async
+        // teardown stays on the runtime.
+        let sessions_for_scan = sessions.clone();
+        let expired = tokio::task::spawn_blocking(move || {
+            let now = Instant::now();
+            let idle_ids: Vec<String> = sessions_for_scan
+                .iter()
+                .filter(|entry| {
+                    now.duration_since(entry.value().last_activity)
+                        > constants::SESSION_IDLE_TIMEOUT
+                })
+                .map(|entry| entry.key().clone())
+                .collect();
 
-        for id in &idle_ids {
+            idle_ids
+                .into_iter()
+                .filter_map(|id| sessions_for_scan.remove(&id))
+                .collect::<Vec<_>>()
+        })
+        .await;
+
+        let expired = match expired {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "Idle-session scan panicked; skipping this sweep");
+                return;
+            }
+        };
+
+        for (id, mut session) in expired {
             tracing::info!(session_id = %id, "Cleaning up idle session");
-            if let Some((_, mut session)) = sessions.remove(id) {
-                // Stop screenshot streaming
-                session.is_recording = false;
-                if let Some(task) = session.screenshot_task.take() {
-                    task.abort();
-                }
-                if let Err(e) = session.context.close().await {
-                    tracing::warn!(session_id = %id, error = %e, "Failed to close context for idle session");
-                }
+            // Stop screenshot streaming
+            session.is_recording = false;
+            if let Some(task) = session.screenshot_task.take() {
+                task.abort();
+            }
+            if let Err(e) = session.context.close().await {
+                tracing::warn!(session_id = %id, error = %e, "Failed to close context for idle session");
             }
         }
     }
@@ -444,6 +467,20 @@ impl PlaywrightRecorder {
         session_id: &str,
     ) -> Option<dashmap::mapref::one::RefMut<'_, String, RecordingSession>> {
         self.sessions.get_mut(session_id)
+    }
+
+    /// Async, worker-friendly counterpart of [`get_session_mut`].
+    ///
+    /// Prefer this ANYWHERE the caller is on an event loop — the record WebSocket
+    /// reader, the cloud bridge, a Playwright event handler. The sync version
+    /// parks the whole worker thread on contention, and the thread it parks may be
+    /// the one that would have run the task holding the guard. See
+    /// [`super::session_lock`] for the deadlock that cost us.
+    pub async fn get_session_mut_async(
+        &self,
+        session_id: &str,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, String, RecordingSession>> {
+        super::session_lock::session_mut(&self.sessions, session_id).await
     }
 
     /// Take the JSON event receiver for a session so the WebSocket handler can

@@ -1,5 +1,5 @@
 use crate::models::session::RecordingSession;
-use crate::models::step::{RawReplayStep, RecordedStep, StepType, ViewportSize};
+use crate::models::step::{Coordinates, RawReplayStep, RecordedStep, StepType};
 
 /// Read the current `.value` of the element a picker/slider is bound to.
 /// SECURITY: parameterised (`(sel) => …`) and invoked through
@@ -29,18 +29,34 @@ pub async fn flush_pending_fill(session: &mut RecordingSession) {
         return;
     }
 
-    // Get the ACTUAL current value from DOM (not just accumulated typing).
-    // This handles cases where the user types partially, does something else,
-    // then comes back — we want the complete final value.
+    // Get the ACTUAL current value from the DOM rather than trusting only the
+    // accumulated keystrokes — that is what catches "typed a bit, went away, came
+    // back and finished", autofill, and input masking.
+    //
+    // The probe deliberately prefers the FOCUSED element when it matches the
+    // selector. `handle_type` derives selectors as `#id` → `[name=…]` →
+    // `[placeholder=…]` → bare tag name, and the last two are routinely ambiguous:
+    // a WordPress search page has the same `input[name="s"]` in the header and in
+    // the page body, so `querySelector` returns the header's empty one and we read
+    // "" for a field the user demonstrably typed into.
+    //
     // SECURITY: the selector goes in as an evaluate ARGUMENT, never interpolated
     // into the JS source — see helpers::eval_selector_probe for the breakout the
     // old `replace('\'', "\\'")` escaping allowed.
     let actual_value = match super::helpers::eval_selector_probe::<Option<String>>(
         &session.page,
         r#"((sel) => {
-                let el = null;
-                try { el = document.querySelector(sel); } catch (e) { return null; }
-                return el ? el.value : null;
+                let matches = [];
+                try { matches = Array.from(document.querySelectorAll(sel)); } catch (e) { return null; }
+                if (matches.length === 0) return null;
+                // 1. The element still focused, when it is one of the matches.
+                const active = document.activeElement;
+                if (active && matches.includes(active)) return active.value;
+                // 2. Otherwise the first match that actually holds a value — an
+                //    ambiguous selector should not resolve to an empty twin.
+                const filled = matches.find(el => el && el.value);
+                if (filled) return filled.value;
+                return matches[0].value;
             })"#,
         selector,
     )
@@ -52,6 +68,26 @@ pub async fn flush_pending_fill(session: &mut RecordingSession) {
             tracing::debug!(error = %e, selector = %selector, "Could not get actual input value");
             pending.value.clone()
         }
+    };
+
+    // NEVER discard text the user actually typed because the DOM read came back
+    // empty. It used to `return` here, silently dropping the whole fill step —
+    // which is why typing into a search box and hitting Enter produced a workflow
+    // with a `press Enter` and no `fill` before it. An empty read means the probe
+    // resolved to the wrong element, or the page had already begun navigating away
+    // and torn the field down; in both cases the keystrokes we accumulated are the
+    // better answer. A genuine "user cleared the field" is still empty here,
+    // because Backspace/Delete pop `pending.value` too (see handle_press).
+    let actual_value = if actual_value.is_empty() {
+        if !pending.value.is_empty() {
+            tracing::debug!(
+                selector = %selector,
+                "DOM read for the fill came back empty; falling back to the typed value"
+            );
+        }
+        pending.value.clone()
+    } else {
+        actual_value
     };
 
     if actual_value.is_empty() {
@@ -123,78 +159,95 @@ pub async fn flush_pending_fill(session: &mut RecordingSession) {
         found
     };
 
-    // Record raw steps for fallback replay (Python line 1680-1694)
-    // Get element coordinates for raw click+type replay
-    let coords: Option<(f64, f64)> = match super::helpers::eval_selector_probe::<Option<serde_json::Value>>(
-        &session.page,
-        r#"((sel) => {
-                let el = null;
-                try { el = document.querySelector(sel); } catch (e) { return null; }
-                if (!el) return null;
-                const rect = el.getBoundingClientRect();
-                return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
-            })"#,
-        selector,
-    ).await {
-        Ok(Some(val)) => {
-            let cx = val.get("x").and_then(|v| v.as_f64());
-            let cy = val.get("y").and_then(|v| v.as_f64());
-            match (cx, cy) {
-                (Some(x), Some(y)) => Some((x, y)),
-                _ => None,
-            }
-        }
-        _ => None,
-    };
-
-    if let Some((rx, ry)) = coords {
-        let now = super::step_recording::current_timestamp();
-        let viewport = ViewportSize { width: 1280, height: 720 };
-        // Raw click to focus
-        super::step_recording::record_raw_step(session, RawReplayStep {
-            step_type: "click".to_string(),
-            x: Some(rx),
-            y: Some(ry),
-            value: None,
-            key: None,
-            url: None,
-            duration: None,
-            delta_y: None,
-            wait_before: None,
-            mouse_path: None,
-            key_timings: None,
-            viewport: Some(viewport.clone()),
-            timestamp: now,
-        });
-        // Raw type
-        super::step_recording::record_raw_step(session, RawReplayStep {
-            step_type: "type".to_string(),
-            x: None,
-            y: None,
-            value: Some(actual_value.clone()),
-            key: None,
-            url: None,
-            duration: None,
-            delta_y: None,
-            wait_before: None,
-            mouse_path: None,
-            key_timings: None,
-            viewport: Some(viewport),
-            timestamp: now,
-        });
-    }
-
     if let Some(idx) = existing_fill_idx {
-        // Update existing fill step with the new (final) value
-        let existing_step = &mut session.steps[idx];
-        existing_step.value = Some(actual_value);
-        existing_step.selector = Some(selector.clone());
+        // Update the existing fill step with the new (final) value, and TELL THE UI.
+        // Mutating `session.steps[idx]` in place left the recorder's step list
+        // showing the stale value until the session was saved.
+        //
+        // No raw click+type pair is recorded here: the first flush for this field
+        // already emitted one, and appending a second would make the raw-replay
+        // lane type the value twice.
+        let mut updated = session.steps[idx].clone();
+        updated.value = Some(actual_value.clone());
+        updated.selector = Some(selector.clone());
         tracing::debug!(
-            step_id = %existing_step.id,
+            step_id = %updated.id,
             selector = %selector,
             "Updated existing fill step with final value"
         );
+        super::step_recording::update_step(session, idx, &updated);
+        // These keystrokes belong to THIS field, and no raw step is emitted here to
+        // drain them. Left in place they would ride along on the next field's raw
+        // `type` step, giving it a cadence recorded from different text.
+        session.key_timing_buf.clear();
     } else {
+        // Record raw steps for fallback replay (Python line 1680-1694):
+        // a click to focus the field, then the typing. Coordinates are also
+        // attached to the recorded step itself so the structured replay can fall
+        // back to click-to-focus when the selector no longer resolves.
+        let coords: Option<(f64, f64)> = match super::helpers::eval_selector_probe::<Option<serde_json::Value>>(
+            &session.page,
+            r#"((sel) => {
+                    let el = null;
+                    try { el = document.querySelector(sel); } catch (e) { return null; }
+                    if (!el) return null;
+                    const rect = el.getBoundingClientRect();
+                    return { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) };
+                })"#,
+            selector,
+        ).await {
+            Ok(Some(val)) => {
+                let cx = val.get("x").and_then(|v| v.as_f64());
+                let cy = val.get("y").and_then(|v| v.as_f64());
+                match (cx, cy) {
+                    (Some(x), Some(y)) => Some((x, y)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        // The REAL viewport, not a 1280x720 guess: replay scales raw coordinates by
+        // the ratio of run-time viewport to recorded viewport, so a wrong value here
+        // lands every fallback click in the wrong place.
+        let viewport = super::helpers::get_viewport(&session.page).await;
+
+        if let Some((rx, ry)) = coords {
+            let now = super::step_recording::current_timestamp();
+            // Raw click to focus
+            super::step_recording::record_raw_step(session, RawReplayStep {
+                step_type: "click".to_string(),
+                x: Some(rx),
+                y: Some(ry),
+                value: None,
+                key: None,
+                url: None,
+                duration: None,
+                delta_y: None,
+                wait_before: None,
+                mouse_path: None,
+                key_timings: None,
+                viewport: Some(viewport.clone()),
+                timestamp: now,
+            });
+            // Raw type
+            super::step_recording::record_raw_step(session, RawReplayStep {
+                step_type: "type".to_string(),
+                x: None,
+                y: None,
+                value: Some(actual_value.clone()),
+                key: None,
+                url: None,
+                duration: None,
+                delta_y: None,
+                wait_before: None,
+                mouse_path: None,
+                key_timings: None,
+                viewport: Some(viewport.clone()),
+                timestamp: now,
+            });
+        }
+
         // Create new fill step with recognition metadata
         let field_name = pending.field_name.clone();
         let description = format!(
@@ -246,14 +299,39 @@ pub async fn flush_pending_fill(session: &mut RecordingSession) {
             id: uuid::Uuid::new_v4().to_string(),
             selector: Some(selector.clone()),
             url: None,
-            value: Some(actual_value),
+            value: Some(actual_value.clone()),
             description: Some(description),
-            coordinates: None,
-            viewport: None,
+            // Click-to-focus fallback for replay when the selector stops resolving,
+            // plus the viewport those coordinates are relative to.
+            coordinates: coords.map(|(x, y)| Coordinates { x: x as i32, y: y as i32 }),
+            viewport: Some(viewport),
             options: if opts.is_empty() { None } else { Some(opts) },
         };
 
-        session.steps.push(step);
+        // `record_step_with_delay`, NOT `steps.push`. Pushing straight onto the vec
+        // skipped the `step_recorded` frame, so a typed fill never appeared in the
+        // recorder's step list — clicks did, because every other handler goes
+        // through here. From the operator's seat that is indistinguishable from
+        // "typing is not recorded at all". It also skipped the step cap and left
+        // `last_step_timestamp` stale, so the next step recorded a bogus wait.
+        super::step_recording::record_step_with_delay(session, step);
+    }
+
+    // Credentials: hand the typed value to the UI so it can be stored encrypted
+    // against the workflow instead of living as a literal in the step. Sent after
+    // both branches — a password re-typed into an existing fill needs it too.
+    if is_sensitive {
+        super::step_recording::send_sensitive_field(
+            session,
+            selector,
+            pending
+                .field_name
+                .as_deref()
+                .or(pending.field_type.as_deref())
+                .unwrap_or("password"),
+            pending.field_type.as_deref().unwrap_or("password"),
+            &actual_value,
+        );
     }
 }
 
@@ -374,7 +452,7 @@ pub async fn flush_pending_picker(session: &mut RecordingSession) {
         options: None,
     };
 
-    session.steps.push(step);
+    super::step_recording::record_step_with_delay(session, step);
 }
 
 pub async fn flush_pending_slider(session: &mut RecordingSession) {
@@ -416,7 +494,7 @@ pub async fn flush_pending_slider(session: &mut RecordingSession) {
         options: None,
     };
 
-    session.steps.push(step);
+    super::step_recording::record_step_with_delay(session, step);
 }
 
 pub async fn flush_pending_scroll(session: &mut RecordingSession) {
@@ -443,6 +521,15 @@ pub async fn flush_pending_scroll(session: &mut RecordingSession) {
         );
     }
 
+    // The UI labels a step by its description; without one the consolidated scroll
+    // rendered as a bare "scroll" row (the Python recorder names the direction and
+    // the container).
+    let direction = if pending.total_delta_y > 0.0 { "down" } else { "up" };
+    let description = match &pending.container_selector {
+        Some(container) => format!("Scroll {} in {}", direction, container),
+        None => format!("Scroll {}", direction),
+    };
+
     let step = RecordedStep {
         step_type: StepType::Scroll,
         timestamp: pending.start_time,
@@ -450,11 +537,46 @@ pub async fn flush_pending_scroll(session: &mut RecordingSession) {
         selector: pending.container_selector,
         url: None,
         value: None,
-        description: None,
+        description: Some(description),
         coordinates: None,
         viewport: None,
         options: Some(opts),
     };
 
-    session.steps.push(step);
+    super::step_recording::record_step_with_delay(session, step);
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every flush here MUST go through `record_step_with_delay`, never
+    /// `session.steps.push`.
+    ///
+    /// This is not style. `record_step_with_delay` is the only thing that emits the
+    /// `step_recorded` frame, and that frame is the ONLY way a step reaches the
+    /// recorder's step list. All four flushes used to push directly, so typing into
+    /// a field produced a fill that existed in the saved workflow but never showed
+    /// up while recording — while clicks, which take the normal path, appeared
+    /// instantly. That asymmetry reads as "the recorder does not record typing".
+    /// Pushing directly also skips the step cap and leaves `last_step_timestamp`
+    /// stale, which mis-times the wait step before whatever comes next.
+    #[test]
+    fn no_flush_pushes_onto_the_step_list_directly() {
+        let src = include_str!("pending.rs");
+        // Trim this file's own test module so the strings below cannot match themselves.
+        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            !body.contains("session.steps.push("),
+            "a flush in pending.rs pushes a step directly; use \
+             step_recording::record_step_with_delay so the UI gets `step_recorded`"
+        );
+        // The fill UPDATE path has the same requirement, via `update_step`.
+        assert!(
+            body.contains("step_recording::update_step("),
+            "the existing-fill branch must notify the UI through update_step"
+        );
+        assert!(
+            body.contains("step_recording::send_sensitive_field("),
+            "a typed credential must be offered to the UI for encrypted capture"
+        );
+    }
 }

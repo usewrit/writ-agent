@@ -216,7 +216,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         data: serde_json::from_value(parsed.clone()).unwrap_or_default(),
                     };
 
-                    if let Some(mut session_ref) = state.recorder.get_session_mut(&sid) {
+                    // Async acquire — this runs ON the WebSocket read loop and the
+                    // guard is then held across every await of the action. A
+                    // blocking acquire parks the worker thread, and a Playwright
+                    // event handler blocking on the same shard completes a circular
+                    // wait that wedges the whole session mid-navigation. See
+                    // `recorder::session_lock`; the local record transport and the
+                    // cloud bridge carry the identical fix.
+                    if let Some(mut session_ref) = state.recorder.get_session_mut_async(&sid).await {
                         let session = session_ref.value_mut();
                         crate::recorder::action_handler::handle_action(session, action).await
                     } else {

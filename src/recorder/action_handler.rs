@@ -238,9 +238,9 @@ async fn handle_type(session: &mut RecordingSession, action: &IncomingAction) ->
             let fieldCategory = 'text';
             const allText = name + ' ' + id + ' ' + placeholder.toLowerCase() + ' ' + labelText.toLowerCase() + ' ' + autocomplete;
 
-            if (type === 'email' || allText.includes('email')) fieldCategory = 'email';
+            if (type === 'email' || allText.includes('email') || allText.includes('e-mail')) fieldCategory = 'email';
             else if (type === 'password' || isSensitive) fieldCategory = 'password';
-            else if (type === 'tel' || allText.includes('phone') || allText.includes('tel')) fieldCategory = 'phone';
+            else if (type === 'tel' || allText.includes('phone') || allText.includes('mobile') || allText.includes('tel')) fieldCategory = 'phone';
             else if (allText.includes('user') || allText.includes('login') || allText.includes('username')) fieldCategory = 'username';
             else if (allText.includes('first') && allText.includes('name')) fieldCategory = 'first_name';
             else if (allText.includes('last') && allText.includes('name')) fieldCategory = 'last_name';
@@ -248,19 +248,40 @@ async fn handle_type(session: &mut RecordingSession, action: &IncomingAction) ->
             else if (allText.includes('address') || allText.includes('street')) fieldCategory = 'address';
             else if (allText.includes('city')) fieldCategory = 'city';
             else if (allText.includes('zip') || allText.includes('postal')) fieldCategory = 'zip';
+            else if (allText.includes('country')) fieldCategory = 'country';
             else if (allText.includes('search')) fieldCategory = 'search';
+            else if (allText.includes('comment') || allText.includes('message') || allText.includes('description')) fieldCategory = 'text_area';
             else if (type === 'date') fieldCategory = 'date';
+            else if (type === 'time') fieldCategory = 'time';
             else if (type === 'number') fieldCategory = 'number';
             else if (type === 'url') fieldCategory = 'url';
 
             const displayName = labelText || placeholder || el.name || el.id || '';
 
-            // Selector generation
-            const getSelector = () => {
+            // Selector generation.
+            //
+            // PREFER the injected helper: it verifies UNIQUENESS and walks
+            // id → data-testid → name → aria-label → placeholder → title → nth path.
+            // The local fallback below does not check uniqueness at all, so on a page
+            // with a duplicated field (a WordPress header/body `input[name="s"]` pair
+            // is the everyday case) it hands back a selector that resolves to the
+            // WRONG element — the fill is then read from, and replayed into, the twin.
+            // The Python recorder has always preferred the helper here; this handler
+            // was the one place that did not.
+            const getFallbackSelector = () => {
                 if (el.id) return '#' + el.id;
                 if (el.name) return el.tagName.toLowerCase() + '[name="' + el.name + '"]';
                 if (el.placeholder) return el.tagName.toLowerCase() + '[placeholder="' + el.placeholder + '"]';
                 return el.tagName.toLowerCase();
+            };
+            const getSelector = () => {
+                if (window.__psRecorder && window.__psRecorder.getSelector) {
+                    try {
+                        const s = window.__psRecorder.getSelector(el);
+                        if (s && s !== 'body') return s;
+                    } catch (e) { /* fall through */ }
+                }
+                return getFallbackSelector();
             };
 
             // Recognition metadata
@@ -283,20 +304,37 @@ async fn handle_type(session: &mut RecordingSession, action: &IncomingAction) ->
                 const texts = [];
                 let parent = el.parentElement;
                 for (let i = 0; i < 3 && parent; i++) {
-                    parent.querySelectorAll(':scope > label, :scope > span').forEach(e => {
+                    // Direct text nodes of the container carry the visible label on
+                    // plenty of forms that never use a <label> element.
+                    Array.from(parent.childNodes)
+                        .filter(n => n.nodeType === 3)
+                        .map(n => n.textContent.trim())
+                        .filter(t => t.length > 0 && t.length < 50)
+                        .forEach(t => texts.push(t));
+                    parent.querySelectorAll(':scope > label, :scope > span, :scope > div > label').forEach(e => {
                         const t = e.textContent.trim();
                         if (t && t.length < 50) texts.push(t);
                     });
                     parent = parent.parentElement;
                 }
-                return texts.slice(0, 5);
+                let prev = el.previousElementSibling;
+                for (let i = 0; i < 2 && prev; i++) {
+                    const t = prev.textContent.trim();
+                    if (t && t.length < 50) texts.push(t);
+                    prev = prev.previousElementSibling;
+                }
+                return [...new Set(texts)].slice(0, 5);
             };
 
             const getParentPath = () => {
                 const path = [];
                 let p = el.parentElement;
                 for (let i = 0; i < 3 && p && p !== document.body; i++) {
-                    const classes = Array.from(p.classList || []).filter(c => c.length > 2).slice(0, 2);
+                    // Drop framework-generated state classes (ng-*, is-*, …) — they
+                    // change between runs and poison the breadcrumb match.
+                    const classes = Array.from(p.classList || [])
+                        .filter(c => c.length > 2 && !/^(ng-|v-|js-|is-|has-)/.test(c))
+                        .slice(0, 2);
                     if (classes.length) path.push(classes.join('.'));
                     p = p.parentElement;
                 }
@@ -312,6 +350,24 @@ async fn handle_type(session: &mut RecordingSession, action: &IncomingAction) ->
                 }
                 return dataAttrs;
             };
+
+            // Recognition fallback attributes. The replay-side scorer
+            // (js/recognition_scorer.js) reads `stable_attributes` and scores it,
+            // and clicks already supply it via element_at_coordinates.js — typed
+            // fills were the only steps recording recognition data WITHOUT it, so
+            // they re-matched worse than everything else after a page changed.
+            const getStableAttributes = () => ({
+                'role': el.getAttribute('role'),
+                'aria-label': el.getAttribute('aria-label'),
+                'aria-describedby': el.getAttribute('aria-describedby'),
+                'aria-labelledby': el.getAttribute('aria-labelledby'),
+                'inputmode': el.inputMode || null,
+                'pattern': el.pattern || null,
+                'required': el.required || false,
+                'readonly': el.readOnly || false,
+                'maxlength': el.maxLength > 0 ? el.maxLength : null,
+                'minlength': el.minLength > 0 ? el.minLength : null,
+            });
 
             return {
                 selector: getSelector(),
@@ -332,6 +388,7 @@ async fn handle_type(session: &mut RecordingSession, action: &IncomingAction) ->
                     parentPath: getParentPath(),
                     tagName: el.tagName.toLowerCase(),
                     dataAttributes: getDataAttributes(),
+                    stableAttributes: getStableAttributes(),
                 }
             };
         })()"#,
@@ -344,6 +401,27 @@ async fn handle_type(session: &mut RecordingSession, action: &IncomingAction) ->
             None
         }
     };
+
+    // `None` here means the probe found no usable focused element —
+    // `document.activeElement` was absent or still `<body>`. The text is typed
+    // into the page below either way, but there is nothing to attribute it to, so
+    // NO fill step is recorded. That used to happen in complete silence, and it is
+    // indistinguishable from the recorder being broken: the characters appear on
+    // screen and the step list stays empty.
+    //
+    // We deliberately do NOT invent a selector to hang the step on — a fill step
+    // whose selector does not resolve is worse than none, because it fails at
+    // replay instead of at record time, long after the user could have fixed it.
+    // Say so loudly instead.
+    if field_info.is_none() {
+        tracing::warn!(
+            session_id = %session.session_id,
+            chars = text.chars().count(),
+            "Typed text is not being recorded: no focused form field. The keystrokes \
+             reached the page, but nothing had focus to attribute them to — click \
+             directly into the field in the live view before typing."
+        );
+    }
 
     // Type the text into the page
     if let Err(e) = crate::browser::page_actions::keyboard_type(&session.page, text, 0.0).await {
@@ -1708,6 +1786,37 @@ mod extraction_tests {
 
     fn action(data: serde_json::Value) -> IncomingAction {
         serde_json::from_value(data).expect("action frame")
+    }
+
+    /// The field probe that runs before a keystroke burst must resolve the selector
+    /// the SAME way the rest of the recorder does — through the injected helper,
+    /// which verifies uniqueness. Its local fallback checks nothing, so on a page
+    /// carrying two `input[name="s"]` (a WordPress header/body search pair) it hands
+    /// back a selector matching both: the flush then reads the value off the wrong
+    /// twin, and replay types into it. Clicks were never affected — they resolve via
+    /// element_at_coordinates.js, which does check uniqueness.
+    #[test]
+    fn the_typing_probe_prefers_the_uniqueness_checked_selector() {
+        let src = include_str!("action_handler.rs");
+        let probe = src
+            .split("async fn handle_type(")
+            .nth(1)
+            .and_then(|s| s.split("async fn handle_press(").next())
+            .expect("handle_type body");
+        assert!(
+            probe.contains("window.__psRecorder.getSelector(el)"),
+            "handle_type must prefer __psRecorder.getSelector over its raw fallback"
+        );
+        assert!(
+            probe.contains("getFallbackSelector"),
+            "the fallback must survive for pages where the helper failed to inject"
+        );
+        // The replay-side scorer reads `stable_attributes`; a fill recorded without
+        // it re-matches worse than every other step type after the page changes.
+        assert!(
+            probe.contains("stableAttributes: getStableAttributes()"),
+            "typed fills must carry stableAttributes in their recognition metadata"
+        );
     }
 
     #[test]

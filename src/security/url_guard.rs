@@ -1,4 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
 use url::Url;
 
 const BLOCKED_HOSTS: &[&str] = &[
@@ -389,10 +393,96 @@ async fn is_url_safe_async_inner(url_str: &str, fail_closed_on_dns_error: bool) 
         }
     }
 
-    // Async DNS resolution via tokio
+    // DNS. Cached and bounded — see `resolve_host_verdict` for why both matter.
+    let timeout = if fail_closed_on_dns_error {
+        NAV_DNS_TIMEOUT
+    } else {
+        ROUTE_DNS_TIMEOUT
+    };
+    match resolve_host_verdict(hostname_no_dot, &hostname, timeout).await {
+        HostVerdict::Safe => true,
+        HostVerdict::Internal => false,
+        HostVerdict::Unresolved => {
+            // Navigation targets fail CLOSED; the per-request route blocker passes
+            // through (it is a defence-in-depth layer, not the only one, and
+            // blocking every subresource on a flaky resolver would break pages).
+            if fail_closed_on_dns_error {
+                tracing::warn!(hostname = %hostname, "SSRF blocked: DNS resolution failed or timed out (fail-closed)");
+                return false;
+            }
+            true
+        }
+    }
+}
+
+/// How long a hostname's verdict stays cached.
+///
+/// This is the knob that trades SSRF-via-DNS-rebinding exposure against the
+/// resolution storm below. 60s is short enough that a rebind is caught on the
+/// next page load, and it does not weaken the guard much in absolute terms: the
+/// browser does its OWN resolution for the actual connection, so this check has
+/// never been able to pin the address the request ultimately reaches. It is a
+/// screen against obviously-internal targets, not a TOCTOU-proof gate.
+const DNS_VERDICT_TTL: Duration = Duration::from_secs(60);
+
+/// Per-request cap. A subresource must never hold the browser's route handler
+/// open on a slow resolver — it fails open on timeout, exactly as it already did
+/// on a DNS error.
+const ROUTE_DNS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Navigation/entry targets get longer: this one fails CLOSED, so a premature
+/// timeout on a cold resolver would refuse a perfectly good URL.
+const NAV_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HostVerdict {
+    /// Resolved, and no address is in a blocked range.
+    Safe,
+    /// Resolved to at least one internal/private address.
+    Internal,
+    /// Could not be resolved in time. Caller decides open/closed.
+    Unresolved,
+}
+
+/// hostname → (verdict, decided_at). Only DEFINITIVE verdicts are stored;
+/// a timeout is never cached, or one slow moment would pin a host for a minute.
+static DNS_VERDICT_CACHE: OnceLock<DashMap<String, (HostVerdict, Instant)>> = OnceLock::new();
+
+fn dns_cache() -> &'static DashMap<String, (HostVerdict, Instant)> {
+    DNS_VERDICT_CACHE.get_or_init(DashMap::new)
+}
+
+/// Resolve `hostname` and decide whether it points anywhere internal.
+///
+/// **Why this is cached and bounded.** Every context installs
+/// `context.route("**/*")` as an SSRF screen (browser/manager.rs), and the
+/// browser is BLOCKED on `route.continue_()` for each intercepted request until
+/// this returns. Uncached, that meant one `getaddrinfo` per request — including
+/// repeats of the same host — so a page like google.fr (100+ requests over a
+/// dozen hostnames, plus a consent redirect) paid hundreds of resolutions before
+/// it could finish loading. The document's own request is in that queue, so
+/// `page.goto` blew past its 30s budget and surfaced as
+/// `Protocol error: Timeout 30000ms exceeded` — the recorder simply never opened
+/// on request-heavy sites, while light ones worked fine.
+///
+/// With the cache a page pays one lookup per distinct host per minute; with the
+/// timeout, a single unresponsive resolver can no longer stall a page at all.
+async fn resolve_host_verdict(cache_key: &str, hostname: &str, timeout: Duration) -> HostVerdict {
+    let cache = dns_cache();
+
+    if let Some(entry) = cache.get(cache_key) {
+        let (verdict, decided_at) = *entry;
+        if decided_at.elapsed() < DNS_VERDICT_TTL {
+            return verdict;
+        }
+    }
+
     let lookup_host = format!("{}:0", hostname);
-    match tokio::net::lookup_host(&lookup_host).await {
-        Ok(addrs) => {
+    let resolved = tokio::time::timeout(timeout, tokio::net::lookup_host(&lookup_host)).await;
+
+    let verdict = match resolved {
+        Ok(Ok(addrs)) => {
+            let mut v = HostVerdict::Safe;
             for addr in addrs {
                 if is_blocked_ip(addr.ip()) {
                     tracing::warn!(
@@ -400,21 +490,29 @@ async fn is_url_safe_async_inner(url_str: &str, fail_closed_on_dns_error: bool) 
                         resolved_ip = %addr.ip(),
                         "SSRF blocked: resolves to internal IP"
                     );
-                    return false;
+                    v = HostVerdict::Internal;
+                    break;
                 }
             }
+            v
         }
-        Err(_) => {
-            // Navigation targets fail CLOSED on DNS error; route blocker passes through.
-            if fail_closed_on_dns_error {
-                tracing::warn!(hostname = %hostname, "SSRF blocked: DNS resolution failed (fail-closed)");
-                return false;
-            }
-        }
-    }
+        // Resolver said no, or took too long. Not cached — see the field note.
+        Ok(Err(_)) | Err(_) => return HostVerdict::Unresolved,
+    };
 
-    true
+    // Bound the cache. A recording session touches tens of hosts; a crawl can
+    // touch thousands, and an unbounded map here would be a slow leak for the
+    // life of the process. Clearing wholesale (rather than evicting LRU) keeps
+    // this lock-free and cheap — the cost of a rebuild is one lookup per live
+    // host, which is exactly what the steady state already pays every TTL.
+    if cache.len() >= DNS_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(cache_key.to_string(), (verdict, Instant::now()));
+    verdict
 }
+
+const DNS_CACHE_MAX_ENTRIES: usize = 4096;
 
 #[cfg(test)]
 mod tests {
@@ -607,5 +705,87 @@ mod tests {
         assert!(!is_url_safe("http://[::ffff:169.254.169.254]"));
         assert!(!is_url_safe("http://[::ffff:127.0.0.1]:8080"));
         assert!(!is_navigation_url_safe("http://[::ffff:10.0.0.1]"));
+    }
+
+    // ── DNS verdict cache ────────────────────────────────────────────────
+    //
+    // THE BUG this exists for: every browser context installs
+    // `context.route("**/*")` as an SSRF screen, and the browser is blocked on
+    // `route.continue_()` until the check returns. Uncached, that was one
+    // `getaddrinfo` per request — repeats of the same host included — so a page
+    // firing 100+ requests across a dozen hostnames (google.fr, with its consent
+    // redirect) spent its whole 30s navigation budget resolving. The recorder
+    // never opened, and reported `Protocol error: Timeout 30000ms exceeded`.
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    /// A blocked hostname must be decided WITHOUT touching the resolver at all —
+    /// it is caught by the literal/IP screens well before DNS.
+    #[test]
+    fn blocked_literals_never_reach_the_resolver() {
+        rt().block_on(async {
+            assert!(!is_url_safe_async("http://127.0.0.1/x").await);
+            assert!(!is_url_safe_async("http://169.254.169.254/latest/meta-data").await);
+            assert!(!is_navigation_url_safe_async("http://metadata.google.internal/").await);
+            // Nothing above is a hostname lookup, so nothing should be cached.
+            assert!(dns_cache().get("127.0.0.1").is_none());
+        });
+    }
+
+    /// The second call for the same host must be served from cache. Without this
+    /// the route handler pays a resolution per request, which is the stall.
+    #[test]
+    fn a_decided_verdict_is_reused_within_the_ttl() {
+        rt().block_on(async {
+            let host = "cache-probe.invalid.test";
+            dns_cache().insert(host.to_string(), (HostVerdict::Safe, Instant::now()));
+            // `.invalid` never resolves, so a cache MISS would return Unresolved.
+            // Getting Safe back proves the cached verdict was used.
+            let v = resolve_host_verdict(host, host, Duration::from_millis(50)).await;
+            assert_eq!(v, HostVerdict::Safe);
+            dns_cache().remove(host);
+        });
+    }
+
+    /// A stale entry must be re-resolved rather than trusted forever — that TTL is
+    /// what keeps the cache from becoming a DNS-rebinding hole.
+    #[test]
+    fn an_expired_verdict_is_not_reused() {
+        rt().block_on(async {
+            let host = "expired-probe.invalid.test";
+            let stale = Instant::now() - (DNS_VERDICT_TTL + Duration::from_secs(1));
+            dns_cache().insert(host.to_string(), (HostVerdict::Safe, stale));
+            // Past the TTL we must go back to the resolver, which cannot resolve
+            // `.invalid` → Unresolved, NOT the stale Safe.
+            let v = resolve_host_verdict(host, host, Duration::from_secs(2)).await;
+            assert_eq!(v, HostVerdict::Unresolved);
+            dns_cache().remove(host);
+        });
+    }
+
+    /// An unresolvable host must NOT be cached: one bad moment would otherwise
+    /// pin the verdict for a whole TTL.
+    #[test]
+    fn unresolved_is_never_cached() {
+        rt().block_on(async {
+            let host = "never-cached.invalid.test";
+            dns_cache().remove(host);
+            let v = resolve_host_verdict(host, host, Duration::from_secs(2)).await;
+            assert_eq!(v, HostVerdict::Unresolved);
+            assert!(dns_cache().get(host).is_none(), "a timeout/error must not be cached");
+        });
+    }
+
+    /// The two callers must keep their opposite postures on an unresolvable host:
+    /// a navigation target fails CLOSED, a subresource passes through.
+    #[test]
+    fn unresolvable_host_fails_closed_for_navigation_and_open_for_subresources() {
+        rt().block_on(async {
+            let url = "https://posture-probe.invalid.test/asset.js";
+            assert!(!is_navigation_url_safe_async(url).await, "navigation must fail closed");
+            assert!(is_url_safe_async(url).await, "a subresource must pass through");
+        });
     }
 }
