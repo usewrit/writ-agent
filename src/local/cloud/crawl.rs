@@ -87,3 +87,80 @@ pub async fn cancel(db: &SqlitePool, id: i64) -> LocalResult<Value> {
         .post_json(&format!("{CRAWL}/{id}/cancel"), &json!({}))
         .await
 }
+
+// ── Saved crawls (the callable crawl API) ────────────────────────────────────
+//
+// A saved crawl is a stored configuration with a stable slug, so the crawl can be called by API and
+// re-run with the same settings — and, with `max_age`, answered from the data it already collected
+// instead of crawling again.
+//
+// These are passthroughs for the same reason every crawl call is: on a linked desktop the crawl runs
+// on the FLEET, so the definitions must live where the runs do. Keeping a local copy would give the
+// user two divergent lists of "my saved crawls" and a `max_age` that consulted the wrong history.
+
+/// `GET /api/crawl/definitions?limit=N` — the account's saved crawls.
+pub async fn list_definitions(db: &SqlitePool, limit: i64) -> LocalResult<Value> {
+    let path = format!("{CRAWL}/definitions?limit={}", limit.clamp(1, 200));
+    client(db).await?.get_json(&path).await
+}
+
+/// `POST /api/crawl/definitions` — save a crawl configuration.
+pub async fn create_definition(db: &SqlitePool, body: &Value) -> LocalResult<Value> {
+    client(db).await?.post_json(&format!("{CRAWL}/definitions"), body).await
+}
+
+/// `GET /api/crawl/definitions/{ref}` — one saved crawl (id or slug).
+pub async fn get_definition(db: &SqlitePool, reference: &str) -> LocalResult<Value> {
+    client(db)
+        .await?
+        .get_json(&format!("{CRAWL}/definitions/{reference}"))
+        .await
+}
+
+/// `PATCH /api/crawl/definitions/{ref}` — update a saved crawl's settings or metadata.
+pub async fn update_definition(
+    db: &SqlitePool,
+    reference: &str,
+    body: &Value,
+) -> LocalResult<Value> {
+    client(db)
+        .await?
+        .patch_json(&format!("{CRAWL}/definitions/{reference}"), body)
+        .await
+}
+
+/// `DELETE /api/crawl/definitions/{ref}` — remove a saved crawl. Its past runs and their collected
+/// data survive; only the reusable configuration goes away.
+pub async fn delete_definition(db: &SqlitePool, reference: &str) -> LocalResult<()> {
+    client(db)
+        .await?
+        .delete(&format!("{CRAWL}/definitions/{reference}"))
+        .await
+}
+
+/// `POST /api/crawl/definitions/{ref}/run` — run a saved crawl.
+///
+/// `body` carries the DELIVERY controls only (`max_age`, `wait`, `timeout`, `limit`) — the crawl
+/// settings are the saved ones. The response is either a freshness hit (data inline, `_cache.hit`
+/// true) or a dispatched crawl handle.
+pub async fn run_definition(
+    db: &SqlitePool,
+    reference: &str,
+    body: &Value,
+) -> LocalResult<Value> {
+    client(db)
+        .await?
+        .post_json(&format!("{CRAWL}/definitions/{reference}/run"), body)
+        .await
+}
+
+/// `GET /api/crawl/definitions/{ref}/data?limit=N` — the data a saved crawl already collected on its
+/// most recent completed run. Never starts a crawl.
+pub async fn definition_data(
+    db: &SqlitePool,
+    reference: &str,
+    limit: i64,
+) -> LocalResult<Value> {
+    let path = format!("{CRAWL}/definitions/{reference}/data?limit={}", limit.clamp(1, 500));
+    client(db).await?.get_json(&path).await
+}

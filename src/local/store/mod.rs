@@ -36,6 +36,7 @@ pub mod changes;
 pub mod cloud_sync_map;
 pub mod concierge_sessions;
 pub mod config_kv;
+pub mod crawl_definitions;
 pub mod crawl_jobs;
 pub mod installed_workflows;
 pub mod local_api_keys;

@@ -174,6 +174,22 @@ pub fn derive_input_schema(wf: &Workflow) -> Value {
         );
     }
 
+    // Advertise the freshness control so `max_age` works the same whether an agent calls
+    // writ_run_workflow or this workflow's own derived tool. Only when nothing already claims the
+    // name: a workflow that genuinely declares a `max_age` input keeps its own meaning, and the
+    // runner would treat it as an input in that case anyway.
+    properties
+        .entry(super::tool_executor::FRESHNESS_ARG.to_string())
+        .or_insert_with(|| {
+            json!({
+                "type": "integer",
+                "minimum": 0,
+                "description": "Reuse a previous result if it is younger than this many seconds, \
+                                instead of running the workflow again. 0 (the default) always runs \
+                                fresh — much faster and cheaper when a recent answer will do.",
+            })
+        });
+
     json!({
         "type": "object",
         "properties": Value::Object(properties),
@@ -352,12 +368,35 @@ mod tests {
         assert_eq!(schema["required"], json!(["foo", "bar"]));
     }
 
+    /// A workflow with no placeholders declares no INPUTS — only the freshness control every derived
+    /// run tool carries, so `max_age` is discoverable on a workflow's own tool and not just on
+    /// writ_run_workflow.
     #[test]
-    fn no_inputs_yields_empty_object_schema() {
+    fn no_inputs_yields_controls_only_schema() {
         let wf = make_wf(2, "y", r#"[{"type":"goto","url":"https://x"}]"#);
         let schema = derive_input_schema(&wf);
         assert_eq!(schema["required"], json!([]));
-        assert_eq!(schema["properties"], json!({}));
+        let props = schema["properties"].as_object().expect("properties object");
+        assert_eq!(
+            props.keys().collect::<Vec<_>>(),
+            vec!["max_age"],
+            "no inputs ⇒ the freshness control is the only advertised property"
+        );
+        assert_eq!(props["max_age"]["type"], "integer");
+    }
+
+    /// A workflow that genuinely declares an input called `max_age` keeps ITS meaning — the control
+    /// must never shadow a real placeholder.
+    #[test]
+    fn a_declared_max_age_input_is_not_shadowed_by_the_control() {
+        let wf = make_wf(3, "z", r#"[{"type":"type","value":"{{input.max_age}}"}]"#);
+        let schema = derive_input_schema(&wf);
+        assert_eq!(schema["properties"]["max_age"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["max_age"]["description"], "Input: max_age",
+            "the workflow's own declaration wins"
+        );
+        assert_eq!(schema["required"], json!(["max_age"]));
     }
 
     #[test]

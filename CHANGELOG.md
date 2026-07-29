@@ -70,6 +70,20 @@ and this project adheres to
   route handler open, while navigation targets get 5s and fail **closed**. The guard screens
   obviously-internal targets; it has never been able to pin the address the browser ultimately
   connects to, since the browser resolves independently.
+- **Saved crawls** — a crawl configuration now has a stable handle, so it can be called like a
+  workflow. A `crawl_jobs` row is one *run*: its settings lived on the row and its id died with the
+  run, so a crawl could not be exposed as a callable API (the id changed on every re-crawl) and
+  "re-crawl with the same settings" meant refilling a form. `crawl_definitions` (migration `0024`)
+  owns the saved settings as a single JSON blob in the same shape the `POST /v1/crawl` body takes —
+  so a new crawl option cannot silently fall out of a hand-maintained column mirror — plus a slug for
+  the callable endpoint. `crawl_jobs.definition_id` points each run back at the config that launched
+  it, making runs the definition's history. The migration is additive: the new column is `NULL` for
+  every pre-existing ad-hoc crawl and needs no backfill. New routes under
+  `/v1/crawl/definitions/…` (create, list, read, run, fetch data).
+- `max_age` is advertised on **every** workflow's derived MCP tool, not just `writ_run_workflow`, so
+  an agent can discover the freshness control where it is actually calling. A workflow that genuinely
+  declares an input named `max_age` keeps its own meaning — the control never shadows a real
+  placeholder.
 - The crawl's HTTP lane advertises the same `Accept-Encoding` a real Chrome does. `reqwest` gains the
   `brotli`, `deflate` and `zstd` features so the header it derives and the bodies it can decode can
   never drift apart — hand-writing Chrome's list without them would return `br`/`zstd` bodies the

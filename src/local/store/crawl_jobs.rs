@@ -45,6 +45,10 @@ pub struct CrawlJob {
     pub workflow_id: Option<i64>,
     #[serde(default)]
     pub concierge_session_id: Option<i64>,
+    /// Saved [`super::crawl_definitions::CrawlDefinition`] this run was launched from, or NULL for an
+    /// ad-hoc crawl started straight from the wizard (every pre-0024 row).
+    #[serde(default)]
+    pub definition_id: Option<i64>,
     pub status: String,
     pub pages_discovered: i64,
     pub pages_done: i64,
@@ -96,9 +100,18 @@ pub struct NewCrawlJob {
 
 const SELECT_COLS: &str = "id, name, seed_url, include_paths, exclude_paths, max_depth, same_domain,
     allow_subdomains, extract_mode, extract_schema, content_spec, persona_id, respect_robots, delay_ms,
-    max_concurrent, page_budget, workflow_id, concierge_session_id, status, pages_discovered,
+    max_concurrent, page_budget, workflow_id, concierge_session_id, definition_id, status, pages_discovered,
     pages_done, pages_failed, pages_skipped, workers_active, current_depth, error, cancel_requested,
     created_at, updated_at, started_at, completed_at";
+
+/// The column list a `CrawlJob` needs, for sibling stores that select the same row shape.
+///
+/// Exposed as a function rather than making the const public so there stays exactly ONE list: a
+/// column added here reaches every query, instead of the next reader hand-copying a list that then
+/// drifts (the `SELECT_COLS` divergence that has bitten the get-vs-list pair before).
+pub fn select_cols() -> &'static str {
+    SELECT_COLS
+}
 
 /// Start a crawl (`status='queued'`). Returns the full row.
 pub async fn insert(pool: &SqlitePool, new: &NewCrawlJob) -> LocalResult<CrawlJob> {

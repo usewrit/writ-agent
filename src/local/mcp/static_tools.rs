@@ -38,13 +38,16 @@ use super::tool_executor::CallError;
 
 /// Every static tool name — reserved in the workflow-derived catalog so a workflow named e.g.
 /// "writ build" can never shadow a static tool (it falls back to `workflow_<id>`).
-pub const NAMES: [&str; 28] = [
+pub const NAMES: [&str; 31] = [
     "writ_browser_use",
     "writ_build",
     "writ_record_website",
     "writ_website_to_api",
     "writ_crawl_site",
     "writ_crawl_status",
+    "writ_saved_crawls",
+    "writ_run_saved_crawl",
+    "writ_saved_crawl_data",
     "writ_scrape",
     "writ_map",
     "writ_browser_act",
@@ -169,7 +172,9 @@ pub fn entries() -> Vec<Value> {
                     "same_domain": { "type": "boolean", "description": "Stay on the seed's registered domain (default true)" },
                     "allow_subdomains": { "type": "boolean", "description": "Allow subdomains of the seed domain (default true)" },
                     "content": { "type": "object", "description": "Content-selection spec applied to every page: {preset, include_comments (keep discussion/comment threads), exclude_selectors[], include_selectors[], keep}. Omit for default extraction." },
-                    "persona": { "description": "Persona id or name to crawl a login-gated site as; omit for public sites", "type": ["string", "integer"] }
+                    "persona": { "description": "Persona id or name to crawl a login-gated site as; omit for public sites", "type": ["string", "integer"] },
+                    "save_as": { "type": "string", "description": "Save these settings under this name so the crawl becomes callable by API and re-runnable. Reusing the same name updates that saved crawl instead of creating a duplicate. See writ_saved_crawls." },
+                    "max_age": { "type": "integer", "minimum": 0, "description": "Only meaningful with save_as: if that saved crawl already completed within this many seconds, return its collected data instead of crawling again. 0 (default) always crawls." }
                 },
                 "required": ["url"]
             }),
@@ -189,6 +194,51 @@ pub fn entries() -> Vec<Value> {
                     "limit": { "type": "integer", "description": "When listing, max crawls to return (default 20, max 100)" }
                 },
                 "required": []
+            }),
+        ),
+        tool(
+            "writ_saved_crawls",
+            "List SAVED crawls — stored crawl configurations that are callable by API and re-runnable, \
+             each of which may already hold collected data. Check here BEFORE crawling a site again: a \
+             saved crawl with recent data answers instantly and costs nothing, where a fresh whole-site \
+             crawl is slow and metered. Run one with writ_run_saved_crawl.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "Max saved crawls to return (default 50, max 200)" }
+                },
+                "required": []
+            }),
+        ),
+        tool(
+            "writ_run_saved_crawl",
+            "Run a SAVED crawl with its stored settings. Pass max_age to get the data it already \
+             collected when that run is recent enough — the cheap, instant path; otherwise the site is \
+             crawled again. The response carries `_cache.hit` and `_cache.age_seconds` so you can tell \
+             which happened. A fresh crawl returns a crawl id to poll with writ_crawl_status, because a \
+             whole-site crawl takes far longer than one tool call.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "crawl": { "description": "Saved crawl slug, name, or id (from writ_saved_crawls)", "type": ["string", "integer"] },
+                    "max_age": { "type": "integer", "minimum": 0, "description": "Reuse the last completed crawl if it finished within this many seconds. 0 (default) always re-crawls." },
+                    "limit": { "type": "integer", "description": "Rows of collected data to include (default 50, max 500)" }
+                },
+                "required": ["crawl"]
+            }),
+        ),
+        tool(
+            "writ_saved_crawl_data",
+            "Read the data a SAVED crawl already collected on its most recent completed run. Never \
+             starts a crawl — use this when you want whatever is already there, at any age. To insist \
+             on recency instead, use writ_run_saved_crawl with max_age.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "crawl": { "description": "Saved crawl slug, name, or id (from writ_saved_crawls)", "type": ["string", "integer"] },
+                    "limit": { "type": "integer", "description": "Rows to return (default 50, max 500)" }
+                },
+                "required": ["crawl"]
             }),
         ),
         tool(
@@ -331,12 +381,14 @@ pub fn entries() -> Vec<Value> {
             "writ_run_workflow",
             "Run a saved workflow by name or id and return its extracted data. Deterministic replay \
              — zero AI tokens. Use for workflows just created by writ_build (their dedicated tools \
-             appear on the next tools/list).",
+             appear on the next tools/list). Pass max_age when a recent answer is good enough: the \
+             previous result comes back instead of driving the browser again.",
             json!({
                 "type": "object",
                 "properties": {
                     "workflow": { "description": "Workflow name or id", "type": ["string", "integer"] },
                     "inputs": { "type": "object", "description": "Values for the workflow's {{input.*}} placeholders" },
+                    "max_age": { "type": "integer", "minimum": 0, "description": "Reuse a previous result if it is younger than this many seconds, instead of running the workflow again. 0 (the default) always runs fresh. Much faster and cheaper when a recent answer will do." },
                 },
                 "required": ["workflow"],
             }),
@@ -618,6 +670,9 @@ pub async fn call(state: &AppState, name: &str, args: &Value) -> Option<Result<V
         "writ_website_to_api" => connected_browser_start(state, args, true, false).await,
         "writ_crawl_site" => crawl_site(state, args).await,
         "writ_crawl_status" => crawl_status(state, args).await,
+        "writ_saved_crawls" => saved_crawls(state, args).await,
+        "writ_run_saved_crawl" => run_saved_crawl(state, args).await,
+        "writ_saved_crawl_data" => saved_crawl_data(state, args).await,
         "writ_scrape" => scrape(state, args).await,
         "writ_map" => site_map(state, args).await,
         "writ_expose_workflow_api" => expose_workflow_api(state, args).await,
@@ -2045,11 +2100,23 @@ async fn run_workflow(state: &AppState, args: &Value) -> Result<Value, CallError
             wf.name, wf.id
         )));
     }
-    let inputs = args.get("inputs").cloned().unwrap_or_else(|| json!({}));
+    let mut inputs = args.get("inputs").cloned().unwrap_or_else(|| json!({}));
     if !inputs.is_object() {
         return Err(CallError::BadArgument(
             "'inputs' must be a JSON object".into(),
         ));
+    }
+    // `max_age` is a top-level control on this tool but the runner reads it alongside the inputs (it
+    // is the shared entry point for the derived per-workflow tools, which take it top-level). Carry it
+    // through; the runner strips it before the values reach the workflow.
+    if let (Some(obj), Some(requested)) = (
+        inputs.as_object_mut(),
+        args.get(super::tool_executor::FRESHNESS_ARG),
+    ) {
+        obj.insert(
+            super::tool_executor::FRESHNESS_ARG.to_string(),
+            requested.clone(),
+        );
     }
     super::tool_executor::run_workflow_tool(state, wf.id, inputs).await
 }
@@ -3280,9 +3347,23 @@ async fn crawl_site(state: &AppState, args: &Value) -> Result<Value, CallError> 
     // this one machine. A linked account routes to the fleet; WITHOUT a credential we REFUSE rather than
     // silently crawl locally — keyless callers get single-page scrape / site map only (writ_scrape,
     // writ_map). The local worker pool is compiled in ONLY for the OSS self-host build (no `cloud`).
+    // `save_as` turns this into a SAVED crawl: the settings are persisted under that name so the
+    // crawl becomes callable by API and re-runnable, and the run goes through the definition so this
+    // very call already benefits from `max_age`. Re-using a name updates that saved crawl rather than
+    // minting a near-duplicate every time an agent repeats itself.
+    let save_as = args
+        .get("save_as")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
     #[cfg(feature = "cloud")]
     {
         if crate::local::cloud::crawl::is_linked(&state.db).await {
+            if let Some(label) = save_as {
+                return save_and_run_cloud_crawl(state, &params, &label, requested_max_age(args)).await;
+            }
             let cloud = match crate::local::cloud::crawl::start(&state.db, &build_cloud_crawl_body(&params)).await {
                 Ok(v) => v,
                 // Seed rejected by the cloud (SSRF/scope/plan) → relayable outcome, not a protocol error.
@@ -3299,6 +3380,9 @@ async fn crawl_site(state: &AppState, args: &Value) -> Result<Value, CallError> 
     }
     #[cfg(not(feature = "cloud"))]
     {
+        if let Some(label) = save_as {
+            return save_and_run_local_crawl(state, &params, &label, args).await;
+        }
         let crawl = match crate::local::crawl::start_crawl(state, params).await {
             Ok(c) => c,
             // Bad/SSRF-blocked seed → relayable domain outcome, not a JSON-RPC error.
@@ -3311,6 +3395,427 @@ async fn crawl_site(state: &AppState, args: &Value) -> Result<Value, CallError> 
         }
         Ok(text_result(&view))
     }
+}
+
+/// `save_as` on a linked desktop: upsert the saved crawl on the fleet, then run it there.
+#[cfg(feature = "cloud")]
+async fn save_and_run_cloud_crawl(
+    state: &AppState,
+    params: &crate::local::crawl::StartParams,
+    label: &str,
+    max_age: i64,
+) -> Result<Value, CallError> {
+    let config = build_cloud_crawl_body(params);
+    let existing = crate::local::cloud::crawl::list_definitions(&state.db, 200)
+        .await
+        .unwrap_or_else(|_| json!({}));
+    let matched = existing
+        .get("definitions")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .find(|d| {
+                    d.get("slug").and_then(Value::as_str) == Some(label)
+                        || d.get("name").and_then(Value::as_str) == Some(label)
+                })
+                .and_then(|d| d.get("slug").and_then(Value::as_str).map(str::to_string))
+        });
+
+    let defn = match matched {
+        Some(slug) => {
+            crate::local::cloud::crawl::update_definition(
+                &state.db,
+                &slug,
+                &json!({ "config": config }),
+            )
+            .await?
+        }
+        None => {
+            crate::local::cloud::crawl::create_definition(
+                &state.db,
+                &json!({ "name": label, "slug": label, "config": config }),
+            )
+            .await?
+        }
+    };
+    let slug = defn
+        .get("slug")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LocalError::Internal("saved crawl has no slug".into()))?
+        .to_string();
+    let res = crate::local::cloud::crawl::run_definition(
+        &state.db,
+        &slug,
+        &json!({ "max_age": max_age, "wait": false }),
+    )
+    .await?;
+    Ok(text_result(&annotate_saved_crawl_run(res)))
+}
+
+/// `save_as` on the OSS build: upsert the local definition, then run it locally.
+#[cfg(not(feature = "cloud"))]
+async fn save_and_run_local_crawl(
+    state: &AppState,
+    params: &crate::local::crawl::StartParams,
+    label: &str,
+    args: &Value,
+) -> Result<Value, CallError> {
+    use crate::local::store::crawl_definitions as defs;
+
+    // Persist the config in the SAME vocabulary the local start body uses, so
+    // `saved_config_to_params` re-hydrates it losslessly.
+    let config = json!({
+        "url": params.seed_url,
+        "name": params.name,
+        "extract_mode": params.extract_mode,
+        "extract_schema": params.extract_schema,
+        "persona_id": params.persona_id,
+        "include_paths": params.include_paths,
+        "exclude_paths": params.exclude_paths,
+        "max_depth": params.max_depth,
+        "page_budget": params.page_budget,
+        "max_concurrent": params.max_concurrent,
+        "delay_ms": params.delay_ms,
+        "respect_robots": params.respect_robots,
+        "same_domain": params.same_domain,
+        "allow_subdomains": params.allow_subdomains,
+        "content_spec": params.content,
+    });
+    let raw = serde_json::to_string(&config)
+        .map_err(|e| CallError::from(LocalError::Internal(format!("config serialize: {e}"))))?;
+
+    let defn = match defs::resolve(&state.db, label).await? {
+        Some(found) => {
+            defs::update_config(&state.db, found.id, &raw, &params.seed_url).await?;
+            defs::get_by_id(&state.db, found.id)
+                .await?
+                .ok_or_else(|| LocalError::Internal("saved crawl vanished".into()))?
+        }
+        None => {
+            let slug = defs::mint_slug(&state.db, label).await?;
+            defs::insert(
+                &state.db,
+                &defs::NewCrawlDefinition {
+                    name: label.chars().take(200).collect(),
+                    slug,
+                    description: None,
+                    config: raw,
+                    seed_url: params.seed_url.clone(),
+                    default_max_age_seconds: None,
+                },
+            )
+            .await?
+        }
+    };
+
+    // Route through the saved-crawl runner so `max_age` behaves identically whether the agent called
+    // writ_crawl_site with save_as or writ_run_saved_crawl directly.
+    let mut run_args = json!({ "crawl": defn.slug });
+    if let (Some(obj), Some(requested)) = (run_args.as_object_mut(), args.get("max_age")) {
+        obj.insert("max_age".into(), requested.clone());
+    }
+    run_saved_crawl(state, &run_args).await
+}
+
+// ── Saved crawls ─────────────────────────────────────────────────────────────
+//
+// A saved crawl is a stored configuration with a stable slug: callable by API, re-runnable with the
+// same settings, and — with `max_age` — answerable from the data it already collected instead of
+// crawling the site again. For a driving model this is the difference between a slow metered crawl
+// and an instant free read, so the tools are worth surfacing prominently.
+//
+// Same build split as every other crawl path here: the managed desktop proxies to the fleet (that is
+// where its crawls and their history live), the OSS build owns the local `crawl_definitions` table.
+
+/// The MCP tool arg naming the saved crawl. Accepts a slug, a name, or a numeric id so the model can
+/// pass whatever it has on hand.
+fn saved_crawl_ref(args: &Value) -> Result<String, CallError> {
+    let raw = args.get("crawl").or_else(|| args.get("saved_crawl"));
+    match raw {
+        Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+        Some(Value::Number(n)) => Ok(n.to_string()),
+        _ => Err(CallError::BadArgument(
+            "`crawl` is required — a saved crawl slug, name, or id (see writ_saved_crawls)".into(),
+        )),
+    }
+}
+
+/// Caller's freshness ceiling in seconds. 0 (the default) means always crawl.
+///
+/// A malformed value degrades to 0 rather than failing the call: freshness is a hint, and refusing to
+/// answer over an unparseable number would be the worse outcome.
+fn requested_max_age(args: &Value) -> i64 {
+    args.get("max_age")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .clamp(0, 30 * 24 * 3600)
+}
+
+async fn saved_crawls(state: &AppState, args: &Value) -> Result<Value, CallError> {
+    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(50).clamp(1, 200);
+    #[cfg(feature = "cloud")]
+    {
+        if crate::local::cloud::crawl::is_linked(&state.db).await {
+            let res = crate::local::cloud::crawl::list_definitions(&state.db, limit).await?;
+            return Ok(text_result(&res));
+        }
+        Ok(err_result(CRAWL_STATUS_NEEDS_CLOUD))
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        let rows = crate::local::store::crawl_definitions::list(&state.db, limit).await?;
+        if rows.is_empty() {
+            return Ok(err_result(
+                "No saved crawls yet. Create one by passing `save_as` to writ_crawl_site — that makes \
+                 the crawl callable by API and re-runnable, and lets later calls reuse its data via \
+                 max_age.",
+            ));
+        }
+        let out: Vec<Value> = rows
+            .iter()
+            .map(|d| {
+                json!({
+                    "id": d.id,
+                    "slug": d.slug,
+                    "name": d.name,
+                    "seed_url": d.seed_url,
+                    "last_run_at": d.last_run_at,
+                    "default_max_age_seconds": d.default_max_age_seconds,
+                })
+            })
+            .collect();
+        Ok(text_result(&json!({ "saved_crawls": out, "total": out.len() })))
+    }
+}
+
+async fn run_saved_crawl(state: &AppState, args: &Value) -> Result<Value, CallError> {
+    let reference = saved_crawl_ref(args)?;
+    let max_age = requested_max_age(args);
+    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(50).clamp(1, 500);
+
+    #[cfg(feature = "cloud")]
+    {
+        if crate::local::cloud::crawl::is_linked(&state.db).await {
+            let body = json!({ "max_age": max_age, "wait": false, "limit": limit });
+            let res = match crate::local::cloud::crawl::run_definition(&state.db, &reference, &body).await {
+                Ok(v) => v,
+                Err(LocalError::NotFound(m)) => return Ok(err_result(m)),
+                Err(LocalError::BadRequest(m)) => return Ok(err_result(m)),
+                Err(e) => return Err(e.into()),
+            };
+            return Ok(text_result(&annotate_saved_crawl_run(res)));
+        }
+        Ok(err_result(CRAWL_NEEDS_CLOUD))
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        use crate::local::store::crawl_definitions as defs;
+        let defn = defs::resolve(&state.db, &reference)
+            .await?
+            .ok_or_else(|| CallError::BadArgument(format!("no saved crawl '{reference}'")))?;
+
+        // The definition's stored default applies only when the caller said nothing at all; an
+        // explicit max_age=0 means "crawl it fresh" and must win.
+        let effective = if args.get("max_age").is_some() {
+            max_age
+        } else {
+            defn.default_max_age_seconds.unwrap_or(0)
+        };
+
+        if effective > 0 {
+            if let Some(fresh) = defs::find_fresh_run(&state.db, defn.id, effective).await? {
+                let age = defs::run_age_seconds(&state.db, fresh.id).await?;
+                let data = saved_crawl_rows(state, &fresh, limit).await;
+                return Ok(text_result(&json!({
+                    "cached": true,
+                    "_cache": { "hit": true, "age_seconds": age.map(|a| a as i64), "source_crawl_id": fresh.id },
+                    "saved_crawl": defn.slug,
+                    "crawl": crawl_view(&fresh),
+                    "data": data,
+                })));
+            }
+        }
+
+        let config: Value = serde_json::from_str(&defn.config)
+            .map_err(|e| CallError::from(LocalError::Internal(format!("saved crawl config: {e}"))))?;
+        let params = saved_config_to_params(state, &config).await?;
+        let crawl = match crate::local::crawl::start_crawl(state, params).await {
+            Ok(c) => c,
+            Err(LocalError::BadRequest(m)) => return Ok(err_result(m)),
+            Err(e) => return Err(e.into()),
+        };
+        defs::attach_run(&state.db, crawl.id, defn.id).await?;
+        defs::touch_last_run(&state.db, defn.id).await?;
+        let mut view = crawl_view(&crawl);
+        if let Some(obj) = view.as_object_mut() {
+            obj.insert("next".into(), json!(CRAWL_STARTED_NEXT));
+        }
+        Ok(text_result(&json!({
+            "cached": false,
+            "_cache": { "hit": false },
+            "saved_crawl": defn.slug,
+            "crawl": view,
+        })))
+    }
+}
+
+async fn saved_crawl_data(state: &AppState, args: &Value) -> Result<Value, CallError> {
+    let reference = saved_crawl_ref(args)?;
+    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(50).clamp(1, 500);
+    #[cfg(feature = "cloud")]
+    {
+        if crate::local::cloud::crawl::is_linked(&state.db).await {
+            let res = match crate::local::cloud::crawl::definition_data(&state.db, &reference, limit).await {
+                Ok(v) => v,
+                Err(LocalError::NotFound(m)) => return Ok(err_result(m)),
+                Err(e) => return Err(e.into()),
+            };
+            return Ok(text_result(&res));
+        }
+        Ok(err_result(CRAWL_STATUS_NEEDS_CLOUD))
+    }
+    #[cfg(not(feature = "cloud"))]
+    {
+        use crate::local::store::crawl_definitions as defs;
+        let defn = defs::resolve(&state.db, &reference)
+            .await?
+            .ok_or_else(|| CallError::BadArgument(format!("no saved crawl '{reference}'")))?;
+        // A very large window rather than a separate "any age" query: reusing find_fresh_run keeps ONE
+        // definition of what counts as a usable run (completed, non-empty).
+        match defs::find_fresh_run(&state.db, defn.id, i64::MAX / 4).await? {
+            None => Ok(err_result(format!(
+                "'{}' has not completed a crawl with any pages yet — run it with writ_run_saved_crawl.",
+                defn.slug
+            ))),
+            Some(last) => {
+                let age = defs::run_age_seconds(&state.db, last.id).await?;
+                let data = saved_crawl_rows(state, &last, limit).await;
+                Ok(text_result(&json!({
+                    "saved_crawl": defn.slug,
+                    "crawl": crawl_view(&last),
+                    "age_seconds": age.map(|a| a as i64),
+                    "data": data,
+                })))
+            }
+        }
+    }
+}
+
+/// Stamp a proxied saved-crawl run with the same post-start guidance the local path gives, when the
+/// cloud actually dispatched a crawl rather than answering from its data.
+#[cfg(feature = "cloud")]
+fn annotate_saved_crawl_run(mut res: Value) -> Value {
+    let was_cached = res.get("cached").and_then(Value::as_bool).unwrap_or(false);
+    if !was_cached {
+        if let Some(obj) = res.as_object_mut() {
+            obj.insert("next".into(), json!(CRAWL_STARTED_NEXT));
+        }
+    }
+    res
+}
+
+/// Re-hydrate a saved config into local crawl params.
+///
+/// Goes through the same field vocabulary `crawl_site` accepts, so a saved config and a direct call
+/// cannot be interpreted differently.
+#[cfg(not(feature = "cloud"))]
+async fn saved_config_to_params(
+    state: &AppState,
+    config: &Value,
+) -> Result<crate::local::crawl::StartParams, CallError> {
+    let seed = config
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| CallError::BadArgument("saved crawl config has no url".into()))?
+        .to_string();
+    let to_list = |v: Option<&Value>| -> Vec<String> {
+        match v {
+            Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+            Some(Value::String(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
+            _ => Vec::new(),
+        }
+    };
+    let persona_id = match config.get("persona_id").or_else(|| config.get("persona")) {
+        Some(v) if !v.is_null() => Some(resolve_persona(state, v).await?),
+        _ => None,
+    };
+    let defaults = crate::local::crawl::StartParams::default();
+    Ok(crate::local::crawl::StartParams {
+        seed_url: seed,
+        name: config.get("name").and_then(Value::as_str).map(str::to_string),
+        extract_mode: match config
+            .get("extract_mode")
+            .or_else(|| config.get("extract"))
+            .and_then(Value::as_str)
+            .unwrap_or("markdown")
+        {
+            "schema" => "schema".to_string(),
+            _ => "markdown".to_string(),
+        },
+        extract_schema: config.get("extract_schema").filter(|v| !v.is_null()).cloned(),
+        persona_id,
+        include_paths: to_list(config.get("include_paths").or_else(|| config.get("include"))),
+        exclude_paths: to_list(config.get("exclude_paths").or_else(|| config.get("exclude"))),
+        max_depth: config
+            .get("max_depth")
+            .and_then(Value::as_i64)
+            .unwrap_or(defaults.max_depth),
+        page_budget: config
+            .get("page_budget")
+            .or_else(|| config.get("max_pages"))
+            .and_then(Value::as_i64)
+            .map(|n| n.clamp(1, 50_000))
+            .unwrap_or(defaults.page_budget),
+        max_concurrent: config
+            .get("max_concurrent")
+            .and_then(Value::as_i64)
+            .unwrap_or(defaults.max_concurrent),
+        delay_ms: config.get("delay_ms").and_then(Value::as_i64).unwrap_or(defaults.delay_ms),
+        respect_robots: config
+            .get("respect_robots")
+            .and_then(Value::as_bool)
+            .unwrap_or(defaults.respect_robots),
+        same_domain: config
+            .get("same_domain")
+            .and_then(Value::as_bool)
+            .unwrap_or(defaults.same_domain),
+        allow_subdomains: config
+            .get("allow_subdomains")
+            .and_then(Value::as_bool)
+            .unwrap_or(defaults.allow_subdomains),
+        content: config
+            .get("content_spec")
+            .or_else(|| config.get("content"))
+            .filter(|v| !v.is_null())
+            .cloned(),
+        concierge_session_id: None,
+    })
+}
+
+/// The rows a crawl collected, in the shared table shape. JSON null on any read problem — a data
+/// hiccup must not sink an otherwise-successful answer.
+#[cfg(not(feature = "cloud"))]
+async fn saved_crawl_rows(
+    state: &AppState,
+    crawl: &crate::local::store::crawl_jobs::CrawlJob,
+    limit: i64,
+) -> Value {
+    let Some(workflow_id) = crawl.workflow_id else {
+        return Value::Null;
+    };
+    let Ok((inputs, _truncated)) =
+        crate::local::api::v1::data::scan_workflow_data_runs_pool(&state.db, workflow_id).await
+    else {
+        return Value::Null;
+    };
+    if inputs.is_empty() {
+        return Value::Null;
+    }
+    let (columns, mut rows) = crate::local::data_query::flatten(&inputs, &[], true);
+    rows.truncate(limit.max(0) as usize);
+    let rows = crate::local::data_query::rows_to_table_json(&rows, &columns);
+    json!({ "columns": columns, "rows": rows })
 }
 
 /// Refusal shown when a managed (cloud-feature) desktop asks to crawl without a linked account or API

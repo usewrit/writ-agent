@@ -77,6 +77,8 @@ const TOOL_SCOPES: &[(&str, Scope)] = &[
     ("writ_dataset_search", Scope::Read),
     ("writ_search_data", Scope::Read),
     ("writ_crawl_status", Scope::Read),
+    ("writ_saved_crawls", Scope::Read),
+    ("writ_saved_crawl_data", Scope::Read),
     ("writ_mission_status", Scope::Read),
     // Marketplace SEARCH only browses the cloud catalog; installing is separate (Admin, below).
     ("writ_search_api", Scope::Read),
@@ -89,7 +91,10 @@ const TOOL_SCOPES: &[(&str, Scope)] = &[
     ("writ_browser_cancel", Scope::Run),
     ("writ_scrape", Scope::Run),
     ("writ_map", Scope::Run),
+    // Run to START a crawl; `save_as` escalates to Admin via `arg_escalated_scope` because it also
+    // creates a saved, API-callable crawl (REST parity with POST /v1/crawl/definitions).
     ("writ_crawl_site", Scope::Run),
+    ("writ_run_saved_crawl", Scope::Run),
     ("writ_mission_respond", Scope::Run),
     ("writ_mission_cancel", Scope::Run),
     // ── creation / reconfiguration (Admin on REST, Admin here) ───────────────
@@ -112,13 +117,53 @@ fn tool_min_scope(name: &str) -> Option<Scope> {
     TOOL_SCOPES.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
 }
 
+/// Tools whose required scope depends on their ARGUMENTS, not just their name.
+///
+/// `writ_crawl_site` is `Run` — starting a crawl is execution. But `save_as` makes it also CREATE a
+/// saved crawl, and creating one over REST (`POST /v1/crawl/definitions`) requires `Admin`. Without
+/// this escalation the MCP surface would be strictly more permissive than the REST surface for the
+/// same action, which is exactly the kind of gap a scoped key is supposed to close.
+fn arg_escalated_scope(name: &str, arguments: &Value) -> Option<Scope> {
+    if name == "writ_crawl_site"
+        && arguments
+            .get("save_as")
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    {
+        return Some(Scope::Admin);
+    }
+    None
+}
+
 /// Gate one `tools/call` on the caller's capability.
 ///
 /// DEFAULT-DENY for the reserved `writ_` prefix: an unclassified `writ_*` name cannot be reached, so
 /// adding a static tool without a [`TOOL_SCOPES`] entry fails closed instead of inheriting `Run`.
 /// Everything else is a workflow-derived tool — replaying a saved workflow is execution, hence `Run`
 /// (the per-workflow Connect → MCP toggle is enforced separately by `tools::catalog`).
-fn authorize_tool(caller: &Caller, name: &str) -> Result<(), CallError> {
+///
+/// `arguments` participates because a few tools' authority depends on what they are asked to DO, not
+/// only which tool it is — see [`arg_escalated_scope`].
+fn authorize_tool(caller: &Caller, name: &str, arguments: &Value) -> Result<(), CallError> {
+    if let Some(escalated) = arg_escalated_scope(name, arguments) {
+        if !caller.grants(escalated) {
+            tracing::warn!(
+                tool = %name,
+                caller = caller.describe(),
+                required = escalated.as_str(),
+                "mcp: tools/call refused — saving a crawl needs a broader capability than running one"
+            );
+            return Err(CallError::Forbidden(format!(
+                "Not authorized: saving a crawl with `save_as` requires the '{}' capability (it \
+                 creates a reusable, API-callable crawl), but this connection was granted '{}'. Omit \
+                 `save_as` to just run the crawl, or reconnect with an '{}'-scoped API key.",
+                escalated.as_str(),
+                caller.describe(),
+                escalated.as_str(),
+            )));
+        }
+    }
     let needed = match tool_min_scope(name) {
         Some(s) => s,
         None if name.starts_with(STATIC_TOOL_PREFIX) => {
@@ -163,7 +208,7 @@ pub async fn call_tool(
     name: &str,
     arguments: Value,
 ) -> Result<Value, CallError> {
-    authorize_tool(caller, name)?;
+    authorize_tool(caller, name, &arguments)?;
     // Static `writ_*` tools take precedence — the workflow catalog reserves their names.
     if let Some(result) = super::static_tools::call(state, name, &arguments).await {
         return result;
@@ -190,6 +235,29 @@ pub(crate) async fn run_workflow_tool(
             )));
         }
     };
+
+    // ── Freshness (`max_age`) ────────────────────────────────────────────────
+    // Running a workflow drives a real browser, so an agent asking the same question twice pays and
+    // waits twice. `max_age` lets the CALLER say a recent answer is acceptable. Opt-in: absent or 0
+    // always runs, so no existing agent silently starts getting stale data.
+    //
+    // Stripped from `inputs` BEFORE anything else reads them — leaving it in would both feed a stray
+    // `max_age` into the workflow's `{{input.*}}` values and give every distinct max_age its own
+    // cache key, which is the opposite of asking for a reusable answer.
+    let requested_max_age = inputs
+        .get(FRESHNESS_ARG)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    if let Some(obj) = inputs.as_object_mut() {
+        obj.remove(FRESHNESS_ARG);
+    }
+    let freshness_key = freshness_key(workflow_id, &inputs);
+    if requested_max_age > 0 {
+        if let Some(hit) = cached_run(&freshness_key, requested_max_age) {
+            return Ok(hit);
+        }
+    }
 
     // Lift any top-level `file_slot` string args into a `files` map the engine's `RunFiles` consumes.
     // A workflow's declared file slots (advertised as optional string handle properties by
@@ -252,7 +320,94 @@ pub(crate) async fn run_workflow_tool(
         Err(e) => return Err(e.into()),
     };
 
-    Ok(to_mcp_result(&result))
+    let mcp_result = to_mcp_result(&result);
+    store_run(&freshness_key, &mcp_result);
+    Ok(mcp_result)
+}
+
+// ── Result reuse (the `max_age` tool argument) ───────────────────────────────
+//
+// In-process and bounded rather than durable storage: this is a latency/cost optimisation on an
+// explicitly-approximate request, so a miss after a daemon restart just means the workflow runs —
+// exactly what would have happened before. Nothing depends on it for correctness.
+//
+// Deliberately the same argument name, `_cache` stamp shape and success-only rule as the cloud and
+// self-host MCP servers, so `max_age` behaves identically wherever an agent connects.
+
+/// The tool argument that carries the caller's freshness ceiling.
+pub(crate) const FRESHNESS_ARG: &str = "max_age";
+
+const RESULT_CACHE_MAX: usize = 256;
+
+type ResultCache = std::collections::HashMap<String, (std::time::Instant, Value)>;
+
+fn result_cache() -> &'static std::sync::Mutex<ResultCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ResultCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(ResultCache::new()))
+}
+
+/// Identity of one answerable question.
+///
+/// The INPUTS are part of the key. Without them a workflow taking a parameter would serve the first
+/// caller's answer to every subsequent one — a wrong result that looks perfectly valid, which is the
+/// worst kind. Keys are canonicalized by sorting so argument order never splits the cache.
+fn freshness_key(workflow_id: i64, inputs: &Value) -> String {
+    let canonical = match inputs.as_object() {
+        Some(map) => {
+            let mut pairs: Vec<(&String, &Value)> = map.iter().collect();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        }
+        None => String::new(),
+    };
+    format!("{workflow_id}:{canonical}")
+}
+
+/// A stored result younger than `max_age_seconds`, stamped so the agent can tell it was reused.
+fn cached_run(key: &str, max_age_seconds: i64) -> Option<Value> {
+    let cache = result_cache().lock().ok()?;
+    let (stored_at, result) = cache.get(key)?;
+    let age = stored_at.elapsed().as_secs() as i64;
+    // `<= 0` is not redundant with the age check: a freshly stored entry has age 0, so a bare
+    // `age > max_age` would treat max_age=0 as a HIT — the exact opposite of "always run fresh".
+    // Callers guard on this too, but the rule belongs with the function that implements it.
+    if max_age_seconds <= 0 || age > max_age_seconds {
+        return None;
+    }
+    let mut out = result.clone();
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert(
+            "_cache".into(),
+            json!({ "hit": true, "age_seconds": age }),
+        );
+    }
+    Some(out)
+}
+
+/// Store a SUCCESSFUL result for reuse. A stored failure served back as if it were an answer would be
+/// worse than re-running, so errors are never cached.
+fn store_run(key: &str, result: &Value) {
+    if result.get("isError").and_then(Value::as_bool).unwrap_or(false) {
+        return;
+    }
+    let Ok(mut cache) = result_cache().lock() else {
+        return;
+    };
+    if cache.len() >= RESULT_CACHE_MAX {
+        // Bounded, and evicting the OLDEST keeps the entries most likely to still be asked for.
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (at, _))| *at)
+            .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key.to_string(), (std::time::Instant::now(), result.clone()));
 }
 
 /// Manifest-driven pre-run gate for a marketplace-proxy workflow — delegates to the shared
@@ -451,6 +606,11 @@ mod tests {
     use super::*;
     use crate::local::engine::{RunResult, RunStatus};
 
+    /// Empty tool arguments — the common case for a name-only authorization assertion.
+    fn no_args() -> Value {
+        json!({})
+    }
+
     fn scoped(csv: &str) -> Caller {
         Caller::Scoped(csv.to_string())
     }
@@ -496,7 +656,7 @@ mod tests {
             "writ_browser_save",
             "writ_install_api",
         ] {
-            let err = authorize_tool(&run, tool).expect_err("{tool} must be refused to a run key");
+            let err = authorize_tool(&run, tool, &no_args()).expect_err("{tool} must be refused to a run key");
             match err {
                 CallError::Forbidden(msg) => {
                     assert!(msg.contains("admin"), "{tool}: message names the needed scope: {msg}");
@@ -518,12 +678,99 @@ mod tests {
             "writ_workflow_data",
             "writ_search_data",
         ] {
-            assert!(authorize_tool(&run, tool).is_ok(), "{tool} must be allowed with `run`");
+            assert!(authorize_tool(&run, tool, &no_args()).is_ok(), "{tool} must be allowed with `run`");
         }
 
         // A workflow-derived tool (not `writ_*`) is a replay ⇒ `run`.
-        assert!(authorize_tool(&run, "my_price_check").is_ok());
-        assert!(authorize_tool(&scoped("read"), "my_price_check").is_err(), "read cannot execute");
+        assert!(authorize_tool(&run, "my_price_check", &no_args()).is_ok());
+        assert!(authorize_tool(&scoped("read"), "my_price_check", &no_args()).is_err(), "read cannot execute");
+    }
+
+    /// `save_as` on writ_crawl_site CREATES a saved, API-callable crawl, which is an `Admin` mutation
+    /// over REST. The MCP surface must not be the cheaper door: a `run` key may crawl, but not save.
+    #[test]
+    fn saving_a_crawl_needs_admin_even_though_crawling_needs_only_run() {
+        let run = scoped("run");
+
+        // Plain crawl: allowed with `run`.
+        assert!(authorize_tool(&run, "writ_crawl_site", &json!({ "url": "https://example.com" })).is_ok());
+
+        // Same tool, but asked to SAVE — refused, and the message says why and how to proceed.
+        let err = authorize_tool(
+            &run,
+            "writ_crawl_site",
+            &json!({ "url": "https://example.com", "save_as": "docs" }),
+        )
+        .expect_err("save_as must require admin");
+        match err {
+            CallError::Forbidden(msg) => {
+                assert!(msg.contains("admin"), "names the needed scope: {msg}");
+                assert!(msg.contains("save_as"), "names the offending argument: {msg}");
+            }
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+
+        // A blank/whitespace save_as is not a save request and must not escalate.
+        assert!(authorize_tool(&run, "writ_crawl_site", &json!({ "url": "u", "save_as": "   " })).is_ok());
+
+        // Admin may save.
+        assert!(authorize_tool(
+            &scoped("admin"),
+            "writ_crawl_site",
+            &json!({ "url": "u", "save_as": "docs" })
+        )
+        .is_ok());
+    }
+
+    /// Reading saved crawls is a read; running one is execution.
+    #[test]
+    fn saved_crawl_tools_sit_on_the_expected_rungs() {
+        let read = scoped("read");
+        assert!(authorize_tool(&read, "writ_saved_crawls", &no_args()).is_ok());
+        assert!(authorize_tool(&read, "writ_saved_crawl_data", &no_args()).is_ok());
+        assert!(
+            authorize_tool(&read, "writ_run_saved_crawl", &no_args()).is_err(),
+            "read must not be able to launch a crawl"
+        );
+        assert!(authorize_tool(&scoped("run"), "writ_run_saved_crawl", &no_args()).is_ok());
+    }
+
+    /// `max_age` must never reach the workflow as an input, and a cached answer must be keyed by the
+    /// inputs that produced it — otherwise a parameterised workflow serves one caller's answer to
+    /// everyone, which looks valid and is wrong.
+    #[test]
+    fn freshness_keys_include_inputs_and_ignore_argument_order() {
+        let paris = freshness_key(7, &json!({ "city": "paris" }));
+        let london = freshness_key(7, &json!({ "city": "london" }));
+        assert_ne!(paris, london, "different inputs must not share a cache entry");
+
+        let a = freshness_key(7, &json!({ "city": "paris", "zoom": 3 }));
+        let b = freshness_key(7, &json!({ "zoom": 3, "city": "paris" }));
+        assert_eq!(a, b, "argument order must not split the cache");
+
+        assert_ne!(
+            freshness_key(7, &json!({ "city": "paris" })),
+            freshness_key(8, &json!({ "city": "paris" })),
+            "different workflows must not share a cache entry"
+        );
+    }
+
+    /// A stored FAILURE served back as if it were an answer would be worse than re-running.
+    #[test]
+    fn only_successful_results_are_reusable() {
+        let ok_key = "freshness-test:ok";
+        let err_key = "freshness-test:err";
+
+        store_run(ok_key, &json!({ "content": [], "isError": false }));
+        store_run(err_key, &json!({ "content": [], "isError": true }));
+
+        let hit = cached_run(ok_key, 300).expect("a successful result is reusable");
+        assert_eq!(hit["_cache"]["hit"], json!(true), "a reused answer is stamped");
+        assert!(hit["_cache"]["age_seconds"].is_i64());
+
+        assert!(cached_run(err_key, 300).is_none(), "a failed run must not be cached");
+        // max_age=0 means "run it fresh" — an entry exists, but nothing may satisfy a zero window.
+        assert!(cached_run(ok_key, 0).is_none(), "max_age=0 must always miss");
     }
 
     /// The rest of the ladder: `read` reaches only read tools, `admin` reaches everything on this
@@ -532,25 +779,25 @@ mod tests {
     #[test]
     fn scope_ladder_and_default_deny() {
         let read = scoped("read");
-        assert!(authorize_tool(&read, "writ_list_workflows").is_ok());
-        assert!(authorize_tool(&read, "writ_workflow_runs").is_ok());
-        assert!(authorize_tool(&read, "writ_run_workflow").is_err(), "read must not execute");
-        assert!(authorize_tool(&read, "writ_set_schedule").is_err());
+        assert!(authorize_tool(&read, "writ_list_workflows", &no_args()).is_ok());
+        assert!(authorize_tool(&read, "writ_workflow_runs", &no_args()).is_ok());
+        assert!(authorize_tool(&read, "writ_run_workflow", &no_args()).is_err(), "read must not execute");
+        assert!(authorize_tool(&read, "writ_set_schedule", &no_args()).is_err());
 
         let admin = scoped("admin");
         for (name, _) in TOOL_SCOPES {
-            assert!(authorize_tool(&admin, name).is_ok(), "admin may call {name}");
+            assert!(authorize_tool(&admin, name, &no_args()).is_ok(), "admin may call {name}");
         }
 
         for (name, _) in TOOL_SCOPES {
-            assert!(authorize_tool(&Caller::FullAccess, name).is_ok(), "wlt_/stdio may call {name}");
+            assert!(authorize_tool(&Caller::FullAccess, name, &no_args()).is_ok(), "wlt_/stdio may call {name}");
         }
 
         // Reserved prefix, unknown name → refused for EVERY caller that is not full-access, including
         // admin: a new tool must be classified deliberately.
         for caller in [scoped("read"), scoped("run"), scoped("admin"), scoped("manage")] {
             assert!(
-                matches!(authorize_tool(&caller, "writ_brand_new_tool"), Err(CallError::Forbidden(_))),
+                matches!(authorize_tool(&caller, "writ_brand_new_tool", &no_args()), Err(CallError::Forbidden(_))),
                 "an unclassified writ_* tool must be default-denied for {}",
                 caller.describe()
             );
@@ -558,8 +805,8 @@ mod tests {
 
         // A caller with no grant at all (missing/failed auth) reaches nothing.
         let none = scoped("");
-        assert!(authorize_tool(&none, "writ_list_workflows").is_err());
-        assert!(authorize_tool(&none, "my_price_check").is_err());
+        assert!(authorize_tool(&none, "writ_list_workflows", &no_args()).is_err());
+        assert!(authorize_tool(&none, "my_price_check", &no_args()).is_err());
     }
 
     #[test]
