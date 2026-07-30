@@ -524,6 +524,11 @@ fn clamp_freshness(value: Option<i64>) -> Option<i64> {
 /// Not headers-only: MCP tools and the SDK clients hand back a payload, not an HTTP response, so a
 /// header-only freshness signal is invisible on exactly the surfaces that most need to know whether
 /// they just paid for a crawl.
+///
+/// Cloud-free builds only — a linked build forwards the coordinator's own `_cache` stamp rather than
+/// minting one, so both call sites live under `cfg(not(feature = "cloud"))` and this would be dead
+/// code with `cloud` on. Matches the other local-only helpers below.
+#[cfg(not(feature = "cloud"))]
 fn cache_stamp(hit: bool, age_seconds: Option<f64>, source_crawl_id: Option<i64>) -> Value {
     let mut stamp = json!({ "hit": hit });
     if let (Some(age), Some(obj)) = (age_seconds, stamp.as_object_mut()) {
