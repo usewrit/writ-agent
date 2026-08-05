@@ -105,8 +105,12 @@ impl PlaywrightRecorder {
         // rejected up front if it targets file:/data:/internal hosts or cloud
         // metadata. Fail CLOSED on DNS error. ("about:blank", relative URLs, and
         // the safe internal prefixes are allowed by the guard.)
-        if !crate::security::url_guard::is_navigation_url_safe_async(&start_url).await {
-            return Err(StartSessionError::UnsafeUrl(start_url));
+        // The reason-carrying variant, not the bool one: the refusal is shown to the
+        // person who typed the URL, and "Refused unsafe start URL" for what is
+        // usually a typo'd domain sent users hunting for an engine bug instead of
+        // the missing letter in the hostname.
+        if let Some(reason) = crate::security::url_guard::navigation_refusal(&start_url).await {
+            return Err(StartSessionError::UnsafeUrl(format!("{start_url} — {reason}")));
         }
 
         // Create a stealth browser context with a new page
@@ -565,7 +569,7 @@ pub enum StartSessionError {
     SessionLimit(usize),
     #[error("Browser error: {0}")]
     Browser(String),
-    #[error("Refused unsafe start URL: {0}")]
+    #[error("Cannot open {0}")]
     UnsafeUrl(String),
 }
 

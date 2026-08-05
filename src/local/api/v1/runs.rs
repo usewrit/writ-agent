@@ -126,6 +126,12 @@ struct RunFeedItem {
     duration_ms: Option<i64>,
     trigger_source: Option<String>,
     error: Option<String>,
+    /// Engine-assigned failure bucket (`runs.failure_category`, e.g. "twofa" vs "twofa_persona").
+    /// Lets the UI offer the RIGHT fix for a shared status — a `twofa_required` run is "run it in
+    /// the cloud" when the persona's code arrives by email/SMS, but "attach a persona / import the
+    /// 2FA secret" when there is no usable persona at all. `None` on successful runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_category: Option<String>,
     detail_url_hint: Option<String>,
     data_url_hint: Option<String>,
     /// Workflow runs only: how many data records the run produced (the row count the Data view
@@ -253,6 +259,7 @@ fn project_run(run: &runs::Run, wf_names: &HashMap<i64, WfInfo>) -> RunFeedItem 
         duration_ms: run.duration_ms,
         trigger_source: Some(run.trigger_type.clone()),
         error: run.error_message.clone(),
+        failure_category: run.failure_category.clone(),
         detail_url_hint,
         data_url_hint,
         rows_extracted,

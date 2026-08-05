@@ -327,18 +327,29 @@ async fn history(
 #[derive(Debug, Default, Deserialize)]
 struct RecentChangesQuery {
     limit: Option<i64>,
+    /// Keyset cursor: return only changes detected after this `last_detected_at`.
+    since: Option<String>,
+    /// Tie-breaker for rows sharing the `since` timestamp — the last row's `id`.
+    since_id: Option<i64>,
 }
 
-/// `GET /v1/changes/recent` — newest-first detected content changes across ALL monitors, each
-/// enriched with the monitor URL + selector name + a truncated diff snippet. Powers the home
-/// "recent changes" activity feed. Capped by `?limit` (default 10, hard-capped at 50). Uptime
-/// samples are NOT included here — this feed is content-change history only.
+/// `GET /v1/changes/recent` — detected content changes across ALL monitors, each enriched with the
+/// monitor URL + selector name + a truncated diff snippet. Powers the home "recent changes"
+/// activity feed. Capped by `?limit` (default 10, hard-capped at 50). Uptime samples are NOT
+/// included here — this feed is content-change history only.
+///
+/// `?since=<ISO-8601>` (with optional `?since_id=`) switches from the newest-first browsing view to
+/// an oldest-first keyset walk, so a poller can advance a cursor over the feed without gaps or
+/// re-reads. This mirrors the cloud route so one SDK `watch()` drives either venue.
 async fn recent_changes(
     State(st): State<AppState>,
     Query(q): Query<RecentChangesQuery>,
 ) -> LocalResult<Json<Vec<changes::RecentChange>>> {
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
-    Ok(Json(changes::list_recent_enriched(&st.db, limit).await?))
+    let cursor = q.since.as_deref().map(|s| (s, q.since_id.unwrap_or(0)));
+    Ok(Json(
+        changes::list_recent_enriched(&st.db, limit, cursor).await?,
+    ))
 }
 
 #[cfg(test)]
@@ -586,7 +597,9 @@ mod tests {
         assert_eq!(all[1].target_url, "https://a.test");
 
         // `?limit=1` returns only the newest.
-        let Json(one) = recent_changes(State(st), Query(RecentChangesQuery { limit: Some(1) }))
+        // No cursor: this asserts the plain `?limit=1` path, not keyset pagination.
+        let query = RecentChangesQuery { limit: Some(1), since: None, since_id: None };
+        let Json(one) = recent_changes(State(st), Query(query))
             .await
             .unwrap();
         assert_eq!(one.len(), 1);

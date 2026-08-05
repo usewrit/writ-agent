@@ -54,10 +54,13 @@ fn require_secure_saas_url(saas_url: &str) -> Result<(), String> {
             );
             Ok(())
         }
+        // Spelled as a runnable command, for the same reason as the gateway
+        // refusal in `saas_bridge`: `saas.allow_insecure: true` is the YAML
+        // shape, not something you can type at the CLI.
         _ => Err(format!(
             "refusing to run the device flow against '{}': plaintext would expose the device code \
-             and your account tokens on the wire. Use an https:// URL (or set \
-             `saas.allow_insecure: true` if you accept the risk on a trusted private network).",
+             and your account tokens on the wire. Use an https:// URL, or, on a trusted private \
+             network only, run:\n    writ-agent config set saas.allow_insecure true",
             parsed.scheme()
         )),
     }

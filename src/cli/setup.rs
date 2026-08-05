@@ -275,7 +275,12 @@ pub fn mask_key(key: Option<&str>) -> String {
     }
 }
 
-pub fn set_config_value(key: &str, value: &str) {
+/// Returns `true` when the key was recognised and the value written.
+///
+/// The bool is load-bearing: the caller used to print "✓ Set <key> = <value>"
+/// unconditionally, so a rejected key produced BOTH "Unknown config key" and a
+/// success tick, and the operator had no way to tell that nothing was saved.
+pub fn set_config_value(key: &str, value: &str) -> bool {
     let mut config = load_config();
     let parts: Vec<&str> = key.split('.').collect();
 
@@ -304,16 +309,29 @@ pub fn set_config_value(key: &str, value: &str) {
                 if value.is_empty() { None } else { Some(value.to_string()) };
         }
         (Some(&"saas"), Some(&"url")) => config.saas.url = value.to_string(),
+        // Every error that tells an operator to turn this on named a key this
+        // function did not accept, so the advice could not be followed: the
+        // agent printed "set saas.allow_insecure=true", the CLI answered
+        // "Unknown config key", and the only way through was hand-editing
+        // config.yaml. The field has always existed and is read by
+        // `bridge::auth` and both bridges — it was just never writable.
+        (Some(&"saas"), Some(&"allow_insecure")) => {
+            config.saas.allow_insecure = matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
+        }
         (Some(&"app"), Some(&"port")) => {
             config.app.port = value.parse().unwrap_or(9090);
         }
         _ => {
             eprintln!("Unknown config key: {}", key);
-            return;
+            return false;
         }
     }
 
     save_config(&config);
+    true
 }
 
 pub fn get_config_value(key: &str) -> Option<String> {
@@ -330,6 +348,7 @@ pub fn get_config_value(key: &str) -> Option<String> {
         (Some(&"recorder"), Some(&"max_sessions")) => Some(config.recorder.max_sessions.to_string()),
         (Some(&"recorder"), Some(&"chrome_profile_source")) => config.recorder.chrome_profile_source,
         (Some(&"saas"), Some(&"url")) => Some(config.saas.url),
+        (Some(&"saas"), Some(&"allow_insecure")) => Some(config.saas.allow_insecure.to_string()),
         (Some(&"app"), Some(&"port")) => Some(config.app.port.to_string()),
         _ => None,
     }

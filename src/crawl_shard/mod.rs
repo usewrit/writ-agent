@@ -35,7 +35,7 @@ use crate::local::store::{automations, crawl_jobs, runs, workflows};
 use crate::local::store::crawl_jobs::{CounterSnapshot, CrawlJob, NewCrawlJob};
 use regex::Regex;
 use serde_json::{json, Value};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinSet;
@@ -413,6 +413,20 @@ const SHARD_CONCURRENCY: usize = 6;
 /// Cap on links returned to the coordinator from ONE shard (its frontier still de-dupes on top).
 const SHARD_DISCOVERED_CAP: usize = 3_000;
 
+/// Concurrent BROWSER renders allowed inside one crawl.
+///
+/// The fetch window above is sized for the HTTP lane, which is cheap. A render is not: it holds a
+/// real browser context, and the manager caps LIVE contexts and FAILS a request that waits past its
+/// timeout — so letting the whole fetch window escalate at once would spend every context on one
+/// crawl and start failing pages (its own, and any monitor check running beside it).
+///
+/// This bound is what makes escalation concurrent AT ALL. Before it existed the browser fetch was
+/// awaited on the manager task, between `join_next()` and the refill — so a batch where every page
+/// escalates (any Cloudflare-fronted site: the seed is served, every article gets a 403 challenge)
+/// ran the whole shard ONE page at a time, at ~3s each, while the fetch window sat idle. A 25-URL
+/// shard took ~75s and reported nothing until it finished.
+const BROWSER_LANE_CONCURRENCY: usize = 4;
+
 /// One already-admitted URL in a coordinator shard.
 #[derive(Clone)]
 pub struct ShardItem {
@@ -443,6 +457,160 @@ pub struct ShardCookie {
     pub value: String,
     pub domain: String,
     pub path: String,
+    pub expires: f64,
+    pub http_only: bool,
+    pub secure: bool,
+    pub same_site: Option<String>,
+}
+
+/// The persona session an authenticated crawl replays, in the form BOTH fetch lanes need.
+///
+/// A crawl has two ways to obtain a page — the `reqwest` HTTP lane and a real browser render — and
+/// an authenticated crawl must be logged in on BOTH. Before this existed only the HTTP lane carried
+/// cookies, so any page that escalated to the browser (a JS shell, or a bot-wall challenge — i.e.
+/// exactly the pages a login-gated SPA serves) was fetched logged-OUT and banked as content.
+///
+/// `domain` is the registrable domain the session belongs to. Auth is replayed ONLY to hosts inside
+/// it: a crawl may legitimately leave the seed site (`same_domain=false`, or an off-site link on an
+/// allowed subdomain), and a session cookie or `Authorization` header must never follow it there.
+#[derive(Clone, Default)]
+pub struct CrawlAuth {
+    /// Cookies, matched per-request by domain/path.
+    pub cookies: Vec<ShardCookie>,
+    /// `localStorage` items — browser lane only (the HTTP lane has no DOM).
+    pub local_storage: HashMap<String, String>,
+    /// `sessionStorage` items — browser lane only.
+    pub session_storage: HashMap<String, String>,
+    /// Auth-bearing request headers captured at login (`Authorization`, `X-API-Key`, …) for
+    /// token-auth sites whose session lives in a header rather than a cookie. HTTP lane only —
+    /// see [`CrawlAuth::header_replay_allowed`].
+    pub headers: HashMap<String, String>,
+    /// Registrable domain this session authenticates against. Empty ⇒ no host restriction beyond
+    /// each cookie's own domain (older coordinators that don't send one).
+    pub domain: String,
+}
+
+impl CrawlAuth {
+    /// True when there is nothing to replay — the unauthenticated crawl path.
+    pub fn is_empty(&self) -> bool {
+        self.cookies.is_empty()
+            && self.local_storage.is_empty()
+            && self.session_storage.is_empty()
+            && self.headers.is_empty()
+    }
+
+    /// True when this session carries browser-only state (storage) worth the extra
+    /// navigate-inject-reload round trip on a render.
+    fn has_storage(&self) -> bool {
+        !self.local_storage.is_empty() || !self.session_storage.is_empty()
+    }
+
+    /// Is `url`'s host inside the session's registrable domain?
+    ///
+    /// Gates every non-cookie replay. Cookies carry their own domain and are matched individually
+    /// (see [`cookie_header_for`]); headers and DOM storage do not, so without this a crawl that
+    /// wandered off-site would hand a bearer token to a third party.
+    fn host_in_domain(&self, url: &str) -> bool {
+        if self.domain.is_empty() {
+            return false; // no anchor ⇒ never replay un-domained auth
+        }
+        let Ok(parsed) = Url::parse(url) else { return false };
+        let Some(host) = parsed.host_str() else { return false };
+        let host = host.to_ascii_lowercase();
+        host == self.domain || host.ends_with(&format!(".{}", self.domain))
+    }
+
+    /// Auth headers may only ride requests to the session's own domain, and only over HTTPS —
+    /// a bearer token must never be emitted in plaintext.
+    fn header_replay_allowed(&self, url: &str) -> bool {
+        !self.headers.is_empty() && url.starts_with("https://") && self.host_in_domain(url)
+    }
+}
+
+/// Live page counts for a shard that is still running.
+///
+/// A shard is the coordinator's unit of accounting: it credits `pages_done` when the whole batch
+/// comes back. At 25 URLs a browser-lane shard runs for over a minute, so the crawl's page counter
+/// could not move for that whole time and the run looked frozen on its first page — which is what
+/// operators cancelled. Emitting the running tally lets the coordinator advance the counter while
+/// the batch is still in flight; the final `task_result` stays authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardProgress {
+    /// Pages successfully extracted SO FAR (cumulative within this shard, never decreasing).
+    pub done: u64,
+    /// Pages failed or refused so far (cumulative within this shard).
+    pub failed: u64,
+    /// URLs in the batch — lets the receiver render "7/25" without tracking dispatch.
+    pub total: u64,
+}
+
+/// Where a running shard reports [`ShardProgress`]. Unbounded on purpose: the sender is on the
+/// shard's hot path and must never wait on a slow consumer, and the volume is one message per page.
+/// The receiver decides how often to actually forward — see [`spawn_progress_forwarder`].
+pub type ProgressSink = tokio::sync::mpsc::UnboundedSender<ShardProgress>;
+
+/// Smallest gap between two `task_progress` frames for one shard.
+///
+/// Every frame costs the receiving coordinator a counter write, and the HTTP lane can retire pages
+/// in milliseconds — so the tally is coalesced to its latest value rather than sent per page. Short
+/// enough that a browser-lane shard (seconds per page) still reports essentially live.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(1_500);
+
+/// Turn a shard's per-page tally into coalesced `task_progress` frames.
+///
+/// Lives here rather than in a bridge because BOTH bridges need it — the fleet bridge (self-host
+/// coordinator) and the saas bridge (cloud backend) — and they must put the SAME frame on the wire
+/// for the two coordinators to credit progress identically. They differ only in how a frame reaches
+/// their socket, which is what `send_frame` abstracts.
+///
+/// The returned sink is what [`run_shard_from_message`] reports into. Dropping it (i.e. the shard
+/// finishing) flushes the final tally and ends the task, so the last pre-result value is never lost.
+pub fn spawn_progress_forwarder(
+    task_id: String,
+    send_frame: impl Fn(Value) + Send + 'static,
+) -> ProgressSink {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ShardProgress>();
+    tokio::spawn(async move {
+        // `move`: the closure OWNS the sender and the id. Borrowing them instead would make it a
+        // non-`Send` value held across the ticker await, which `tokio::spawn` rejects.
+        let emit = move |p: ShardProgress| {
+            // Distinct keys from the run-progress fields (`step` / `max_steps` / `phase`) that share
+            // this frame type: a crawl shard is not a workflow run and must not be read as one.
+            send_frame(json!({
+                "type": "task_progress",
+                "task_id": task_id,
+                "crawl_pages_done": p.done,
+                "crawl_pages_failed": p.failed,
+                "crawl_pages_total": p.total,
+                "message": format!("{}/{} pages", p.done + p.failed, p.total),
+            }));
+        };
+        let mut latest: Option<ShardProgress> = None;
+        let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
+        // Delay (not Burst): after a quiet stretch we want ONE tick, not a catch-up salvo.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // the first tick resolves immediately — consume it
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(p) => latest = Some(p),
+                    // The shard finished and dropped its sink: flush and stop.
+                    None => {
+                        if let Some(p) = latest.take() {
+                            emit(p);
+                        }
+                        break;
+                    }
+                },
+                _ = ticker.tick() => {
+                    if let Some(p) = latest.take() {
+                        emit(p);
+                    }
+                }
+            }
+        }
+    });
+    tx
 }
 
 /// What a shard POSTs back — mirrors the cloud fleet-crawl wire contract exactly.
@@ -493,7 +661,7 @@ impl ShardResult {
 /// Build a minimal per-shard [`CrawlConfig`]. Scope/robots/depth/budget are the COORDINATOR's job
 /// (the URLs arrive pre-admitted), so those fields are inert here — only the extraction spec,
 /// politeness delay, browser availability, and auth cookies matter for fetching the batch.
-fn build_shard_config(spec: &ShardExtract, cookies: Vec<ShardCookie>, browser_available: bool) -> CrawlConfig {
+fn build_shard_config(spec: &ShardExtract, auth: CrawlAuth, browser_available: bool) -> CrawlConfig {
     CrawlConfig {
         seed_host: String::new(),
         seed_reg: String::new(),
@@ -511,7 +679,7 @@ fn build_shard_config(spec: &ShardExtract, cookies: Vec<ShardCookie>, browser_av
         ocr_mode: spec.ocr_mode.clone(),
         content: spec.content.clone(),
         browser_available,
-        cookies,
+        auth,
         // Shard runs ship page thumbnails; the coordinator offloads them to storage.
         want_thumbnails: true,
     }
@@ -524,15 +692,21 @@ pub(crate) async fn run_crawl_shard(
     browser: Option<Arc<crate::browser::manager::BrowserManager>>,
     items: Vec<ShardItem>,
     spec: ShardExtract,
-    cookies: Vec<ShardCookie>,
+    auth: CrawlAuth,
+    progress: Option<ProgressSink>,
 ) -> ShardResult {
     let browser_available = browser.is_some();
-    let cfg = Arc::new(build_shard_config(&spec, cookies, browser_available));
+    let cfg = Arc::new(build_shard_config(&spec, auth, browser_available));
     let client = build_http_client();
 
+    let total = items.len() as u64;
     let mut queue: VecDeque<ShardItem> = items.into_iter().collect();
     let max_concurrent = SHARD_CONCURRENCY.min(queue.len().max(1));
-    let mut join: JoinSet<WorkerOut> = JoinSet::new();
+    // Renders are bounded separately from fetches — see BROWSER_LANE_CONCURRENCY.
+    let render_slots = Arc::new(tokio::sync::Semaphore::new(
+        BROWSER_LANE_CONCURRENCY.min(max_concurrent),
+    ));
+    let mut join: JoinSet<ResolvedOut> = JoinSet::new();
 
     let mut pages: Vec<Value> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
@@ -572,7 +746,13 @@ pub(crate) async fn run_crawl_shard(
             match queue.pop_front() {
                 Some(it) => {
                     let item = FrontierItem { url: it.url, depth: it.depth };
-                    join.spawn(fetch_and_extract(client.clone(), cfg.clone(), item));
+                    join.spawn(fetch_resolve(
+                        client.clone(),
+                        cfg.clone(),
+                        browser.clone(),
+                        render_slots.clone(),
+                        item,
+                    ));
                 }
                 None => break,
             }
@@ -585,15 +765,15 @@ pub(crate) async fn run_crawl_shard(
             Some(Err(_)) => continue, // a panicked worker: can't attribute the url — skip it
             None => break,
         };
-        // The HTTP lane flags a browser retry via NeedsBrowser; record that for the `engine` field
-        // BEFORE the outcome is moved into resolve_outcome.
-        if matches!(out.outcome, PageOutcome::NeedsBrowser { .. }) {
+        // Whether the HTTP lane asked for a render, decided in the worker (where the escalation now
+        // happens) and reported back for the `engine` field.
+        if out.escalated {
             used_browser = true;
         }
-        let now = now_iso();
-        let url = out.url.clone();
+        let now = out.fetched_at;
+        let url = out.url;
         let depth = out.depth;
-        match resolve_outcome(browser.as_ref(), &cfg, url.clone(), depth, out.outcome, &now).await {
+        match out.outcome {
             PageOutcome::Extracted { title, rows, links, favicon, content_kind, lane, screenshot } => {
                 match lane {
                     "browser" => n_browser += 1,
@@ -674,6 +854,16 @@ pub(crate) async fn run_crawl_shard(
                 failed.push(json!({ "url": url, "reason": "no content (browser unavailable)" }));
             }
         }
+        // Report the running tally after every page. Cheap (an unbounded send) and the receiver
+        // decides how often to actually put a frame on the wire; without it the coordinator learns
+        // nothing about this batch until the last page lands.
+        if let Some(tx) = progress.as_ref() {
+            let _ = tx.send(ShardProgress {
+                done: pages.len() as u64,
+                failed: failed.len() as u64,
+                total,
+            });
+        }
     }
 
     ShardResult {
@@ -701,6 +891,7 @@ pub async fn run_shard_from_message(
     browser: Option<Arc<crate::browser::manager::BrowserManager>>,
     task_id: &str,
     config: &Value,
+    progress: Option<ProgressSink>,
 ) -> Value {
     let tc = config
         .get("trigger_context")
@@ -761,9 +952,26 @@ pub async fn run_shard_from_message(
         .filter(|v| v.is_object())
         .cloned();
 
-    let cookies = cookies_from_session(config.get("session_state"));
+    // Registrable domain the coordinator scoped this crawl to — the boundary for replaying
+    // un-domained auth (headers, DOM storage). Absent on an older coordinator: auth then falls
+    // back to cookie-domain matching only.
+    let auth_domain = extract
+        .get("auth_domain")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let auth = auth_from_session(config.get("session_state"), auth_domain);
+    if !auth.is_empty() {
+        tracing::info!(
+            task_id,
+            cookies = auth.cookies.len(),
+            local_storage = auth.local_storage.len(),
+            headers = auth.headers.len(),
+            domain = %auth.domain,
+            "crawl shard running AUTHENTICATED (persona session restored)"
+        );
+    }
     let spec = ShardExtract { mode, schema, delay_ms, render_mode, ocr_mode, content };
-    let result = run_crawl_shard(browser, items, spec, cookies).await;
+    let result = run_crawl_shard(browser, items, spec, auth, progress).await;
 
     json!({
         "type": "task_result",
@@ -774,34 +982,114 @@ pub async fn run_shard_from_message(
     })
 }
 
-/// Restore persona session cookies from a workflow `session_state` (Playwright `storage_state` shape:
-/// `{cookies:[{name,value,domain,path,...}], origins:[...]}`). Empty when unauthenticated.
-fn cookies_from_session(session_state: Option<&Value>) -> Vec<ShardCookie> {
+/// Restore a persona session from a workflow `session_state` blob.
+///
+/// The wire shape is the one [`crate::models::session::SessionState`] serializes — `cookies` plus
+/// camelCase `localStorage`/`sessionStorage` and `headers`. Playwright's own `storage_state` shape
+/// (`origins: [{origin, localStorage: [{name, value}]}]`) is ALSO accepted, because a session
+/// captured by a raw Playwright export reaches us that way and silently losing its localStorage is
+/// how a token-auth SPA ends up crawled logged-out.
+///
+/// `auth_domain` is the registrable domain the coordinator scoped this crawl to; when empty we fall
+/// back to the widest cookie domain so an older coordinator still gets browser-lane auth.
+fn auth_from_session(session_state: Option<&Value>, auth_domain: &str) -> CrawlAuth {
     let Some(ss) = session_state.filter(|v| !v.is_null()) else {
-        return Vec::new();
+        return CrawlAuth::default();
     };
-    let Some(cookies) = ss.get("cookies").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-    cookies
-        .iter()
-        .filter_map(|c| {
-            let name = c.get("name").and_then(|v| v.as_str())?.to_string();
-            let value = c.get("value").and_then(|v| v.as_str())?.to_string();
-            let domain = c
-                .get("domain")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim_start_matches('.')
-                .to_ascii_lowercase();
-            let path = c
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("/")
-                .to_string();
-            Some(ShardCookie { name, value, domain, path })
+
+    let cookies: Vec<ShardCookie> = ss
+        .get("cookies")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let name = c.get("name").and_then(|v| v.as_str())?.to_string();
+                    let value = c.get("value").and_then(|v| v.as_str())?.to_string();
+                    let domain = c
+                        .get("domain")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim_start_matches('.')
+                        .to_ascii_lowercase();
+                    let path = c
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("/")
+                        .to_string();
+                    Some(ShardCookie {
+                        name,
+                        value,
+                        domain,
+                        path,
+                        expires: c.get("expires").and_then(|v| v.as_f64()).unwrap_or(-1.0),
+                        http_only: c.get("httpOnly").and_then(|v| v.as_bool()).unwrap_or(false),
+                        secure: c.get("secure").and_then(|v| v.as_bool()).unwrap_or(false),
+                        same_site: c.get("sameSite").and_then(|v| v.as_str()).map(str::to_string),
+                    })
+                })
+                .collect()
         })
-        .collect()
+        .unwrap_or_default();
+
+    // Writ shape: flat `{key: value}` maps under camelCase keys.
+    let flat_map = |key: &str| -> HashMap<String, String> {
+        ss.get(key)
+            .and_then(|v| v.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut local_storage = flat_map("localStorage");
+    let session_storage = flat_map("sessionStorage");
+
+    // Playwright shape: `origins[].localStorage[] = {name, value}`. Merged in without clobbering
+    // anything the Writ shape already provided.
+    if let Some(origins) = ss.get("origins").and_then(|v| v.as_array()) {
+        for origin in origins {
+            let Some(items) = origin.get("localStorage").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for item in items {
+                let (Some(name), Some(value)) = (
+                    item.get("name").and_then(|v| v.as_str()),
+                    item.get("value").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                local_storage
+                    .entry(name.to_string())
+                    .or_insert_with(|| value.to_string());
+            }
+        }
+    }
+
+    let headers: HashMap<String, String> = ss
+        .get("headers")
+        .and_then(|v| v.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.to_ascii_lowercase(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Anchor for header/storage replay. An explicit coordinator domain wins; otherwise take the
+    // SHORTEST cookie domain present (the registrable one, e.g. `site.com` over `app.site.com`).
+    let domain = if !auth_domain.is_empty() {
+        auth_domain.trim_start_matches('.').to_ascii_lowercase()
+    } else {
+        cookies
+            .iter()
+            .filter(|c| !c.domain.is_empty())
+            .map(|c| c.domain.clone())
+            .min_by_key(|d| d.len())
+            .unwrap_or_default()
+    };
+
+    CrawlAuth { cookies, local_storage, session_storage, headers, domain }
 }
 
 /// Build a `Cookie:` header value for `url` from the session cookies whose domain/path match. Returns
@@ -810,20 +1098,11 @@ fn cookie_header_for(url: &str, cookies: &[ShardCookie]) -> Option<String> {
     if cookies.is_empty() {
         return None;
     }
-    let parsed = Url::parse(url).ok()?;
-    let host = parsed.host_str()?.to_ascii_lowercase();
-    let path = parsed.path();
-    let mut pairs: Vec<String> = Vec::new();
-    for c in cookies {
-        if c.domain.is_empty() {
-            continue;
-        }
-        let host_match = host == c.domain || host.ends_with(&format!(".{}", c.domain));
-        let path_match = c.path.is_empty() || c.path == "/" || path.starts_with(&c.path);
-        if host_match && path_match {
-            pairs.push(format!("{}={}", c.name, c.value));
-        }
-    }
+    let pairs: Vec<String> = cookies
+        .iter()
+        .filter(|c| cookie_matches(url, c))
+        .map(|c| format!("{}={}", c.name, c.value))
+        .collect();
     if pairs.is_empty() {
         None
     } else {
@@ -855,9 +1134,9 @@ struct CrawlConfig {
     /// Content-selection spec forwarded to `extract::extract` (which page elements to keep).
     content: Option<Value>,
     browser_available: bool,
-    /// Persona session cookies for an authenticated crawl (empty otherwise). Applied by the HTTP
-    /// lane; the local in-process crawler never sets these (it crawls logged-out).
-    cookies: Vec<ShardCookie>,
+    /// Persona session for an authenticated crawl (empty otherwise). Applied by BOTH fetch lanes —
+    /// cookies/headers on the HTTP lane, cookies + DOM storage on a browser render.
+    auth: CrawlAuth,
     /// Capture a page thumbnail on every BROWSER-rendered page. Set for coordinator shards only —
     /// they ship it as `screenshot_b64` for the coordinator to move into storage. The local
     /// in-process crawler leaves it false so its SQLite rows stay lean.
@@ -932,10 +1211,102 @@ enum PageOutcome {
     Failed { reason: String },
 }
 
+/// What the HTTP stage produced for one URL. `outcome` may still be `NeedsBrowser`.
 struct WorkerOut {
     url: String,
     depth: i64,
     outcome: PageOutcome,
+}
+
+/// One URL, fully resolved — the HTTP stage AND any browser escalation, both done on the worker
+/// task. This is what the crawl loops consume.
+struct ResolvedOut {
+    url: String,
+    depth: i64,
+    /// Never `NeedsBrowser`, unless the browser was unavailable or produced nothing.
+    outcome: PageOutcome,
+    /// The HTTP lane asked for a render (whether or not one was produced) — drives the shard's
+    /// reported `engine`.
+    escalated: bool,
+    /// When this page was resolved. Stamped on the worker so the timestamp reflects the fetch, not
+    /// when a busy manager task got around to reading the result.
+    fetched_at: String,
+}
+
+/// Fetch one URL and resolve it completely, INCLUDING the browser escalation.
+///
+/// The escalation used to run on the manager task, awaited between `join_next()` and the refill of
+/// the fetch window. That made the browser lane strictly serial: on a host that challenges the HTTP
+/// lane (Cloudflare and friends), every page escalates, and a crawl that should saturate its window
+/// crawled one page at a time with every other worker slot idle. Doing it here puts renders on the
+/// same footing as fetches, bounded by `render_slots` because a context is a scarce resource.
+async fn fetch_resolve(
+    client: reqwest::Client,
+    cfg: Arc<CrawlConfig>,
+    browser: Option<Arc<crate::browser::manager::BrowserManager>>,
+    render_slots: Arc<tokio::sync::Semaphore>,
+    item: FrontierItem,
+) -> ResolvedOut {
+    let out = fetch_and_extract(client, cfg.clone(), item).await;
+    let escalated = matches!(out.outcome, PageOutcome::NeedsBrowser { .. });
+    let fetched_at = now_iso();
+    let outcome = if escalated {
+        // Hold a render slot only for the render itself. `acquire` fails only if the semaphore is
+        // closed, which never happens here (it lives as long as the crawl) — resolve anyway rather
+        // than dropping a page on an impossible branch.
+        let _permit = render_slots.acquire().await.ok();
+        resolve_outcome(browser.as_ref(), &cfg, out.url.clone(), out.depth, out.outcome, &fetched_at).await
+    } else {
+        out.outcome
+    };
+    ResolvedOut { url: out.url, depth: out.depth, outcome, escalated, fetched_at }
+}
+
+/// Load the persona's saved session for a LOCAL crawl and shape it for both fetch lanes.
+///
+/// `Err(message)` is a user-facing refusal: the persona vanished, or it has no usable session left.
+/// The session itself is only ever produced by an interactive sign-in (persona linking / a prior
+/// run) — a crawl replays one, it never logs in — so "expired" genuinely means the user has to
+/// re-link before pages behind the login are reachable.
+#[cfg(feature = "local")]
+async fn resolve_local_crawl_auth(
+    state: &AppState,
+    persona_id: i64,
+    seed_url: &str,
+) -> Result<CrawlAuth, String> {
+    use crate::local::engine::persona::resolve_persona;
+
+    let resolved = resolve_persona(&state.db, &state.vault, persona_id)
+        .await
+        .map_err(|e| format!("Could not open the login identity for this crawl: {e}"))?
+        .ok_or_else(|| {
+            "The login identity for this crawl is missing. Re-link a persona for the site, \
+             then start the crawl."
+                .to_string()
+        })?;
+
+    let Some(session) = resolved.session_state.as_ref() else {
+        return Err("This crawl's persona has no saved login session yet. Sign in once with \
+                    the persona so pages behind the login are reachable, then start the crawl."
+            .to_string());
+    };
+    // Serialize through the wire shape so the local and coordinator paths parse ONE format —
+    // a divergence here is how the two editions drift apart.
+    let blob = serde_json::to_value(session)
+        .map_err(|e| format!("Could not read the persona's saved session: {e}"))?;
+    let auth = auth_from_session(Some(&blob), &registrable(&host_of(seed_url)));
+    if auth.is_empty() {
+        return Err("The login session for this crawl's persona has expired. Sign in again with \
+                    the persona, then start the crawl."
+            .to_string());
+    }
+    tracing::info!(
+        persona_id,
+        cookies = auth.cookies.len(),
+        local_storage = auth.local_storage.len(),
+        "local crawl running AUTHENTICATED (persona session restored)"
+    );
+    Ok(auth)
 }
 
 // --------------------------------------------------------------------------- //
@@ -949,7 +1320,23 @@ async fn run_crawl(state: AppState, id: i64) -> LocalResult<()> {
     };
     let workflow_id = crawl.workflow_id.ok_or_else(|| LocalError::Internal("crawl has no workflow".into()))?;
 
-    let cfg = Arc::new(build_config(&crawl, state.engine.browser().is_some()));
+    // LOGIN-BEFORE-CRAWL. A crawl with a persona must fetch every page signed in, so resolve the
+    // saved session up front and REFUSE to run without one — a persona'd crawl that quietly fell
+    // back to logged-out would bank a whole site of login walls as if it were content, which is
+    // strictly worse than failing with something the user can act on.
+    let auth = match crawl.persona_id {
+        Some(pid) => match resolve_local_crawl_auth(&state, pid, &crawl.seed_url).await {
+            Ok(a) => a,
+            Err(msg) => {
+                crawl_jobs::finalize(&state.db, id, "failed", Some(&msg)).await?;
+                tracing::info!(crawl_id = id, persona_id = pid, "crawl blocked pre-seed: {msg}");
+                return Ok(());
+            }
+        },
+        None => CrawlAuth::default(),
+    };
+
+    let cfg = Arc::new(build_config(&crawl, state.engine.browser().is_some(), auth));
     let client = build_http_client();
     let mut robots = robots::RobotsCache::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -971,7 +1358,14 @@ async fn run_crawl(state: AppState, id: i64) -> LocalResult<()> {
 
     // --- Bounded worker pool ---------------------------------------------- //
     let max_concurrent = crawl.max_concurrent.max(1) as usize;
-    let mut join: JoinSet<WorkerOut> = JoinSet::new();
+    // The browser lane is bounded separately and much lower: `max_concurrent` is the user's fetch
+    // setting and a render costs a live browser context. See BROWSER_LANE_CONCURRENCY.
+    let render_slots = Arc::new(tokio::sync::Semaphore::new(
+        BROWSER_LANE_CONCURRENCY.min(max_concurrent),
+    ));
+    // Resolved once, not per iteration: the workers hold their own clone of the handle.
+    let crawl_browser = state.engine.browser();
+    let mut join: JoinSet<ResolvedOut> = JoinSet::new();
     let mut buffer: Vec<Value> = Vec::new();
     let mut stopping = false;
     let mut cancel_poll: u32 = 0;
@@ -991,7 +1385,13 @@ async fn run_crawl(state: AppState, id: i64) -> LocalResult<()> {
             while join.len() < max_concurrent {
                 match frontier.pop_front() {
                     Some(item) => {
-                        join.spawn(fetch_and_extract(client.clone(), cfg.clone(), item));
+                        join.spawn(fetch_resolve(
+                            client.clone(),
+                            cfg.clone(),
+                            crawl_browser.clone(),
+                            render_slots.clone(),
+                            item,
+                        ));
                     }
                     None => break,
                 }
@@ -1016,10 +1416,8 @@ async fn run_crawl(state: AppState, id: i64) -> LocalResult<()> {
             }
         };
 
-        let now = now_iso();
-        let _crawl_browser = state.engine.browser();
-        let outcome = resolve_outcome(_crawl_browser.as_ref(), &cfg, out.url.clone(), out.depth, out.outcome, &now).await;
-        match outcome {
+        // Already fully resolved on the worker (browser escalation included).
+        match out.outcome {
             PageOutcome::Extracted { rows, links, .. } => {
                 counters.done += 1;
                 for r in rows {
@@ -1384,7 +1782,7 @@ async fn resolve_outcome(
         // thumbnails (shard runs only — the local crawler keeps its rows lean).
         let want_ocr_shot = cfg.ocr_mode != "off" && doc_extract::is_configured();
         let want_shot = want_ocr_shot || cfg.want_thumbnails;
-        if let Some((final_url, html, shot)) = fetch_via_browser(browser, &url, want_shot).await {
+        if let Some((final_url, html, shot)) = fetch_via_browser(browser, &url, want_shot, &cfg.auth).await {
             // Even a RENDERED page can be a bot wall (the browser solved nothing). Report it as a
             // refusal so the coordinator retries elsewhere rather than banking an empty page.
             // Checked BEFORE extraction so a wall never pays for a full parse.
@@ -1495,14 +1893,12 @@ async fn resolve_outcome(
 /// the future stays `Send` (the non-`Send` parse lives entirely inside `extract`, never across an
 /// `.await`).
 async fn fetch_and_extract(client: reqwest::Client, cfg: Arc<CrawlConfig>, item: FrontierItem) -> WorkerOut {
-    if cfg.delay_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(cfg.delay_ms)).await;
-    }
+    claim_host_slot(&item.url, cfg.delay_ms).await;
     // A browser retry is only allowed when a warm browser exists AND render_mode
     // isn't pinned to "http".
     let may_browser = cfg.browser_available && cfg.render_mode != "http";
 
-    let mut fetched = match http_fetch(&client, &item.url, &cfg.cookies).await {
+    let mut fetched = match http_fetch(&client, &item.url, &cfg.auth).await {
         Ok(f) => f,
         Err(reason) => {
             let outcome = if may_browser {
@@ -1676,14 +2072,21 @@ async fn fetch_and_extract(client: reqwest::Client, cfg: Arc<CrawlConfig>, item:
 async fn http_fetch(
     client: &reqwest::Client,
     url: &str,
-    cookies: &[ShardCookie],
+    auth: &CrawlAuth,
 ) -> Result<Fetched, String> {
     let mut req = client
         .get(url)
         .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
         .header("Accept-Language", "en-US,en;q=0.9");
-    if let Some(cookie) = cookie_header_for(url, cookies) {
+    if let Some(cookie) = cookie_header_for(url, &auth.cookies) {
         req = req.header(reqwest::header::COOKIE, cookie);
+    }
+    // Token auth (Bearer / X-API-Key / CSRF) captured at login. Domain- AND https-gated so a
+    // crawl that leaves the session's site cannot leak the token to a third party.
+    if auth.header_replay_allowed(url) {
+        for (name, value) in &auth.headers {
+            req = req.header(name.as_str(), value.as_str());
+        }
     }
     let resp = req
         .send()
@@ -1734,14 +2137,103 @@ async fn http_fetch(
     }
 }
 
+/// Restore the persona session into a fresh browser context before rendering `url`.
+///
+/// Returns `true` when the caller's page is ALREADY navigated to `url` (the storage path has to
+/// navigate in order to reach the origin, then reloads so the app boots with the session in place);
+/// `false` when only cookies were applied and the caller still owns the navigation.
+///
+/// Cookies are filtered to the ones this URL would actually send — an unmatched cookie is not just
+/// useless, it is state from another host sitting in the jar. DOM storage is domain-gated on top:
+/// `localStorage` for `site.com` must never be written into a page on another origin.
+async fn apply_browser_auth(
+    context: &playwright_rs::BrowserContext,
+    page: &playwright_rs::Page,
+    url: &str,
+    auth: &CrawlAuth,
+) -> bool {
+    if auth.is_empty() {
+        return false;
+    }
+    let matching: Vec<playwright_rs::Cookie> = auth
+        .cookies
+        .iter()
+        .filter(|c| cookie_matches(url, c))
+        .map(|c| playwright_rs::Cookie {
+            name: c.name.clone(),
+            value: c.value.clone(),
+            domain: c.domain.clone(),
+            path: c.path.clone(),
+            expires: c.expires,
+            http_only: c.http_only,
+            secure: c.secure,
+            same_site: c.same_site.clone(),
+        })
+        .collect();
+    if !matching.is_empty() {
+        if let Err(e) = context.add_cookies(&matching).await {
+            tracing::warn!(error = %e, "crawl render: could not restore session cookies");
+        }
+    }
+
+    // Storage is only meaningful on the session's own origin, and only worth a second navigation
+    // when there is something to write.
+    if !auth.has_storage() || !auth.host_in_domain(url) {
+        return false;
+    }
+    if crate::browser::navigation::goto(page, url, "domcontentloaded", Duration::from_secs(30))
+        .await
+        .is_err()
+    {
+        return false; // let the caller's own goto surface the failure
+    }
+    for (key, value) in auth.local_storage.iter() {
+        let args = json!([key, value]);
+        let _: Result<Value, _> = page
+            .evaluate("(a) => localStorage.setItem(a[0], a[1])", Some(&args))
+            .await;
+    }
+    for (key, value) in auth.session_storage.iter() {
+        let args = json!([key, value]);
+        let _: Result<Value, _> = page
+            .evaluate("(a) => sessionStorage.setItem(a[0], a[1])", Some(&args))
+            .await;
+    }
+    // Reload so the SPA boots and reads the token it now has.
+    if crate::browser::navigation::reload(page, Duration::from_secs(30))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    true
+}
+
+/// Would `url` send this cookie? Host-suffix + path-prefix match, plus the `secure` rule.
+/// Shared by the header builder and the browser-context restore so both lanes agree on scope.
+fn cookie_matches(url: &str, c: &ShardCookie) -> bool {
+    if c.domain.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = Url::parse(url) else { return false };
+    let Some(host) = parsed.host_str() else { return false };
+    let host = host.to_ascii_lowercase();
+    let host_match = host == c.domain || host.ends_with(&format!(".{}", c.domain));
+    let path = parsed.path();
+    let path_match = c.path.is_empty() || c.path == "/" || path.starts_with(&c.path);
+    let scheme_ok = !c.secure || parsed.scheme() == "https";
+    host_match && path_match && scheme_ok
+}
+
 /// Browser fallback: render `url` in the engine's warm Chromium and return (final_url, html,
 /// screenshot). Best effort — any error yields `None` and the caller degrades. When
 /// `want_screenshot` is set, a viewport JPEG is captured for the screenshot→OCR fallback. A fresh
-/// stealth context per page.
+/// stealth context per page, carrying the persona session when the crawl is authenticated.
 async fn fetch_via_browser(
     browser: &Arc<crate::browser::manager::BrowserManager>,
     url: &str,
     want_screenshot: bool,
+    auth: &CrawlAuth,
 ) -> Option<(String, String, Option<Vec<u8>>)> {
     if browser.ensure_warm_browser_with(true).await.is_err() {
         return None;
@@ -1754,8 +2246,15 @@ async fn fetch_via_browser(
         .create_stealth_context_full(None, Some(playwright_rs::Viewport { width: 1280, height: 800 }))
         .await
         .ok()?;
+    // AUTHENTICATE THE RENDER. The context is fresh per page, so without this every escalated
+    // page — a JS shell, or anything a bot wall challenges — renders logged-OUT, which is exactly
+    // the set of pages a login-gated SPA serves. Cookies go on BEFORE the first navigation;
+    // DOM storage can only be written once we are on the origin, so it costs a reload.
+    let injected_storage = apply_browser_auth(&context, &page, url, auth).await;
     let result = async {
-        crate::browser::navigation::goto(&page, url, "domcontentloaded", Duration::from_secs(30)).await.ok()?;
+        if !injected_storage {
+            crate::browser::navigation::goto(&page, url, "domcontentloaded", Duration::from_secs(30)).await.ok()?;
+        }
         // Wait for the network to settle at the end of the load (bounded so a chatty
         // long-poll/streaming page can't hang the crawl).
         let _ = crate::browser::navigation::wait_for_load_state(&page, "networkidle", Duration::from_secs(8)).await;
@@ -1992,6 +2491,58 @@ fn host_of(url: &str) -> String {
 // item out and breaking those tests.
 #[cfg_attr(not(feature = "local"), allow(dead_code))]
 /// Cheap eTLD+1 (last two labels) — good enough for scoping; SSRF/blocklist still runs per URL.
+// --- Per-host politeness pacing ---------------------------------------------
+// `delay_ms` is the gap between REQUESTS TO A HOST, and the host does not care how
+// its pages were sharded — it sees ONE IP: this agent. So the pace is tracked per
+// host for the whole PROCESS, not per worker and not per shard.
+//
+// Sleeping per worker (what this used to do) made the real rate `window / delay` —
+// six concurrent fetches every `delay`, six times what the operator dialled in. That
+// also silently divided the coordinator's ONLY throttle by the width of the window:
+// when a shard reports blocks the coordinator raises `delay_ms` (×1.5 + 250ms) and
+// cuts `max_concurrent_shards` to ease off the host, and both levers assume the
+// delay means what it says. A crawl that had just been refused would keep six
+// requests in flight against the wall.
+//
+// The concurrency win is untouched by this: it comes from overlapping the SLOW parts
+// (renders at seconds each), not from a higher request rate.
+static HOST_NEXT_SLOT: std::sync::LazyLock<tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
+/// Above this many tracked hosts, expired entries are dropped — a long-lived agent
+/// crawls many hosts and the map must not grow for the life of the process.
+const HOST_SLOT_PRUNE_AT: usize = 512;
+
+/// Wait until this agent may issue its next request to `url`'s host.
+async fn claim_host_slot(url: &str, delay_ms: u64) {
+    if delay_ms == 0 {
+        return;
+    }
+    let delay = Duration::from_millis(delay_ms);
+    // The registrable domain, not the full host: a site spread over `www.`/`cdn.`/
+    // `m.` is still one edge doing the rate limiting, and the coordinator's
+    // cross-crawl host cooldown keys the same way.
+    let key = Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| registrable(&h.to_lowercase())))
+        .unwrap_or_default();
+
+    let start_at = {
+        let mut slots = HOST_NEXT_SLOT.lock().await;
+        let now = tokio::time::Instant::now();
+        // First request to a host goes immediately; each later one takes the next slot.
+        let at = slots.get(&key).copied().map(|t| t.max(now)).unwrap_or(now);
+        slots.insert(key.clone(), at + delay);
+        if slots.len() > HOST_SLOT_PRUNE_AT {
+            slots.retain(|k, v| *v > now || *k == key);
+        }
+        at
+    };
+    // Slept OUTSIDE the lock, so workers wait on their own deadline in parallel
+    // rather than queueing on the mutex.
+    tokio::time::sleep_until(start_at).await;
+}
+
 fn registrable(host: &str) -> String {
     let labels: Vec<&str> = host.split('.').collect();
     if labels.len() >= 2 {
@@ -2069,7 +2620,7 @@ fn normalize_url(raw: &str) -> String {
 // Config + persistence + small helpers                                         //
 // --------------------------------------------------------------------------- //
 #[cfg(feature = "local")]
-fn build_config(crawl: &CrawlJob, browser_available: bool) -> CrawlConfig {
+fn build_config(crawl: &CrawlJob, browser_available: bool, auth: CrawlAuth) -> CrawlConfig {
     let seed_host = host_of(&crawl.seed_url);
     let seed_reg = registrable(&seed_host);
     let compile = |raw: &str| -> Vec<Regex> {
@@ -2107,7 +2658,9 @@ fn build_config(crawl: &CrawlJob, browser_available: bool) -> CrawlConfig {
         render_mode: "auto".into(),
         ocr_mode: "auto".into(),
         browser_available,
-        cookies: Vec::new(),
+        // The persona session for an authenticated local crawl, resolved by `run_crawl` before
+        // seeding (empty for a public site).
+        auth,
         // No page thumbnails locally: there is no coordinator to offload them to, so they would
         // land as base64 inside the local SQLite rows.
         want_thumbnails: false,
@@ -2291,7 +2844,7 @@ mod tests {
             ocr_mode: "auto".into(),
             content: None,
             browser_available: false,
-            cookies: Vec::new(),
+            auth: CrawlAuth::default(),
             want_thumbnails: false,
         }
     }
@@ -2389,6 +2942,20 @@ mod tests {
 
     // ---- distributed shard execution -------------------------------------- //
 
+    /// Terse cookie builder for the matching tests below.
+    fn tc(name: &str, domain: &str, path: &str) -> ShardCookie {
+        ShardCookie {
+            name: name.into(),
+            value: "v".into(),
+            domain: domain.into(),
+            path: path.into(),
+            expires: -1.0,
+            http_only: false,
+            secure: false,
+            same_site: None,
+        }
+    }
+
     #[test]
     fn cookies_parsed_from_storage_state() {
         let ss = json!({
@@ -2399,20 +2966,98 @@ mod tests {
             ],
             "origins": []
         });
-        let cs = cookies_from_session(Some(&ss));
-        assert_eq!(cs.len(), 2);
-        assert_eq!(cs[0].name, "sid");
-        assert_eq!(cs[0].domain, "example.com", "leading dot stripped, lowercased");
-        assert_eq!(cs[1].path, "/app");
-        assert!(cookies_from_session(None).is_empty());
-        assert!(cookies_from_session(Some(&Value::Null)).is_empty());
+        let a = auth_from_session(Some(&ss), "example.com");
+        assert_eq!(a.cookies.len(), 2);
+        assert_eq!(a.cookies[0].name, "sid");
+        assert_eq!(a.cookies[0].domain, "example.com", "leading dot stripped, lowercased");
+        assert_eq!(a.cookies[1].path, "/app");
+        assert!(auth_from_session(None, "").is_empty());
+        assert!(auth_from_session(Some(&Value::Null), "").is_empty());
+    }
+
+    #[test]
+    fn session_storage_parsed_from_both_wire_shapes() {
+        // Writ shape: camelCase flat maps. A localStorage-only session is a REAL session — a
+        // token-auth SPA has no cookies at all, and treating it as empty crawled it logged-out.
+        let writ = json!({
+            "cookies": [],
+            "localStorage": {"token": "jwt-abc"},
+            "sessionStorage": {"tab": "1"},
+            "headers": {"Authorization": "Bearer abc"}
+        });
+        let a = auth_from_session(Some(&writ), "example.com");
+        assert!(!a.is_empty(), "localStorage-only session must count as authenticated");
+        assert_eq!(a.local_storage.get("token").map(String::as_str), Some("jwt-abc"));
+        assert_eq!(a.session_storage.get("tab").map(String::as_str), Some("1"));
+        assert_eq!(
+            a.headers.get("authorization").map(String::as_str),
+            Some("Bearer abc"),
+            "header names are lowercased for consistent replay"
+        );
+
+        // Playwright storage_state shape: origins[].localStorage[] = {name, value}.
+        let pw = json!({
+            "cookies": [],
+            "origins": [{
+                "origin": "https://example.com",
+                "localStorage": [{"name": "token", "value": "jwt-xyz"}]
+            }]
+        });
+        let b = auth_from_session(Some(&pw), "example.com");
+        assert_eq!(b.local_storage.get("token").map(String::as_str), Some("jwt-xyz"));
+    }
+
+    #[test]
+    fn auth_domain_falls_back_to_registrable_cookie_domain() {
+        let ss = json!({"cookies": [
+            {"name": "a", "value": "1", "domain": "app.example.com", "path": "/"},
+            {"name": "b", "value": "2", "domain": "example.com", "path": "/"}
+        ]});
+        // No coordinator-supplied domain → the SHORTEST cookie domain anchors replay.
+        let a = auth_from_session(Some(&ss), "");
+        assert_eq!(a.domain, "example.com");
+        // An explicit domain always wins.
+        let b = auth_from_session(Some(&ss), "Other.COM");
+        assert_eq!(b.domain, "other.com", "explicit domain wins and is normalized");
+    }
+
+    #[test]
+    fn auth_headers_never_leave_the_session_domain() {
+        let ss = json!({"cookies": [], "headers": {"Authorization": "Bearer secret"}});
+        let a = auth_from_session(Some(&ss), "example.com");
+        assert!(a.header_replay_allowed("https://example.com/x"));
+        assert!(a.header_replay_allowed("https://app.example.com/x"), "subdomain is in-domain");
+        // A crawl may legitimately leave the site — the bearer token must not follow it.
+        assert!(!a.header_replay_allowed("https://evil.test/x"));
+        assert!(!a.header_replay_allowed("https://notexample.com/x"), "suffix must be a label boundary");
+        // Never in plaintext.
+        assert!(!a.header_replay_allowed("http://example.com/x"));
+        // No anchor ⇒ never replay.
+        let loose = auth_from_session(Some(&ss), "");
+        assert!(!loose.header_replay_allowed("https://example.com/x"));
+    }
+
+    #[test]
+    fn secure_cookies_are_not_sent_over_plaintext() {
+        let mut c = tc("sid", "example.com", "/");
+        c.secure = true;
+        assert!(cookie_matches("https://example.com/", &c));
+        assert!(!cookie_matches("http://example.com/", &c), "Secure cookie is https-only");
     }
 
     #[test]
     fn cookie_header_matches_domain_and_path() {
         let cs = vec![
-            ShardCookie { name: "sid".into(), value: "abc".into(), domain: "example.com".into(), path: "/".into() },
-            ShardCookie { name: "csrf".into(), value: "xyz".into(), domain: "app.example.com".into(), path: "/app".into() },
+            {
+                let mut c = tc("sid", "example.com", "/");
+                c.value = "abc".into();
+                c
+            },
+            {
+                let mut c = tc("csrf", "app.example.com", "/app");
+                c.value = "xyz".into();
+                c
+            },
         ];
         // Subdomain host gets the registrable-domain cookie; the /app cookie only on the /app path.
         let h = cookie_header_for("https://app.example.com/app/page", &cs).unwrap();
@@ -2436,7 +3081,7 @@ mod tests {
             "trigger_context": {"_crawl_id": 7, "_crawl_shard": [], "_crawl_extract": {"mode": "markdown"}}
         });
         // No browser needed for an empty shard (no URLs → no JS fallback).
-        let frame = run_shard_from_message(None, "42", &config).await;
+        let frame = run_shard_from_message(None, "42", &config, None).await;
         assert_eq!(frame["type"], json!("task_result"));
         assert_eq!(frame["task_id"], json!("42"));
         assert_eq!(frame["success"], json!(true));
@@ -2447,6 +3092,145 @@ mod tests {
         assert_eq!(rd["discovered_urls"], json!([]));
         assert_eq!(rd["extracted_data"], json!([]));
         assert_eq!(rd["lane_counts"], json!({"http": 0, "browser": 0, "doc": 0, "ocr": 0}));
+    }
+
+    #[tokio::test]
+    async fn progress_forwarder_coalesces_and_flushes_the_last_tally() {
+        // A shard reports after every page. Putting all of those on the wire would cost the
+        // coordinator one counter write each, so they coalesce — but the LAST one must always be
+        // sent, or the coordinator's count sits behind what the shard already knew when its
+        // `task_result` arrives.
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let tx = spawn_progress_forwarder("77".into(), move |frame| {
+            sink.lock().unwrap().push(frame);
+        });
+
+        // Ten pages retired back-to-back, well inside one coalescing window.
+        for i in 1..=10u64 {
+            tx.send(ShardProgress { done: i, failed: 0, total: 25 }).unwrap();
+        }
+        drop(tx); // the shard finished → flush and stop
+
+        // Wait in REAL time for the forwarder task to observe the closed channel and
+        // flush. Yielding is not enough on a multi-threaded runtime — that task may
+        // be parked on another worker while the whole suite runs in parallel.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while seen.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let frames = seen.lock().unwrap().clone();
+        assert!(!frames.is_empty(), "the final tally must always be sent");
+        assert!(frames.len() < 10, "per-page frames must be coalesced, got {}", frames.len());
+
+        let last = frames.last().unwrap();
+        assert_eq!(last["type"], json!("task_progress"));
+        assert_eq!(last["task_id"], json!("77"));
+        assert_eq!(last["crawl_pages_done"], json!(10));
+        assert_eq!(last["crawl_pages_failed"], json!(0));
+        assert_eq!(last["crawl_pages_total"], json!(25));
+        // Distinct from the run-progress keys (`step` / `max_steps` / `phase`) that share this
+        // frame type — a crawl shard must not be read as a workflow run.
+        assert!(last.get("step").is_none() && last.get("phase").is_none());
+    }
+
+    // The pace map is process-global by design (an agent runs many shards), so each
+    // test below uses its OWN host names rather than resetting shared state.
+    //
+    // Every assertion is a MINIMUM elapsed time except where noted: pacing can only
+    // ever add delay, so a loaded machine cannot make these fail spuriously.
+
+    #[tokio::test]
+    async fn delay_ms_paces_one_host_across_concurrent_workers() {
+        // `delay_ms` is the gap between REQUESTS TO A HOST, so N concurrent workers
+        // must NOT turn it into N requests per delay. It is also the coordinator's
+        // only throttle — it raises the delay to back off a host that blocked us, and
+        // a per-worker reading would divide that lever by the width of the window.
+        let start = tokio::time::Instant::now();
+        let mut set = JoinSet::new();
+        for i in 0..4 {
+            set.spawn(async move {
+                claim_host_slot(&format!("https://paced-a.example/{i}"), 30).await;
+                tokio::time::Instant::now()
+            });
+        }
+        let mut stamps = Vec::new();
+        while let Some(Ok(t)) = set.join_next().await {
+            stamps.push(t);
+        }
+        stamps.sort();
+        assert_eq!(stamps.len(), 4);
+        // Timer granularity: a sleep may return a fraction of a millisecond before
+        // the measured deadline. The property under test is "one delay apart, not
+        // all at once", so absorb that rather than asserting to the microsecond.
+        const TOL: Duration = Duration::from_millis(5);
+        // Four requests, three gaps: the batch must span at least three delays. A
+        // per-worker sleep would fire all four after ONE delay.
+        assert!(
+            stamps[3].duration_since(start) + TOL >= Duration::from_millis(90),
+            "four requests took {:?} — the window outpaced delay_ms",
+            stamps[3].duration_since(start),
+        );
+        for (n, pair) in stamps.windows(2).enumerate() {
+            assert!(
+                pair[1].duration_since(pair[0]) + TOL >= Duration::from_millis(30),
+                "gap {n} was {:?}, under the configured delay",
+                pair[1].duration_since(pair[0]),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn subdomains_of_one_site_share_a_pace_but_other_hosts_do_not() {
+        // The edge that rate-limits us sees one registrable domain, however many
+        // subdomains the pages are spread over — and the coordinator's cross-crawl
+        // cooldown keys the same way. A DIFFERENT site must not be throttled behind it.
+        let start = tokio::time::Instant::now();
+        claim_host_slot("https://www.paced-b.example/a", 120).await;
+        claim_host_slot("https://cdn.paced-b.example/b", 120).await;
+        assert!(
+            tokio::time::Instant::now().duration_since(start) >= Duration::from_millis(120),
+            "subdomains of one site must share a pace",
+        );
+
+        // Upper bound, generously slack: an unrelated host must not queue behind it.
+        let before_other = tokio::time::Instant::now();
+        claim_host_slot("https://paced-c.test/a", 120).await;
+        assert!(
+            tokio::time::Instant::now().duration_since(before_other) < Duration::from_millis(60),
+            "an unrelated host waits on nobody",
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_delay_means_no_pacing() {
+        let start = tokio::time::Instant::now();
+        for i in 0..10 {
+            claim_host_slot(&format!("https://paced-d.example/{i}"), 0).await;
+        }
+        assert!(tokio::time::Instant::now().duration_since(start) < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn browser_lane_is_bounded_below_the_fetch_window() {
+        // The fetch window is sized for cheap HTTP GETs; a render holds a live browser context and
+        // the manager FAILS a request that waits past its timeout. If escalation used the full
+        // window, one crawl on a challenge-walled host would spend every context — failing its own
+        // pages and any monitor check running beside it.
+        // `const { .. }` rather than a plain `assert!`: both operands are constants, so this is
+        // decidable at compile time. Evaluating it in a const block turns a violation into a build
+        // error instead of a test failure — you cannot land the bad constant at all.
+        const {
+            assert!(
+                BROWSER_LANE_CONCURRENCY < SHARD_CONCURRENCY,
+                "renders must be scarcer than fetches"
+            );
+        }
+        const {
+            assert!(BROWSER_LANE_CONCURRENCY >= 2, "escalation must still be concurrent");
+        }
     }
 
     #[test]
@@ -2501,7 +3285,7 @@ mod tests {
         // Verify the schema/mode/delay parsing without running the fetch (pure config plumbing).
         let cfg = build_shard_config(
             &ShardExtract { mode: "schema".into(), schema: Some(json!({"row_selector": ".x"})), delay_ms: 500, render_mode: "auto".into(), ocr_mode: "auto".into(), content: None },
-            Vec::new(),
+            CrawlAuth::default(),
             false,
         );
         assert_eq!(cfg.extract_mode, "schema");

@@ -271,6 +271,15 @@ fn is_device_management_path(path: &str) -> bool {
         // API-key issuance/revocation — a key that can mint keys can escalate itself arbitrarily.
         || path == "/v1/keys"
         || path.starts_with("/v1/keys/")
+        // The SAME escalation through the cloud reflect surface, and strictly worse: `POST
+        // /v1/cloud/reflect/api-keys` mints an ACCOUNT key and returns its one-time secret, so the
+        // credential it hands back outlives this device and is not bounded by it. Without this the
+        // route fell through to `Admin` — the scope a routine "create a workflow" key carries —
+        // while the merely-local `/v1/keys` above already required `Manage`. Prefix-matched so any
+        // future mutation under this path is fail-closed rather than silently `Admin`; the GETs
+        // (list, catalog) are unaffected because `required_scope` resolves GET to `Read` before it
+        // reaches here.
+        || path.starts_with("/v1/cloud/reflect/api-keys")
         // Rotating the master `wlt_` runtime bearer — re-issuing the device's full-access token is
         // device control (the full-access UI token bypasses this gate; an external key needs `manage`).
         || path == "/v1/token/rotate"
@@ -499,6 +508,21 @@ mod tests {
         // Cloud DATA SYNC is ordinary admin; cloud LINK is device management (see below).
         assert_eq!(required_scope("POST", "/v1/cloud/sync/push"), Scope::Admin);
         assert_eq!(required_scope("POST", "/v1/cloud/sync/pull"), Scope::Admin);
+
+        // Minting an ACCOUNT key through the reflect surface is key issuance, exactly like
+        // `/v1/keys` — and the secret it returns is not bounded by this device, so it must not be
+        // reachable with the `admin` scope a routine "create a workflow" key carries.
+        assert_eq!(required_scope("POST", "/v1/cloud/reflect/api-keys"), Scope::Manage);
+        assert_eq!(
+            required_scope("POST", "/v1/cloud/reflect/api-keys/abc123/delete"),
+            Scope::Manage
+        );
+        // Reading the list/catalog stays `read`: those responses carry metadata, never a secret
+        // (the one-time secret exists only in the create RESPONSE).
+        assert_eq!(required_scope("GET", "/v1/cloud/reflect/api-keys"), Scope::Read);
+        assert_eq!(required_scope("GET", "/v1/cloud/reflect/api-keys/catalog"), Scope::Read);
+        // Other reflect routes are untouched by the prefix rule above.
+        assert_eq!(required_scope("GET", "/v1/cloud/reflect/local-workflows"), Scope::Read);
 
         // AC-2: device-control routes require the SEPARATE `manage` capability, not `admin`.
         assert_eq!(required_scope("POST", "/v1/vault/disable"), Scope::Manage);

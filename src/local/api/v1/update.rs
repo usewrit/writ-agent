@@ -1,4 +1,11 @@
-//! `POST /v1/update/verify` — the daemon's authenticated auto-update trust authority.
+//! `/v1/update/*` — the daemon's authenticated auto-update trust authority.
+//!
+//! Three routes, one owner: the daemon holds every piece of update state that must not live in the
+//! shell (the pinned keys, the monotonic version record, the channel), so the shell asks rather than
+//! keeps its own copy.
+//!   * `POST /v1/update/verify`  — run the full §3 chain over a candidate manifest (the gate below).
+//!   * `GET  /v1/update/state`   — channel + version record + any durable rollback demand.
+//!   * `PUT  /v1/update/channel` — switch the channel the §3 chain enforces.
 //!
 //! The Tauri shell must NOT install a desktop update on its own authority. Before staging anything it
 //! asks THIS endpoint to run the full AUTO_UPDATE.md §3 verification chain against the candidate
@@ -24,7 +31,7 @@ use crate::local::server::AppState;
 use crate::local::store::config_kv;
 use crate::local::update::{self, policy};
 use axum::extract::State;
-use axum::routing::post;
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use rand::RngCore as _;
@@ -35,8 +42,68 @@ use serde_json::{json, Value};
 const INSTALL_ID_KEY: &str = "update.install_id";
 const CHANNEL_KEY: &str = "update.channel";
 
+/// Durable rollback demand written by the boot-time post-update gate
+/// (`app::lifecycle::reconcile_update_state`). Present ⇒ the RUNNING build failed its self-check
+/// enough consecutive boots to demand a restore; the value is the retained prior version, or an
+/// empty string when none was retained (unhealthy, but nothing to roll back to).
+const ROLLBACK_TO_KEY: &str = "update.rollback_to";
+
 pub fn router() -> Router<AppState> {
-    Router::new().route("/v1/update/verify", post(verify))
+    Router::new()
+        .route("/v1/update/verify", post(verify))
+        .route("/v1/update/state", get(state))
+        .route("/v1/update/channel", put(set_channel))
+}
+
+/// `GET /v1/update/state` — everything the shell needs to drive the updater, from the ONE authority
+/// that owns it (the encrypted DB).
+///
+/// The shell deliberately keeps NO copy of the channel: duplicating it would let the two halves
+/// disagree, and a shell that checked `beta` while the daemon only approves `stable` manifests would
+/// download bytes it can never install. So the channel travels shell←daemon on every check, and the
+/// shell builds its endpoint URL from THIS value.
+///
+/// Also reports the version record (the downgrade anchor + the retained rollback target) and any
+/// durable rollback demand, so the UI can surface an unhealthy build instead of limping silently.
+async fn state(State(st): State<AppState>) -> LocalResult<Json<Value>> {
+    let channel = config_kv::get_or(&st.db, CHANNEL_KEY, "stable").await?;
+    let record = update::VersionRecord::load(&st.db).await?;
+    // `Some("")` ⇒ a demand with no retained target; distinguish it from "no demand" (`None`).
+    let rollback_to = config_kv::get(&st.db, ROLLBACK_TO_KEY).await?;
+    Ok(Json(json!({
+        "channel": channel,
+        "installed_version": record.installed_version,
+        "prior_version": record.prior_version,
+        "health_fail_count": record.health_fail_count,
+        "rollback_pending": rollback_to.is_some(),
+        "rollback_to": rollback_to.filter(|v| !v.trim().is_empty()),
+        // The version this daemon binary was compiled as. A mismatch with `installed_version` means
+        // the boot reconciliation has not run yet (or failed) — useful for diagnosing a stuck anchor.
+        "running_version": env!("CARGO_PKG_VERSION"),
+    })))
+}
+
+/// Request body for `PUT /v1/update/channel`.
+#[derive(Debug, Deserialize)]
+struct ChannelBody {
+    channel: String,
+}
+
+/// `PUT /v1/update/channel` — switch the update channel the §3 policy chain enforces.
+///
+/// Validated against [`policy::Channel::parse`] so only a channel the verifier actually understands
+/// can be persisted; an unknown value is a 400 rather than a silently-stored string that would make
+/// every later manifest fail closed as `unknown_channel`.
+async fn set_channel(State(st): State<AppState>, Json(body): Json<ChannelBody>) -> LocalResult<Json<Value>> {
+    let Some(channel) = policy::Channel::parse(&body.channel) else {
+        return Err(LocalError::BadRequest(format!(
+            "unknown update channel {:?} (expected stable, beta or managed)",
+            body.channel
+        )));
+    };
+    config_kv::set(&st.db, CHANNEL_KEY, channel.as_str()).await?;
+    tracing::info!(channel = channel.as_str(), "update channel changed");
+    Ok(Json(json!({ "channel": channel.as_str() })))
 }
 
 /// Request body: the candidate manifest (raw AUTO_UPDATE.md JSON object) plus the version the shell's

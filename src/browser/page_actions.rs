@@ -89,6 +89,13 @@ pub async fn hover_at(page: &Page, x: f64, y: f64) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Mouse move to ({}, {}) failed: {}", x, y, e))
 }
 
+pub async fn focus(page: &Page, selector: &str) -> Result<()> {
+    tracing::debug!(selector, "focus");
+    let locator = page.locator(selector).await;
+    locator.focus().await
+        .map_err(|e| anyhow::anyhow!("Focus '{}' failed: {}", selector, e))
+}
+
 pub async fn scroll_into_view(page: &Page, selector: &str) -> Result<()> {
     tracing::debug!(selector, "scroll_into_view");
     let locator = page.locator(selector).await;

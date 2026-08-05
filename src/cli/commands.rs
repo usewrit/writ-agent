@@ -127,7 +127,13 @@ pub async fn run() {
         }
         Some(Commands::Config { action }) => match action {
             ConfigAction::Set { key, value } => {
-                setup::set_config_value(&key, &value);
+                // Only claim success when the key was actually recognised —
+                // `set_config_value` prints its own reason on rejection, and a
+                // tick beside it is how a typo'd key reads as saved. Non-zero
+                // exit so a script can tell, too.
+                if !setup::set_config_value(&key, &value) {
+                    std::process::exit(1);
+                }
                 println!("\x1b[32m✓\x1b[0m Set {} = {}", key, value);
             }
             ConfigAction::Get { key } => {

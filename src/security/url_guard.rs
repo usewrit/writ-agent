@@ -335,44 +335,60 @@ fn dns_resolve(hostname: &str) -> Result<Vec<IpAddr>, std::io::Error> {
 }
 
 pub async fn is_url_safe_async(url_str: &str) -> bool {
-    is_url_safe_async_inner(url_str, false).await
+    refusal_reason_inner(url_str, false).await.is_none()
 }
 
 /// Async, fail-closed-on-DNS-error variant for navigation/entry targets.
 pub async fn is_navigation_url_safe_async(url_str: &str) -> bool {
-    is_url_safe_async_inner(url_str, true).await
+    refusal_reason_inner(url_str, true).await.is_none()
 }
 
-async fn is_url_safe_async_inner(url_str: &str, fail_closed_on_dns_error: bool) -> bool {
+/// Why a navigation/entry URL was refused, in words meant for the person who
+/// typed it — or `None` when the URL is fine.
+///
+/// The bool guards above collapse every refusal into `false`, which the recorder
+/// then reported as "Refused unsafe start URL". For an actual SSRF attempt that
+/// vagueness is fine; for the far more common case — a typo'd domain that simply
+/// doesn't resolve — it reads as a security refusal (or a broken engine) instead
+/// of "check the address". The guard KNOWS which case it hit; this variant is how
+/// a caller keeps that distinction instead of throwing it away.
+pub async fn navigation_refusal(url_str: &str) -> Option<&'static str> {
+    refusal_reason_inner(url_str, true).await
+}
+
+async fn refusal_reason_inner(
+    url_str: &str,
+    fail_closed_on_dns_error: bool,
+) -> Option<&'static str> {
     if url_str.is_empty() {
-        return false;
+        return Some("the URL is empty");
     }
 
     for prefix in SAFE_INTERNAL_PREFIXES {
         if url_str.starts_with(prefix) {
-            return true;
+            return None;
         }
     }
 
     // Same-origin relative path is safe; a protocol-relative "//host/…" is NOT (see the sync variant).
     if url_str.starts_with('/') && !url_str.starts_with("//") {
-        return true;
+        return None;
     }
 
     let parsed = match Url::parse(url_str) {
         Ok(u) => u,
-        Err(_) => return false,
+        Err(_) => return Some("this is not a valid URL"),
     };
 
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
         tracing::warn!(scheme = scheme, "SSRF blocked: scheme not allowed");
-        return false;
+        return Some("only http(s) addresses can be opened");
     }
 
     let hostname = match parsed.host_str() {
         Some(h) => h.to_string(),
-        None => return false,
+        None => return Some("the URL has no hostname"),
     };
 
     let hostname_lower = hostname.to_lowercase();
@@ -382,14 +398,14 @@ async fn is_url_safe_async_inner(url_str: &str, fail_closed_on_dns_error: bool) 
     for blocked in BLOCKED_HOSTS {
         if hostname_clean == *blocked || hostname_no_dot == *blocked {
             tracing::warn!(hostname = hostname_clean, "SSRF blocked: hostname is blocked");
-            return false;
+            return Some("this hostname is blocked (internal/metadata address)");
         }
     }
 
     if let Some(ip) = parse_ip(hostname_clean) {
         if is_blocked_ip(ip) {
             tracing::warn!(hostname = %hostname, "SSRF blocked: private/internal IP");
-            return false;
+            return Some("this address points at a private/internal network");
         }
     }
 
@@ -400,17 +416,22 @@ async fn is_url_safe_async_inner(url_str: &str, fail_closed_on_dns_error: bool) 
         ROUTE_DNS_TIMEOUT
     };
     match resolve_host_verdict(hostname_no_dot, &hostname, timeout).await {
-        HostVerdict::Safe => true,
-        HostVerdict::Internal => false,
+        HostVerdict::Safe => None,
+        HostVerdict::Internal => {
+            Some("this hostname resolves to a private/internal address")
+        }
         HostVerdict::Unresolved => {
             // Navigation targets fail CLOSED; the per-request route blocker passes
             // through (it is a defence-in-depth layer, not the only one, and
             // blocking every subresource on a flaky resolver would break pages).
             if fail_closed_on_dns_error {
                 tracing::warn!(hostname = %hostname, "SSRF blocked: DNS resolution failed or timed out (fail-closed)");
-                return false;
+                return Some(
+                    "this domain could not be resolved — check the address for a \
+                     typo, or check your network's DNS",
+                );
             }
-            true
+            None
         }
     }
 }
@@ -786,6 +807,36 @@ mod tests {
             let url = "https://posture-probe.invalid.test/asset.js";
             assert!(!is_navigation_url_safe_async(url).await, "navigation must fail closed");
             assert!(is_url_safe_async(url).await, "a subresource must pass through");
+        });
+    }
+
+    /// The refusal REASON tells a typo'd domain apart from a policy block.
+    ///
+    /// Both refuse the navigation, but the person reading the error needs opposite
+    /// advice: "check the address" vs "this address is off-limits". Collapsing them
+    /// into one message is what sent a user with a misspelled hostname hunting for
+    /// an engine bug — three retries of the same typo, each "SSRF blocked".
+    #[test]
+    fn refusal_reasons_distinguish_typo_from_policy() {
+        rt().block_on(async {
+            let nxdomain = navigation_refusal("https://quotes.toscape-probe.invalid.test/")
+                .await
+                .expect("an unresolvable host must be refused");
+            assert!(nxdomain.contains("could not be resolved"), "got: {nxdomain}");
+            assert!(nxdomain.contains("typo"), "must point at the likely fix: {nxdomain}");
+
+            let metadata = navigation_refusal("http://169.254.169.254/latest/meta-data")
+                .await
+                .expect("cloud metadata must be refused");
+            assert!(metadata.contains("private/internal"), "got: {metadata}");
+
+            let scheme = navigation_refusal("file:///etc/passwd")
+                .await
+                .expect("non-http schemes must be refused");
+            assert!(scheme.contains("http"), "got: {scheme}");
+
+            assert!(navigation_refusal("https://example.com/").await.is_none(),
+                    "a resolvable public host is not refused");
         });
     }
 }

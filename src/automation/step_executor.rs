@@ -93,6 +93,8 @@ pub async fn execute_step_ctx(
         "scroll" => super::step_misc::execute_scroll(page, config, fast_mode).await,
         "scroll_into_view" => super::step_misc::execute_scroll_into_view(page, config).await,
         "hover" => super::step_misc::execute_hover(page, config, fast_mode).await,
+        "focus" => super::step_misc::execute_focus(page, config).await,
+        "assert" => super::step_misc::execute_assert(page, config, credentials, form_data, timeout_ms).await,
         "evaluate" => super::step_eval::execute_evaluate(page, config).await,
         "codegen" => super::step_eval::execute_codegen(page, config).await,
         "extract" => super::step_eval::execute_extract(page, config).await,
@@ -118,10 +120,128 @@ pub async fn execute_step_ctx(
             m.insert("_return".to_string(), serde_json::json!(true));
             m
         })),
-        "end_point" => super::step_misc::execute_end_point(page, config).await,
+        "end_point" => super::step_misc::execute_end_point(page, config, timeout_ms).await,
         other => {
-            tracing::warn!(step_type = other, "Unknown step type in executor");
+            // No handler: this step does NOTHING. Run loops pre-check [`is_dispatchable`] and
+            // report it as skipped rather than counting a success — being indistinguishable from
+            // a step that ran is exactly how `assert` shipped as a silent no-op.
+            tracing::warn!(
+                step_type = other,
+                "Unsupported step type — no handler, the step did nothing"
+            );
             Ok(None)
         }
+    }
+}
+
+/// Every step type [`execute_step_ctx`] has a handler for.
+///
+/// Run loops consult this BEFORE dispatching so a step nothing can execute is reported honestly
+/// instead of being recorded as a success. `solve_captcha` is an accepted alias of `captcha` and
+/// `login_post` of `api_call`, so both appear here. Types a run loop resolves before dispatch
+/// (`twofa`) are deliberately absent — they never reach the executor.
+///
+/// The dispatch match above is the authority; `dispatchable_list_matches_dispatch_arms` derives
+/// the arm names from this file's own source and fails if the two ever drift apart.
+pub const DISPATCHABLE_STEP_TYPES: &[&str] = &[
+    "ai_continue",
+    "ai_fill",
+    "ai_fill_form",
+    "ai_navigate",
+    "api_call",
+    "assert",
+    "captcha",
+    "check",
+    "click",
+    "codegen",
+    "end_point",
+    "evaluate",
+    "extract",
+    "fill",
+    "focus",
+    "hover",
+    "login_post",
+    "navigate",
+    "navigated_to",
+    "open_tab",
+    "press",
+    "return",
+    "screenshot",
+    "scroll",
+    "scroll_into_view",
+    "select",
+    "solve_captcha",
+    "switch_tab",
+    "tab_closed",
+    "type",
+    "uncheck",
+    "upload",
+    "wait",
+    "wait_for_change",
+    "wait_for_download",
+    "wait_for_tab",
+];
+
+/// Whether [`execute_step_ctx`] can actually run `step_type`. A `false` means the step would do
+/// nothing at all, so the caller should surface it (skipped / warning) rather than record it as
+/// having run.
+pub fn is_dispatchable(step_type: &str) -> bool {
+    DISPATCHABLE_STEP_TYPES.contains(&step_type)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dispatch match is the authority; [`DISPATCHABLE_STEP_TYPES`] is what the run loops read.
+    /// If the two disagree, an authorable step type silently becomes a no-op again (the `assert`
+    /// bug) or a working one gets reported as skipped — so derive the arm names straight from this
+    /// file's source and require set equality.
+    #[test]
+    fn dispatchable_list_matches_dispatch_arms() {
+        let src = include_str!("step_executor.rs");
+        let body = src
+            .split_once("    match step_type {")
+            .expect("dispatch match not found")
+            .1
+            .split_once("\n        other => {")
+            .expect("dispatch fallback arm not found")
+            .0;
+
+        let mut arms: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim_start();
+            // Arm patterns are the only lines that both start with a string literal and carry the
+            // `=>`; comments start with `//` and handler-body lines never start with a quote.
+            if !line.starts_with('"') {
+                continue;
+            }
+            let Some((pattern, _)) = line.split_once("=>") else { continue };
+            for lit in pattern.split('|') {
+                let name = lit.trim().trim_matches('"');
+                assert!(!name.is_empty(), "empty step-type literal in dispatch arm: {line}");
+                arms.push(name.to_string());
+            }
+        }
+        arms.sort();
+
+        let mut listed: Vec<String> =
+            DISPATCHABLE_STEP_TYPES.iter().map(|s| s.to_string()).collect();
+        listed.sort();
+
+        assert_eq!(
+            arms, listed,
+            "DISPATCHABLE_STEP_TYPES is out of sync with the dispatch match arms — a step type \
+             listed but not dispatched is a silent no-op; one dispatched but not listed is \
+             reported as skipped"
+        );
+    }
+
+    /// The two types this list exists because of: both were authorable while doing nothing.
+    #[test]
+    fn assert_and_focus_are_dispatchable() {
+        assert!(is_dispatchable("assert"));
+        assert!(is_dispatchable("focus"));
+        assert!(!is_dispatchable("definitely_not_a_step"));
     }
 }

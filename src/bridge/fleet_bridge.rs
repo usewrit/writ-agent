@@ -625,6 +625,19 @@ fn send_task_result(out: &mpsc::UnboundedSender<Message>, task_id: &str, frame: 
     }
 }
 
+/// Forward a running crawl shard's page tally to the coordinator.
+///
+/// The coalescing + frame shape live in `crawl_shard` so this bridge and the saas bridge put the
+/// IDENTICAL frame on the wire; only the hop onto this socket differs.
+fn spawn_crawl_progress_forwarder(
+    out: mpsc::UnboundedSender<Message>,
+    task_id: String,
+) -> crate::crawl_shard::ProgressSink {
+    crate::crawl_shard::spawn_progress_forwarder(task_id, move |frame| {
+        let _ = out.send(Message::Text(frame.to_string()));
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Catalog cache
 // ---------------------------------------------------------------------------
@@ -1905,7 +1918,13 @@ impl FleetBridge {
                         tokio::spawn(async move {
                             let _permit = permit;
                             let _busy = busy;
-                            let frame = crate::crawl_shard::run_shard_from_message(browser, &task_id, &config).await;
+                            // Live page tally while the batch runs. A 25-URL browser-lane shard is a
+                            // minute of work; without this the coordinator's crawl counters cannot
+                            // move until it ends, and the run reads as frozen on its first page.
+                            let progress = spawn_crawl_progress_forwarder(out.clone(), task_id.clone());
+                            let frame = crate::crawl_shard::run_shard_from_message(
+                                browser, &task_id, &config, Some(progress),
+                            ).await;
                             claim.settle(&out, frame);
                         });
                     } else {
@@ -3135,6 +3154,29 @@ async fn preflight_reject_reason(db: &SqlitePool, wf: &workflows::Workflow) -> O
                     p.twofa_method
                 ));
             }
+        }
+    }
+    // A `twofa` step with no resolvable local persona dead-ends at the challenge. Cloud-persona
+    // runs are pinned to cloud agents and never routed here, so nothing else can supply the code —
+    // reject up front instead of launching a browser to fail. (A persona with method 'none' is NOT
+    // rejected: its warm session may skip the challenge, and the engine arm is challenge-aware.)
+    let has_twofa_step = serde_json::from_str::<Value>(&wf.steps)
+        .ok()
+        .and_then(|v| v.as_array().map(|steps| {
+            steps.iter().any(|s| s.get("type").and_then(Value::as_str) == Some("twofa"))
+        }))
+        .unwrap_or(false);
+    if has_twofa_step {
+        let persona_resolves = match wf.default_persona_id {
+            Some(pid) => matches!(personas::get_by_id(db, pid).await, Ok(Some(_))),
+            None => false,
+        };
+        if !persona_resolves {
+            return Some(
+                "workflow enters a 2FA code but has no persona attached — attach a persona with a \
+                 2FA method (or import its 2FA secret) so runs can enter codes automatically"
+                    .to_string(),
+            );
         }
     }
     None

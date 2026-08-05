@@ -45,6 +45,22 @@ pub async fn wait_for_selector(page: &Page, selector: &str, timeout: Duration) -
         .map_err(|e| anyhow::anyhow!("Wait for '{}' timed out: {}", selector, e))
 }
 
+/// Wait for the element to be present in the DOM, whether or not it is rendered.
+///
+/// Distinct from [`wait_for_selector`], which requires visibility: an author who picks
+/// "Element exists" over "Element visible" usually means a node that is deliberately not shown
+/// (a hidden success flag, an `aria-live` region that is empty until it isn't).
+pub async fn wait_for_selector_attached(page: &Page, selector: &str, timeout: Duration) -> Result<()> {
+    tracing::debug!(?selector, ?timeout, "wait_for_selector_attached");
+    let locator = page.locator(selector).await;
+    let opts = playwright_rs::WaitForOptions {
+        state: Some(playwright_rs::WaitForState::Attached),
+        timeout: Some(timeout.as_millis() as f64),
+    };
+    locator.wait_for(Some(opts)).await
+        .map_err(|e| anyhow::anyhow!("Wait for '{}' attached timed out: {}", selector, e))
+}
+
 pub async fn wait_for_selector_hidden(page: &Page, selector: &str, timeout: Duration) -> Result<()> {
     tracing::debug!(?selector, ?timeout, "wait_for_selector_hidden");
     let locator = page.locator(selector).await;

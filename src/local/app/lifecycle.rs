@@ -141,29 +141,12 @@ pub async fn bootstrap() -> LocalResult<AppState> {
         _ => {}
     }
 
-    // 4b2. Auto-update post-update self-check (AUTO_UPDATE.md §3 step 12, PROD-7). The version record
-    // (`app_meta`) is seeded from the compiled-in build version on first boot, then this gate proves
-    // the RUNNING build is healthy — the encrypted store opens, SQLCipher is genuinely linked, and a
-    // trivial query succeeds (the SAME signal `GET /v1/health` reports). If a freshly-applied update
-    // fails this check `HEALTH_FAIL_ROLLBACK_THRESHOLD` boots running, the gate records an
-    // auto-rollback to the single retained prior version; the actual binary restore is the OS
-    // updater's job (the returned `RollbackAction::Rollback` carries the target). Best-effort — it
-    // never blocks or panics the boot. The whole updater is a desktop concern; the fleet/coordinator
-    // builds still compile it (it is `local`-gated) but it is a no-op cost here.
-    match crate::local::update::VersionRecord::ensure_seeded(&db, env!("CARGO_PKG_VERSION"), None).await {
-        Ok(_) => match crate::local::update::run_post_update_gate(&db).await {
-            crate::local::update::RollbackAction::Rollback { prior_version } => {
-                tracing::error!(
-                    prior_version = prior_version.as_deref().unwrap_or("<none retained>"),
-                    "post-update self-check demanded an auto-rollback — hand the prior version to the OS updater"
-                );
-            }
-            crate::local::update::RollbackAction::HeldFailing { fail_count } => {
-                tracing::warn!(fail_count, "post-update self-check failing (below rollback threshold)");
-            }
-            crate::local::update::RollbackAction::Healthy => {}
-        },
-        Err(e) => tracing::warn!(error = %e, "auto-update version-record seed failed (continuing)"),
+    // 4b2. Auto-update version bookkeeping + post-update self-check (AUTO_UPDATE.md §3 step 12,
+    // PROD-7). Best-effort — it never blocks or panics the boot. The whole updater is a desktop
+    // concern; the fleet/coordinator builds still compile it (it is `local`-gated) but it is a no-op
+    // cost here. See [`reconcile_update_state`] for the ordering rationale.
+    if let Err(e) = reconcile_update_state(&db).await {
+        tracing::warn!(error = %e, "auto-update state reconciliation failed (continuing)");
     }
 
     // 4c. Multi-profile link reconciliation: when the shell has just switched this daemon into an
@@ -413,6 +396,99 @@ where
         }
         tokio::time::sleep(poll.min(deadline.saturating_duration_since(std::time::Instant::now()))).await;
     }
+}
+
+/// Boot reconciliation of the auto-update state (AUTO_UPDATE.md §3 step 12, PROD-7).
+///
+/// This is the ONE place the version record advances, and the ordering matters:
+///
+///   1. **Seed** — a cold `app_meta` stamps `installed_version` from the compiled-in build version.
+///   2. **Detect the apply** — this daemon ships INSIDE the desktop bundle, so a boot whose
+///      `CARGO_PKG_VERSION` is strictly newer than the recorded `installed_version` *is* the first
+///      boot after an update applied. That is the only trustworthy apply signal available offline:
+///      the shell cannot be asked (it may have been replaced mid-flight) and a self-claim in the
+///      manifest is attacker-controlled. Recording it here retains the outgoing version as
+///      `prior_version` (the rollback target) and advances the downgrade anchor the §3 policy chain
+///      gates against — without this the anchor would stay pinned at the ORIGINAL install forever,
+///      and a "downgrade" to any version above it would read as an upgrade.
+///   3. **Self-check** — only then does the gate probe the RUNNING build (the encrypted store opens,
+///      SQLCipher is genuinely linked, a trivial query succeeds — the SAME signal `GET /v1/health`
+///      reports). Step 2 resets the health-fail counter, so a fresh update always gets its full
+///      `HEALTH_FAIL_ROLLBACK_THRESHOLD` budget rather than inheriting the previous build's failures.
+///   4. **Persist the verdict** — a demanded rollback is written to `update.rollback_to` so it
+///      SURVIVES this process. The daemon cannot replace its own binary, so the durable key is how
+///      the demand reaches the shell (`GET /v1/update/state`), which surfaces it and stops offering
+///      the unhealthy build. A healthy boot clears the key.
+///
+/// Every step is best-effort: a bookkeeping failure logs and continues, and never rolls back (that
+/// would risk a rollback loop on a transient DB hiccup — a genuinely broken store is caught by the
+/// self-check itself, which opens it).
+async fn reconcile_update_state(db: &sqlx::SqlitePool) -> LocalResult<()> {
+    use crate::local::store::config_kv;
+    use crate::local::update::{RollbackAction, VersionRecord};
+
+    const ROLLBACK_TO_KEY: &str = "update.rollback_to";
+    let running = env!("CARGO_PKG_VERSION");
+
+    let record = VersionRecord::ensure_seeded(db, running, None).await?;
+
+    // Step 2: did an update just apply? Compare with semver, not string equality, so a build that
+    // ships an unparseable version can never fabricate an "upgrade".
+    let applied = match (
+        record.installed_version.as_deref().and_then(|v| semver::Version::parse(v).ok()),
+        semver::Version::parse(running).ok(),
+    ) {
+        (Some(recorded), Some(now)) => now > recorded,
+        // An unparseable recorded or running version is NOT an apply signal — leave the anchor put.
+        _ => false,
+    };
+    if applied {
+        match record.record_successful_update(db, running, None).await {
+            Ok(_) => tracing::info!(
+                version = running,
+                prior = record.installed_version.as_deref().unwrap_or("<none>"),
+                "auto-update: first boot on a newer build — advanced the downgrade anchor"
+            ),
+            // The monotonic guard inside `record_successful_update` is defence in depth; we already
+            // proved `now > recorded`, so this is a genuine bookkeeping failure, not a policy reject.
+            Err(e) => tracing::warn!(error = %e, "auto-update: could not record the applied update"),
+        }
+    }
+
+    // Steps 3 + 4.
+    match crate::local::update::run_post_update_gate(db).await {
+        RollbackAction::Rollback { prior_version } => {
+            match prior_version.as_deref() {
+                Some(prior) => {
+                    // Durable so the shell can act on it after this process is gone.
+                    config_kv::set(db, ROLLBACK_TO_KEY, prior).await?;
+                    tracing::error!(
+                        prior_version = prior,
+                        "auto-update: self-check failed repeatedly — recorded a rollback demand to the retained prior version"
+                    );
+                }
+                None => {
+                    // Nothing retained (e.g. the failure landed on the very first install). Surface
+                    // the demand WITHOUT a target so the UI can still tell the user the build is
+                    // unhealthy instead of silently limping.
+                    config_kv::set(db, ROLLBACK_TO_KEY, "").await?;
+                    tracing::error!(
+                        "auto-update: self-check failed repeatedly but NO prior version is retained — cannot roll back"
+                    );
+                }
+            }
+        }
+        RollbackAction::HeldFailing { fail_count } => {
+            tracing::warn!(fail_count, "auto-update: post-update self-check failing (below rollback threshold)");
+        }
+        RollbackAction::Healthy => {
+            // Clear any stale demand from an earlier bad build so a recovered install stops nagging.
+            if config_kv::delete(db, ROLLBACK_TO_KEY).await? {
+                tracing::info!("auto-update: build is healthy again — cleared the rollback demand");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Boot reconciliation: mark every `runs` row still in `status='running'` as `interrupted`. Safe to

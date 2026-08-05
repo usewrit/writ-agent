@@ -231,6 +231,14 @@ fn redact(wf: &Workflow, vault: &Vault) -> LocalResult<Value> {
     let placeholders = compute_placeholders(&wf.steps, wf.form_data.as_deref());
     // Gates the Run modal's persona picker (cloud parity); see [`compute_has_login`].
     let has_login = compute_has_login(&wf.steps, wf.form_data.as_deref(), has_credentials);
+    // Narrower than has_login: a step that ENTERS a one-time code. Runs need a persona
+    // with a 2FA method (cloud `has_twofa` parity) — drives the Run modal's warning.
+    let has_twofa = serde_json::from_str::<Value>(&wf.steps)
+        .ok()
+        .and_then(|v| v.as_array().map(|steps| {
+            steps.iter().any(|s| s.get("type").and_then(Value::as_str) == Some("twofa"))
+        }))
+        .unwrap_or(false);
     let credential_keys = credential_key_names(wf, vault);
     let mut v = serde_json::to_value(wf)?;
     if let Some(obj) = v.as_object_mut() {
@@ -239,6 +247,7 @@ fn redact(wf: &Workflow, vault: &Vault) -> LocalResult<Value> {
         obj.insert("credential_keys".into(), json!(credential_keys));
         obj.insert("placeholders".into(), Value::Array(placeholders));
         obj.insert("has_login".into(), json!(has_login));
+        obj.insert("has_twofa".into(), json!(has_twofa));
         // Parse each JSON-TEXT column back into rich JSON. A stored value should always be valid
         // JSON (it was serialized from JSON on the way in); if a legacy row holds non-JSON text we
         // leave the string untouched rather than fail the whole response.

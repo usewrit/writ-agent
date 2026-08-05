@@ -194,7 +194,20 @@ pub(crate) async fn handle_twofa_step(
         .or_else(|| persona.and_then(|p| p.get("twofa_method")).and_then(|v| v.as_str()))
         .unwrap_or("none");
     if method == "none" {
-        tracing::info!("twofa step: no 2FA method configured — skipping");
+        // No OTP source (no persona in the dispatch, or a persona without a 2FA method). A warm
+        // persona session may legitimately have skipped the challenge — so skip ONLY when the page
+        // is not showing one. A visible challenge with nothing to answer it is a workflow-config
+        // gap: fail with the actionable persona message instead of silently continuing into a
+        // selector timeout (or a "successful" extraction of the logged-out page).
+        if crate::bridge::otp_entry::challenge_present(page).await {
+            return Err(
+                "TWOFA_PERSONA_REQUIRED: this sign-in is asking for a 2FA code, but the workflow \
+                 has no persona with a 2FA method attached. Attach a persona — or import its 2FA \
+                 secret — so runs can enter codes automatically."
+                    .to_string(),
+            );
+        }
+        tracing::info!("twofa step: no 2FA method configured and no challenge on the page — skipping");
         return Ok(());
     }
     let persona = persona.ok_or_else(||

@@ -93,6 +93,13 @@ pub fn router() -> Router<AppState> {
         // --- Cloud PERSONA reflection: live (metadata-only) list + "copy for offline" (no control) ---
         .route("/v1/cloud/reflect/personas", get(reflect_personas))
         .route("/v1/cloud/reflect/personas/:cloud_id/copy-local", post(reflect_persona_copy_local))
+        // --- Cloud-callable LOCAL workflows: the coordinator ids for what THIS device advertises,
+        //     so the Connect surfaces can print the real cloud run URL ---
+        .route("/v1/cloud/reflect/local-workflows", get(reflect_local_workflows))
+        // --- Cloud ACCOUNT api keys (`wt_`): mint / list / revoke without leaving the desktop ---
+        .route("/v1/cloud/reflect/api-keys", get(reflect_api_keys).post(reflect_api_key_create))
+        .route("/v1/cloud/reflect/api-keys/catalog", get(reflect_api_key_catalog))
+        .route("/v1/cloud/reflect/api-keys/:key_id/delete", post(reflect_api_key_delete))
 }
 
 /// Build the non-secret `account` reflection object from a linked [`LinkState`], or `null` when the
@@ -821,6 +828,59 @@ async fn reflect_persona_copy_local(
     Ok(Json(serde_json::to_value(result)?))
 }
 
+/// `GET /v1/cloud/reflect/local-workflows` — the coordinator's view of the workflows THIS account's
+/// daemons advertise as cloud-callable, wrapped as `{ workflows: [...], base_url }`.
+///
+/// The Connect surfaces use it to print the REAL cloud run URL for a local workflow: the catalog
+/// only flows upward, so the daemon never learns the canonical coordinator id it must be called by.
+/// `base_url` is the resolved cloud API origin (the same one `/v1/cloud/status` reports) so the
+/// webview can compose an absolute URL without a second round-trip.
+async fn reflect_local_workflows(State(st): State<AppState>) -> LocalResult<Json<Value>> {
+    let link = LinkState::load_or_default(&st.db).await?;
+    let base_url = CloudClient::resolve_base_url(Some(&link));
+    Ok(Json(json!({
+        "workflows": reflect::list_cloud_callable(&st.db).await?,
+        "base_url": base_url,
+    })))
+}
+
+// ── Cloud ACCOUNT api keys ───────────────────────────────────────────────────
+// The desktop's Connect surfaces advertise a cloud URL, and that URL takes an ACCOUNT key (`wt_`).
+// Minting one used to mean opening the web app, which defeats using the desktop app on its own.
+// These four thin passthroughs put the whole lifecycle in the app. The cloud remains the sole
+// issuer/revoker; the `wto_` token never leaves the daemon, and the one-time secret in the create
+// reply is relayed to the caller and never stored.
+
+/// `GET /v1/cloud/reflect/api-keys` — the linked account's keys, wrapped as `{ keys: [...] }`
+/// (the cloud returns a bare array; the wrap matches the other reflect list routes).
+async fn reflect_api_keys(State(st): State<AppState>) -> LocalResult<Json<Value>> {
+    Ok(Json(json!({ "keys": reflect::list_cloud_api_keys(&st.db).await? })))
+}
+
+/// `GET /v1/cloud/reflect/api-keys/catalog` — the cloud's scope vocabulary (resources/actions/
+/// presets), served rather than hardcoded so the desktop key screen can't drift from the web one.
+async fn reflect_api_key_catalog(State(st): State<AppState>) -> LocalResult<Json<Value>> {
+    Ok(Json(reflect::cloud_api_key_catalog(&st.db).await?))
+}
+
+/// `POST /v1/cloud/reflect/api-keys` — mint an account key. The body is the cloud's
+/// `CreateAPIKeyRequest` passed through verbatim, and the reply carries the ONE-TIME secret.
+async fn reflect_api_key_create(
+    State(st): State<AppState>,
+    Json(body): Json<Value>,
+) -> LocalResult<Json<Value>> {
+    Ok(Json(reflect::create_cloud_api_key(&st.db, &body).await?))
+}
+
+/// `POST /v1/cloud/reflect/api-keys/{key_id}/delete` — revoke an account key. POST rather than
+/// DELETE to match the other reflect mutations. Returns `{ok:true}`.
+async fn reflect_api_key_delete(
+    State(st): State<AppState>,
+    Path(key_id): Path<String>,
+) -> LocalResult<Json<Value>> {
+    Ok(Json(reflect::delete_cloud_api_key(&st.db, &key_id).await?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,6 +1300,43 @@ mod tests {
         // clean non-404 error, never a hang or a silent success.
         assert!(mcode == 401 || mcode == 500, "monitors: expected 401|500, got {mcode}");
         assert!(pcode == 401 || pcode == 500, "personas: expected 401|500, got {pcode}");
+    }
+
+    #[tokio::test]
+    async fn reflect_local_workflows_unlinked_is_unauthorized_not_404() {
+        // The cloud-callable catalog read-back is a cloud passthrough like its siblings: unlinked
+        // (no keyring token) must degrade to a clean 401, NOT a 404 the webview would mistake for
+        // "this daemon is too old" and NOT a hang. The Connect surfaces treat any failure as "no
+        // cloud address to advertise", so the only thing that matters is that it fails fast.
+        let prev = std::env::var(crate::local::cloud::client::ENV_CLOUD_URL).ok();
+        std::env::set_var(crate::local::cloud::client::ENV_CLOUD_URL, "http://127.0.0.1:1");
+        let (_dir, st) = test_state().await;
+        let (code, _body) = call(&st, "GET", "/v1/cloud/reflect/local-workflows").await;
+        match prev {
+            Some(v) => std::env::set_var(crate::local::cloud::client::ENV_CLOUD_URL, v),
+            None => std::env::remove_var(crate::local::cloud::client::ENV_CLOUD_URL),
+        }
+        assert!(code == 401 || code == 500, "expected 401 (unlinked) or 500 (unreachable), got {code}");
+    }
+
+    #[tokio::test]
+    async fn reflect_api_keys_routes_exist_and_are_unauthorized_when_unlinked() {
+        // Cloud ACCOUNT keys are minted through the daemon so the desktop never needs the web app.
+        // All three routes must be MOUNTED — a 404 here would read to the key screen as "this
+        // daemon is too old" and silently hide cloud keys — and must fail closed when unlinked.
+        let prev = std::env::var(crate::local::cloud::client::ENV_CLOUD_URL).ok();
+        std::env::set_var(crate::local::cloud::client::ENV_CLOUD_URL, "http://127.0.0.1:1");
+        let (_dir, st) = test_state().await;
+        let (list, _) = call(&st, "GET", "/v1/cloud/reflect/api-keys").await;
+        let (catalog, _) = call(&st, "GET", "/v1/cloud/reflect/api-keys/catalog").await;
+        let (revoke, _) = call(&st, "POST", "/v1/cloud/reflect/api-keys/1/delete").await;
+        match prev {
+            Some(v) => std::env::set_var(crate::local::cloud::client::ENV_CLOUD_URL, v),
+            None => std::env::remove_var(crate::local::cloud::client::ENV_CLOUD_URL),
+        }
+        for (name, code) in [("list", list), ("catalog", catalog), ("revoke", revoke)] {
+            assert!(code == 401 || code == 500, "{name}: expected 401|500, got {code}");
+        }
     }
 
     #[tokio::test]

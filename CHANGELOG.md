@@ -94,6 +94,15 @@ and this project adheres to
 
 ### Security
 
+- **Cloud API-key issuance requires the `manage` scope.** `POST /v1/cloud/reflect/api-keys` mints an
+  account key and returns its one-time secret, and `.../{id}/delete` revokes one, but neither path
+  was listed in `is_device_management_path` — so both resolved to `Scope::Admin`, the scope an
+  ordinary "create a workflow" key carries. The equivalent local route (`/v1/keys`) already required
+  `Manage` on the reasoning that "a key that can mint keys can escalate itself arbitrarily"; the
+  cloud variant is strictly broader, because the credential it returns is scoped to the account
+  rather than this device, and `admin` deliberately does not imply `manage`. Now prefix-matched so
+  future mutations under that path are fail-closed; the GET list/catalog remain `read`, as they
+  carry metadata only.
 - Pinned `quinn-proto` past [RUSTSEC-2026-0185] (remote memory exhaustion). The
   crate is not reachable from any feature set this repository builds — `reqwest`
   lists it behind its optional HTTP/3 support, which is off — but a lockfile

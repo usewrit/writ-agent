@@ -32,7 +32,7 @@ use super::{
     persona, resolve, twofa, Lane, RunIdSink, RunRequest, RunResult, RunSource, RunStatus, StartedRun,
 };
 use crate::automation::files::RunFiles;
-use crate::automation::step_executor::{execute_step_ctx, StepError, StepRunContext};
+use crate::automation::step_executor::{execute_step_ctx, is_dispatchable, StepError, StepRunContext};
 use crate::browser::manager::BrowserManager;
 use crate::config::env::AppConfig;
 use crate::local::error::{LocalError, LocalResult};
@@ -631,11 +631,19 @@ impl RealEngine {
                 }
             }
             Err(RunFailure::Twofa { method, message, url }) => {
-                // Unattended: a TOTP code mints on-device, but an email/SMS code can only be read in
-                // the cloud. Finalize as twofa_required (a non-success terminal state) and surface
-                // RunStatus::TwofaRequired so the caller upsells cloud — the CAPTCHA gate's twin.
-                tracing::warn!(run_id, %url, method, "run blocked on 2FA (email/SMS codes require the cloud)");
-                let _ = runs::fail(db, run_id, "twofa_required", Some(&message), Some("twofa"), Some(duration_ms as i64)).await;
+                // Unattended 2FA gate, finalized as twofa_required (a non-success terminal state,
+                // the CAPTCHA gate's twin). Two distinct shapes share the status, told apart by
+                // failure_category so the UI can offer the RIGHT fix:
+                //   • "twofa" (email/SMS persona) → the code can only be read in the cloud → upsell.
+                //   • "twofa_persona" (no persona / method 'none' / TOTP without a seed) → attach a
+                //     persona or import its 2FA secret; the cloud won't help.
+                tracing::warn!(run_id, %url, method, "run blocked on 2FA");
+                let category = if matches!(method.as_str(), "persona_missing" | "persona_no_method" | "totp_seed_missing") {
+                    "twofa_persona"
+                } else {
+                    "twofa"
+                };
+                let _ = runs::fail(db, run_id, "twofa_required", Some(&message), Some(category), Some(duration_ms as i64)).await;
                 // Like a captcha, a cloud-only 2FA method is not a recipe failure — count the run but
                 // don't poison the streak (the recipe isn't broken; it just needs the cloud to sign in).
                 record_rollup(db, workflow_id, true, None).await;
@@ -789,28 +797,45 @@ impl RealEngine {
         let headless = wf.headless != 0;
         let entry_url = wf.entry_url.as_deref().filter(|s| !s.is_empty()).unwrap_or("about:blank");
 
-        // PRE-FLIGHT 2FA gate: if this run will hit a `twofa` step AND the persona's 2FA method can
-        // only be satisfied in the cloud (email-OTP / SMS), fail fast as `twofa_required` BEFORE
-        // launching a browser — no wasted Chromium, no half-finished login left on the site. TOTP
-        // mints on-device so it never trips this (the per-step branch below still enters it). Mirrors
-        // the cloud pre-flight (`automation.py` premium-feature scan) at the local engine's seam.
-        if let Some(p) = resolved_persona.as_ref() {
-            if matches!(p.twofa_method.as_str(), "email_otp" | "sms")
-                && raw_steps
-                    .iter()
-                    .any(|s| s.get("type").and_then(|v| v.as_str()) == Some("twofa"))
-            {
-                let method = p.twofa_method.clone();
-                tracing::info!(run_id, method, "pre-flight: 2FA needs the cloud (email/SMS) — not launching a browser");
-                return Err(RunFailure::Twofa {
-                    message: format!(
-                        "This workflow signs in with a 2FA code sent by {}. Reading that code \
-                         requires running in the cloud.",
-                        if method == "sms" { "SMS" } else { "email" }
-                    ),
-                    method,
-                    url: entry_url.to_string(),
-                });
+        // PRE-FLIGHT 2FA gate: fail fast as `twofa_required` BEFORE launching a browser — no wasted
+        // Chromium, no half-finished login left on the site. Two doomed shapes are caught here:
+        //   • NO persona at all (also covers a dangling default_persona_id): without a persona there
+        //     is no warm session either, so the challenge WILL appear and the twofa step has no OTP
+        //     source — previously this silently reported the step as Succeeded on a logged-out page.
+        //   • email-OTP / SMS persona: those codes can only be read in the cloud.
+        // A persona whose method is 'none' passes (its warm session may legitimately skip the
+        // challenge — the per-step branch below is challenge-aware), and TOTP mints on-device so it
+        // never trips this. Mirrors the cloud dispatch + engine pre-flights at the local seam.
+        let has_twofa_step = raw_steps
+            .iter()
+            .any(|s| s.get("type").and_then(|v| v.as_str()) == Some("twofa"));
+        if has_twofa_step {
+            match resolved_persona.as_ref() {
+                None => {
+                    tracing::info!(run_id, "pre-flight: twofa step but no persona attached — not launching a browser");
+                    return Err(RunFailure::Twofa {
+                        message: "This workflow enters a 2FA code when signing in, but no persona \
+                                  is attached. Attach a persona with a 2FA method — or import its \
+                                  2FA secret — so runs can enter codes automatically."
+                            .to_string(),
+                        method: "persona_missing".to_string(),
+                        url: entry_url.to_string(),
+                    });
+                }
+                Some(p) if matches!(p.twofa_method.as_str(), "email_otp" | "sms") => {
+                    let method = p.twofa_method.clone();
+                    tracing::info!(run_id, method, "pre-flight: 2FA needs the cloud (email/SMS) — not launching a browser");
+                    return Err(RunFailure::Twofa {
+                        message: format!(
+                            "This workflow signs in with a 2FA code sent by {}. Reading that code \
+                             requires running in the cloud.",
+                            if method == "sms" { "SMS" } else { "email" }
+                        ),
+                        method,
+                        url: entry_url.to_string(),
+                    });
+                }
+                Some(_) => {}
             }
         }
 
@@ -1103,9 +1128,32 @@ impl RealEngine {
                     .map(|p| p.twofa_method.as_str())
                     .unwrap_or("none");
                 match method {
-                    // No 2FA persona configured → nothing to enter (parity with the cloud no-op).
+                    // Persona attached but no 2FA method. Its warm session may legitimately have
+                    // skipped the challenge — so skip ONLY when the page isn't showing one. A visible
+                    // challenge with nothing to answer it is a config gap → fail actionably as
+                    // twofa_required instead of reporting a Succeeded step on the challenge page
+                    // (the no-persona case never reaches here; the pre-flight gate catches it).
                     "none" => {
-                        tracing::info!(run_id, step = i, "twofa step: no 2FA method configured — skipping");
+                        if twofa::challenge_present(&page).await {
+                            tracing::warn!(run_id, step = i, "twofa step: challenge on the page but the persona has no 2FA method");
+                            emitter.emit(RunEvent::Step {
+                                run_id,
+                                index: i,
+                                step_type: step_type.to_string(),
+                                status: StepStatus::Failed,
+                            });
+                            step_failure = Some(RunFailure::Twofa {
+                                method: "persona_no_method".to_string(),
+                                message: "This sign-in is asking for a 2FA code, but the attached \
+                                          persona has no 2FA method configured. Add a 2FA method to \
+                                          the persona — or import its 2FA secret — so runs can enter \
+                                          codes automatically."
+                                    .to_string(),
+                                url: page.url(),
+                            });
+                            break;
+                        }
+                        tracing::info!(run_id, step = i, "twofa step: no 2FA method and no challenge on the page — skipping");
                         completed += 1;
                         emitter.emit(RunEvent::Step {
                             run_id,
@@ -1119,15 +1167,31 @@ impl RealEngine {
                     // Authenticator app: mint a FRESH in-window code on-device, then enter + submit it.
                     "totp" => {
                         let pid = resolved_persona.as_ref().map(|p| p.persona_id).unwrap_or(0);
+                        // Warm-session guard: when the persona's saved session skipped the challenge
+                        // entirely (no OTP field detected AND the recorded selector resolves to
+                        // nothing), entering a code would type it into whatever input the fallback
+                        // chain lands on. Skip the step instead — nothing is asking for a code.
+                        if !twofa::challenge_present(&page).await
+                            && !twofa::recorded_selector_present(&page, raw_step).await
+                        {
+                            tracing::info!(run_id, step = i, "twofa step: no challenge on the page (warm session) — skipping");
+                            completed += 1;
+                            emitter.emit(RunEvent::Step {
+                                run_id,
+                                index: i,
+                                step_type: step_type.to_string(),
+                                status: StepStatus::Succeeded,
+                            });
+                            emitter.emit(RunEvent::Progress { run_id, completed, total });
+                            continue;
+                        }
                         let outcome = match persona::mint_current_totp(db, vault, pid).await {
-                            Ok(Some(code)) => twofa::enter_code(&page, raw_step, &code).await,
-                            Ok(None) => Err(LocalError::Internal(
-                                "persona 2FA method is 'totp' but no seed is configured".into(),
-                            )),
+                            Ok(Some(code)) => twofa::enter_code(&page, raw_step, &code).await.map(Some),
+                            Ok(None) => Ok(None),
                             Err(e) => Err(e),
                         };
                         match outcome {
-                            Ok(()) => {
+                            Ok(Some(())) => {
                                 completed += 1;
                                 emitter.emit(RunEvent::Step {
                                     run_id,
@@ -1137,6 +1201,26 @@ impl RealEngine {
                                 });
                                 emitter.emit(RunEvent::Progress { run_id, completed, total });
                                 continue;
+                            }
+                            // Method is TOTP but the persona holds no seed — a config gap, not a
+                            // broken recipe: fail as twofa_required with the import-the-secret fix.
+                            Ok(None) => {
+                                tracing::warn!(run_id, step = i, "twofa step: persona method is TOTP but no seed is configured");
+                                emitter.emit(RunEvent::Step {
+                                    run_id,
+                                    index: i,
+                                    step_type: step_type.to_string(),
+                                    status: StepStatus::Failed,
+                                });
+                                step_failure = Some(RunFailure::Twofa {
+                                    method: "totp_seed_missing".to_string(),
+                                    message: "The attached persona's 2FA method is TOTP, but no \
+                                              secret is configured. Import the persona's 2FA secret \
+                                              (QR / setup key) so runs can enter codes automatically."
+                                        .to_string(),
+                                    url: page.url(),
+                                });
+                                break;
                             }
                             Err(e) => {
                                 tracing::error!(run_id, step = i, error = %e, "local TOTP 2FA failed");
@@ -1185,6 +1269,24 @@ impl RealEngine {
                         continue;
                     }
                 }
+            }
+
+            // A step type the executor has no handler for does NOTHING. Report it as skipped
+            // rather than dispatching it and recording the resulting `Ok(None)` as a success —
+            // a no-op that reads as "succeeded" is how a workflow can claim to verify something
+            // it never checked. Types this loop resolves itself (twofa, above) never get here.
+            if !is_dispatchable(step_type) {
+                tracing::warn!(
+                    run_id, step = i, step_type,
+                    "unsupported step type — nothing to execute, step skipped"
+                );
+                emitter.emit(RunEvent::Step {
+                    run_id,
+                    index: i,
+                    step_type: step_type.to_string(),
+                    status: StepStatus::Skipped,
+                });
+                continue;
             }
 
             let step_config: WorkflowStepConfig = match serde_json::from_value(
@@ -2112,6 +2214,54 @@ mod tests {
         let row = runs::get_by_id(&eng.db, res.run_id).await.unwrap().expect("run row exists");
         assert_eq!(row.status, "twofa_required", "persisted status string");
         assert_eq!(row.failure_category.as_deref(), Some("twofa"), "fault category stamped");
+        assert_eq!(eng.active_runs(), 0, "active count released");
+    }
+
+    /// A `twofa` workflow with NO persona at all must fail fast BEFORE a browser launches —
+    /// previously the step silently reported Succeeded on the challenge page. The distinct
+    /// `twofa_persona` category is what tells the UI "attach a persona" apart from the
+    /// email/SMS "run it in the cloud" upsell (both share the `twofa_required` status).
+    #[tokio::test]
+    async fn no_persona_twofa_run_gates_without_a_browser() {
+        let eng = engine().await;
+        let wf = workflows::insert(
+            &eng.db,
+            &NewWorkflow {
+                name: "needs-persona-2fa".into(),
+                steps: Some(r#"[{"type":"twofa","enabled":true,"config":{}}]"#.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let res = eng
+            .run(RunRequest {
+                workflow_id: wf.id,
+                inputs: serde_json::json!({}),
+                source: RunSource::Manual,
+                lane: Lane::Interactive,
+                dry_run: false,
+                persona_id: None,
+                allow_local_secret_refs: true,
+            })
+            .await
+            .expect("engine returns a RunResult");
+
+        assert_eq!(res.status, RunStatus::TwofaRequired, "no-persona 2FA must gate, not no-op");
+        assert!(!res.success);
+        assert!(
+            res.error.as_deref().unwrap_or("").to_lowercase().contains("persona"),
+            "error tells the operator to attach a persona, got {:?}",
+            res.error
+        );
+        let row = runs::get_by_id(&eng.db, res.run_id).await.unwrap().expect("run row exists");
+        assert_eq!(row.status, "twofa_required", "persisted status string");
+        assert_eq!(
+            row.failure_category.as_deref(),
+            Some("twofa_persona"),
+            "persona-gap category (drives the attach-a-persona card, not the cloud upsell)"
+        );
         assert_eq!(eng.active_runs(), 0, "active count released");
     }
 

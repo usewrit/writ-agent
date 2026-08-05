@@ -83,6 +83,16 @@ const CLOUD_PERSONAS: &str = "/api/personas";
 /// `/api`; a STREAMING workflow has no one-shot run, so "run in cloud" for it starts a session here.
 const CLOUD_STREAMING_START: &str = "/api/streaming/sessions/start";
 
+/// The coordinator's management view of the tenant's cloud-callable LOCAL workflows (backend
+/// `connected_apps` router, self-prefixed). Session-authed, METADATA ONLY — it is how this daemon
+/// learns the CANONICAL coordinator id the cloud assigned to each workflow it advertised.
+const CLOUD_CONNECTED_APPS: &str = "/api/connected-apps/workflows";
+
+/// The linked ACCOUNT's API keys (`wt_…`) — backend `auth_router`, mounted under `/api`. These are
+/// the credentials a caller off this machine needs, so the desktop must be able to mint and revoke
+/// them without sending the user to the web app.
+const CLOUD_API_KEYS: &str = "/api/api-keys";
+
 /// Build the cloud run path for a workflow cloud id (`POST .../{id}/run`).
 fn run_path(cloud_id: &str) -> String {
     format!("{CLOUD_WORKFLOWS}/{}/run", encode_segment(cloud_id))
@@ -889,6 +899,70 @@ pub async fn copy_persona_local(db: &SqlitePool, cloud_id: &str) -> LocalResult<
 
     tracing::info!(cloud_id, local_id = inserted.id, "cloud persona copied for offline use");
     Ok(CopyLocalResult { local_id: inserted.id, copied: true, updated: false })
+}
+
+// ============================================================================================
+// CLOUD-CALLABLE LOCAL WORKFLOWS — the coordinator's view of what THIS device advertises
+// ============================================================================================
+
+/// `GET /api/connected-apps/workflows` — the SESSION-authed management view of the tenant's
+/// cloud-callable LOCAL workflows. Each row carries the CANONICAL coordinator `id` (the ref
+/// `POST /api/v1/local-workflows/{id}/run` takes), the daemon-side `local_id` it mirrors, the
+/// owning `agent_id`, and whether that daemon is online right now.
+///
+/// The desktop needs this because the catalog flows ONE WAY: the gateway pushes `local_catalog`
+/// frames up (see `gateway::send_catalog`) and never learns the coordinator id the cloud assigned.
+/// Without reading it back, a Connect surface could only advertise the LEGACY `local_id` ref —
+/// which the cloud rejects as ambiguous (409) the moment a tenant links a second daemon. So we
+/// read the real id rather than print a URL that breaks for multi-device users.
+///
+/// Passthrough only: METADATA (name/description/declared inputs/recipe hash) — never steps or
+/// credentials — and nothing is persisted locally.
+pub async fn list_cloud_callable(db: &SqlitePool) -> LocalResult<Value> {
+    client(db).await?.get_json(CLOUD_CONNECTED_APPS).await
+}
+
+// ============================================================================================
+// CLOUD ACCOUNT API KEYS — mint / list / revoke the `wt_` credentials from the desktop
+// ============================================================================================
+//
+// The cloud-callable surfaces hand out a cloud URL, and that URL takes an ACCOUNT key (`wt_`), not
+// the loopback `wlk_` one. Without these the only way to get that credential was the web app, which
+// breaks the desktop-only promise the moment a user wants to call their own workflow from anywhere.
+//
+// These are passthroughs, NOT a local key store: the cloud owns issuance, hashing and revocation,
+// and the SECRET is returned exactly once by the cloud's create response — we relay that response
+// verbatim and never persist it. The `wto_` account token stays in the daemon as always; the
+// webview only ever sees the created key it just asked for.
+
+/// `GET /api/api-keys` — the account's API keys (metadata; the secret is never re-served).
+pub async fn list_cloud_api_keys(db: &SqlitePool) -> LocalResult<Value> {
+    client(db).await?.get_json(CLOUD_API_KEYS).await
+}
+
+/// `GET /api/api-keys/catalog` — the scope vocabulary (resources / actions / presets) the cloud
+/// serves so every key screen offers the same grants instead of hardcoding its own subset.
+pub async fn cloud_api_key_catalog(db: &SqlitePool) -> LocalResult<Value> {
+    client(db)
+        .await?
+        .get_json(&format!("{CLOUD_API_KEYS}/catalog"))
+        .await
+}
+
+/// `POST /api/api-keys` — mint an account key. `body` is the cloud `CreateAPIKeyRequest`
+/// (`{label, preset|scopes, …}`) passed through verbatim; the reply carries the one-time secret.
+pub async fn create_cloud_api_key(db: &SqlitePool, body: &Value) -> LocalResult<Value> {
+    client(db).await?.post_json(CLOUD_API_KEYS, body).await
+}
+
+/// `DELETE /api/api-keys/{id}` — revoke an account key. The cloud answers 204; we return `{ok:true}`
+/// so the webview has a uniform JSON shape to branch on.
+pub async fn delete_cloud_api_key(db: &SqlitePool, key_id: &str) -> LocalResult<Value> {
+    client(db)
+        .await?
+        .delete(&format!("{CLOUD_API_KEYS}/{}", encode_segment(key_id)))
+        .await?;
+    Ok(json!({ "ok": true }))
 }
 
 // --------------------------------------------------------------------------------------------

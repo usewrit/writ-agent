@@ -13,6 +13,35 @@
 
 use crate::local::error::{LocalError, LocalResult};
 
+/// Whether the live page is currently SHOWING a 2FA challenge — the engine's `twofa` arm uses
+/// this to be challenge-aware when there is no OTP source (persona method `none`) or a warm
+/// persona session may have skipped the challenge. Thin re-export of the shared, ungated helper
+/// so the cloud bridge's arm behaves identically.
+pub async fn challenge_present(page: &playwright_rs::Page) -> bool {
+    crate::bridge::otp_entry::challenge_present(page).await
+}
+
+/// Whether the step's RECORDED OTP-field selector (top-level or under `config`) resolves on the
+/// live page. Complements [`challenge_present`] for custom widgets the shared detector doesn't
+/// recognize: if the site shows the recorded field, entry should proceed even when detection
+/// says "no challenge". No selector recorded → `false`.
+pub async fn recorded_selector_present(page: &playwright_rs::Page, raw_step: &serde_json::Value) -> bool {
+    let selector = raw_step
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .or_else(|| raw_step.get("config").and_then(|c| c.get("selector")).and_then(|v| v.as_str()))
+        .filter(|s| !s.is_empty());
+    let Some(selector) = selector else { return false };
+    // JSON-encode the selector so quotes/backslashes can't break out of the literal.
+    let js = format!(
+        "(() => {{ try {{ return !!document.querySelector({}); }} catch (e) {{ return false; }} }})()",
+        serde_json::Value::String(selector.to_string())
+    );
+    crate::browser::page_query::evaluate::<bool>(page, &js)
+        .await
+        .unwrap_or(false)
+}
+
 /// Enter an already-minted 2FA `code` into the live page and submit.
 ///
 /// 1. Use the recorded `selector` (a manual-recording `twofa` step carries one); else auto-detect the

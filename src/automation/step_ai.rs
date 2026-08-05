@@ -251,8 +251,14 @@ pub async fn execute_ai_fill(
     Ok(None)
 }
 
-/// Multi-step AI task loop: get page state, call AI, execute actions until done.
-/// Exact port of Python automation_engine._ai_continue_task
+/// THE AI step ("AI Task" in the editor): describe what you want, the agent loop reads
+/// the page and acts until it's done.
+///
+/// `ai_continue` is what the authoring surfaces emit; `ai_navigate` is the older
+/// spelling of the SAME step and routes here too (see [`execute_ai_navigate`]) rather
+/// than running a second, weaker click-only loop. Both prompt keys (`task`, `goal`) and
+/// both budget keys (`max_actions`, `max_steps`) are read, so neither spelling needs a
+/// migration. Mirrors Python `automation_engine` step type `ai_continue`/`ai_navigate`.
 pub async fn execute_ai_continue(
     page: &Page,
     config: &WorkflowStepConfig,
@@ -260,15 +266,35 @@ pub async fn execute_ai_continue(
     form_data: &HashMap<String, String>,
     _timeout_ms: u64,
 ) -> StepResult {
-    tracing::debug!("Executing ai_continue step");
+    tracing::debug!("Executing AI task step");
 
     let task = config.extra.get("task")
         .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        // Legacy `ai_navigate` spelling of the same field.
+        .or_else(|| config.extra.get("goal").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()))
         .or(config.description.as_deref())
         .unwrap_or("Complete the form");
+    // `max_actions` is the current key, `max_steps` the legacy `ai_navigate` one. The
+    // default matches the Python engine so a workflow that omits it behaves the same
+    // whichever venue runs it.
     let max_actions = config.extra.get("max_actions")
         .and_then(|v| v.as_u64())
-        .unwrap_or(20) as usize;
+        .or_else(|| config.extra.get("max_steps").and_then(|v| v.as_u64()))
+        .unwrap_or(10) as usize;
+
+    // Optional start URL: go there BEFORE the loop starts, so one step can both get
+    // somewhere and do something. Delegated to the `navigate` step so this shares its
+    // SSRF guard, session-token carry-forward and page-settle rather than re-deriving
+    // them here. (The editor has always shown this field for `ai_navigate`; nothing
+    // ever read it, so the step just ran wherever the previous step left the browser.)
+    if let Some(start_url) = config.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let nav_config = WorkflowStepConfig {
+            url: Some(start_url.to_string()),
+            ..Default::default()
+        };
+        super::step_navigate::execute(page, &nav_config, credentials, form_data).await?;
+    }
 
     let mut steps_taken = Vec::new();
     let mut all_data = form_data.clone();
@@ -424,135 +450,19 @@ pub async fn execute_ai_continue(
     Ok(Some(result))
 }
 
-/// AI-driven page navigation: navigate the page using AI decisions.
-/// Exact port of Python automation_engine._ai_navigate_on_page
+/// Legacy spelling of the merged AI step — see [`execute_ai_continue`].
+///
+/// This used to be a SEPARATE, weaker loop: it only ever clicked (never filled), it
+/// re-derived its own prompt, and it fell back to substring-matching the goal against
+/// link text. Two loops for one idea is exactly how "three AI steps" that all mean
+/// "describe it, the AI does it" drifted apart, so `ai_navigate` now runs the same
+/// path as `ai_continue` — which reads `goal`/`max_steps` too, so nothing is lost.
 pub async fn execute_ai_navigate(
     page: &Page,
     config: &WorkflowStepConfig,
     credentials: &HashMap<String, String>,
     form_data: &HashMap<String, String>,
-    _timeout_ms: u64,
+    timeout_ms: u64,
 ) -> StepResult {
-    tracing::debug!("Executing ai_navigate step");
-
-    let goal = config.extra.get("goal")
-        .and_then(|v| v.as_str())
-        .or(config.description.as_deref())
-        .unwrap_or("Navigate to the target");
-    let max_steps = config.extra.get("max_steps")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10) as usize;
-
-    let mut all_data = form_data.clone();
-    for (k, v) in credentials {
-        all_data.insert(k.clone(), v.clone());
-    }
-
-    for step_num in 0..max_steps {
-        // Get interactive elements
-        let state_js = r#"(() => {
-            const elements = [];
-            document.querySelectorAll('a, button, [role="button"], input[type="submit"], [onclick]').forEach((el, i) => {
-                if (i > 30) return;
-                const rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) return;
-                elements.push({
-                    tag: el.tagName.toLowerCase(),
-                    text: (el.textContent || el.value || '').trim().substring(0, 100),
-                    href: el.href || '',
-                    selector: el.id ? '#' + el.id : '',
-                    x: rect.left + rect.width / 2,
-                    y: rect.top + rect.height / 2,
-                });
-            });
-            return { elements, url: location.href, title: document.title };
-        })()"#;
-
-        let state: serde_json::Value = page_query::evaluate(page, state_js).await
-            .map_err(|e| StepError::Execution(format!("Navigation state failed: {}", e)))?;
-
-        // Try AI-driven element selection, fall back to heuristic substring matching
-        let elements = state["elements"].as_array();
-        let mut clicked = false;
-
-        // Attempt AI-driven navigation decision
-        let ai_pick = {
-            let ai_lock = crate::ai::client::get_shared_client();
-            if let Some(ref lock) = ai_lock {
-                let ai = lock.lock().await;
-                if ai.is_connected() {
-                    let prompt = format!(
-                        "Current page: {} ({})\nGoal: {}\nClickable elements:\n{}\n\n\
-                         Which element should I click to navigate toward the goal? \
-                         Return JSON: {{\"index\": <element_index>, \"reason\": \"...\"}} \
-                         or {{\"index\": -1, \"reason\": \"no matching element\"}} if none match.",
-                        state["url"].as_str().unwrap_or(""),
-                        state["title"].as_str().unwrap_or(""),
-                        goal,
-                        serde_json::to_string(&state["elements"]).unwrap_or_default(),
-                    );
-                    ai.complete_json(
-                        "You are a browser navigation agent. Pick the best element to click to reach the goal.",
-                        &prompt,
-                        "",
-                        300,
-                        "workflow",
-                    ).await
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-
-        if let Some(ref pick) = ai_pick {
-            let idx = pick["index"].as_i64().unwrap_or(-1);
-            if idx >= 0 {
-                if let Some(elems) = elements {
-                    if let Some(el) = elems.get(idx as usize) {
-                        if let Some(sel) = el["selector"].as_str().filter(|s| !s.is_empty()) {
-                            let _ = page_actions::click_selector(page, sel, false).await;
-                            clicked = true;
-                        } else if let (Some(x), Some(y)) = (el["x"].as_f64(), el["y"].as_f64()) {
-                            let _ = page_actions::click_at(page, x, y).await;
-                            clicked = true;
-                        }
-                        if clicked {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Heuristic fallback: substring matching on text/href
-        if !clicked {
-            if let Some(elems) = elements {
-                let goal_lower = goal.to_lowercase();
-                for el in elems {
-                    let text = el["text"].as_str().unwrap_or("").to_lowercase();
-                    let href = el["href"].as_str().unwrap_or("").to_lowercase();
-
-                    if text.contains(&goal_lower) || href.contains(&goal_lower) {
-                        if let Some(sel) = el["selector"].as_str().filter(|s| !s.is_empty()) {
-                            let _ = page_actions::click_selector(page, sel, false).await;
-                        } else if let (Some(x), Some(y)) = (el["x"].as_f64(), el["y"].as_f64()) {
-                            let _ = page_actions::click_at(page, x, y).await;
-                        }
-                        clicked = true;
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if !clicked {
-            tracing::debug!(step_num, "AI navigate: no matching element found");
-            break;
-        }
-    }
-
-    Ok(None)
+    execute_ai_continue(page, config, credentials, form_data, timeout_ms).await
 }

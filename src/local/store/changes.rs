@@ -168,23 +168,54 @@ pub struct RecentChange {
     pub last_detected_at: String,
 }
 
-/// Recent changes across ALL targets, newest-first (by `last_detected_at`), each enriched with the
-/// monitor URL + selector name and a diff snippet truncated to a feed-friendly length. Capped at
-/// `limit`. A change whose target row was deleted is excluded by the inner JOIN; a NULL/absent
-/// selector yields `selector_name = None`.
-pub async fn list_recent_enriched(pool: &SqlitePool, limit: i64) -> LocalResult<Vec<RecentChange>> {
-    let rows = sqlx::query_as::<_, RecentChange>(
-        "SELECT c.id, c.target_id, t.url AS target_url, c.target_selector_id, \
+/// Recent changes across ALL targets, each enriched with the monitor URL + selector name and a diff
+/// snippet truncated to a feed-friendly length. Capped at `limit`. A change whose target row was
+/// deleted is excluded by the inner JOIN; a NULL/absent selector yields `selector_name = None`.
+///
+/// `cursor` picks the read mode:
+///   * `None` — newest-first (by `last_detected_at`), the browsing order the home feed wants.
+///   * `Some((ts, id))` — a keyset walk FORWARD from that point, oldest-first, so a poller can
+///     advance without gaps. The pair is compared together because `last_detected_at` is not
+///     unique: ordering on the timestamp alone lets two rows sharing a millisecond straddle the
+///     limit boundary, and the one left behind is never returned again.
+///
+/// Timestamps are stored as zero-padded ISO-8601 `Z` strings, so lexicographic comparison here IS
+/// chronological comparison.
+pub async fn list_recent_enriched(
+    pool: &SqlitePool,
+    limit: i64,
+    cursor: Option<(&str, i64)>,
+) -> LocalResult<Vec<RecentChange>> {
+    const COLS: &str = "SELECT c.id, c.target_id, t.url AS target_url, c.target_selector_id, \
                 s.name AS selector_name, substr(c.diff_snippet, 1, 280) AS diff_snippet, \
                 c.first_detected_at, c.last_detected_at \
          FROM changes c \
          JOIN targets t ON t.id = c.target_id \
-         LEFT JOIN target_selectors s ON s.id = c.target_selector_id \
-         ORDER BY c.last_detected_at DESC, c.id DESC LIMIT ?",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+         LEFT JOIN target_selectors s ON s.id = c.target_selector_id ";
+
+    let rows = match cursor {
+        None => {
+            sqlx::query_as::<_, RecentChange>(&format!(
+                "{COLS} ORDER BY c.last_detected_at DESC, c.id DESC LIMIT ?"
+            ))
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+        Some((since, since_id)) => {
+            sqlx::query_as::<_, RecentChange>(&format!(
+                "{COLS} WHERE c.last_detected_at > ? \
+                    OR (c.last_detected_at = ? AND c.id > ?) \
+                 ORDER BY c.last_detected_at ASC, c.id ASC LIMIT ?"
+            ))
+            .bind(since)
+            .bind(since)
+            .bind(since_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
     Ok(rows)
 }
 

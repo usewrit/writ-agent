@@ -29,6 +29,19 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// Forward a running crawl shard's page tally to the cloud backend.
+///
+/// The coalescing + frame shape live in `crawl_shard` so this bridge and the fleet bridge put the
+/// IDENTICAL frame on the wire; only the hop onto this socket differs.
+fn spawn_crawl_progress_forwarder(
+    out: mpsc::UnboundedSender<crate::streaming::BridgeOutgoing>,
+    task_id: String,
+) -> crate::crawl_shard::ProgressSink {
+    crate::crawl_shard::spawn_progress_forwarder(task_id, move |frame| {
+        let _ = out.send(crate::streaming::BridgeOutgoing::Json(frame));
+    })
+}
+
 // --- transport limits (mirrors `fleet_bridge`; the two bridges are feature-exclusive) ------------
 //
 // Sizing: the largest legitimate inbound frames are full wire workflow definitions (steps +
@@ -963,8 +976,12 @@ impl SaaSBridge {
                     let browser = self.recorder.browser_manager.clone();
                     let tid = task_id.clone();
                     tokio::spawn(async move {
+                        // Live page tally while the batch runs — same contract the fleet bridge
+                        // sends, so the cloud backend credits crawl progress identically whichever
+                        // agent (this one, or the Python fleet agent) is running the shard.
+                        let progress = spawn_crawl_progress_forwarder(outgoing.clone(), tid.clone());
                         let frame = crate::crawl_shard::run_shard_from_message(
-                            Some(browser), &tid, &cfg,
+                            Some(browser), &tid, &cfg, Some(progress),
                         )
                         .await;
                         let _ = outgoing.send(BridgeOutgoing::Json(frame));
@@ -1272,10 +1289,18 @@ fn require_secure_url(url: &str, allow_insecure: bool, what: &str) -> anyhow::Re
     if allow_insecure || is_local {
         return Ok(());
     }
+    // The remedy is spelled as a RUNNABLE command. This used to read
+    // "set saas.allow_insecure=true", which is neither the CLI's syntax
+    // (`config set <key> <value>`, space-separated) nor, until it was wired up,
+    // a key the CLI would accept at all — so following the advice verbatim
+    // produced "Unknown config key" and no change.
     anyhow::bail!(
         "Refusing insecure {what} URL '{url}': plaintext would expose the agent \
          token and all session traffic on the wire. Use a wss://https:// endpoint, \
-         or set saas.allow_insecure=true only on a trusted private network."
+         or, on a trusted private network only, run:\n    \
+         writ-agent config set saas.allow_insecure true\n  \
+         (then restart the agent). Note this URL must also RESOLVE from this \
+         machine — a container-internal hostname will still fail to connect."
     )
 }
 
