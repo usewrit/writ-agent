@@ -76,14 +76,20 @@ or via `WRIT_NETWORK_EXPOSE=1`. In a release build the env override is honored
 (a poisoned launch agent or shell profile) cannot silently expose the API
 LAN-wide.
 
-**When exposed, the bearer token is the *only* gate.** Anyone on the LAN who
-obtains the `wlt_` / `wlk_` token gets full access — including **admin**
-operations: factory-wipe (`data/reset`), DB swap (`backup/restore`), key minting,
-`network/expose`, `cloud/unlink`, and reading every stored secret. The current
-scope model is coarse: an `admin` key is effectively full device control (see
-DISCLOSURES §"Scope model"). Treat LAN exposure as granting full device control to
-anyone holding the token. Prefer keeping the API on loopback and reaching it
-through an authenticated reverse proxy or SSH tunnel.
+**When exposed, the bearer token is the *only* gate.** The full-access `wlt_`
+runtime token bypasses the scope check entirely, so anyone on the LAN holding it
+has complete device control — factory-wipe (`data/reset`), database swap
+(`backup/restore`), key minting, `network/expose`, and every stored secret.
+
+Issued keys (`wlk_`) are narrower. Device-control routes require an explicit
+`manage` scope, and `manage` sits **outside** the `read` ⊂ `run` ⊂ `admin`
+hierarchy — an `admin` key, the kind a "create a workflow" integration gets, does
+**not** reach them. That is a deliberate fail-closed split, not a formality: it is
+what keeps a key that can create workflows from minting further keys.
+
+Either way, treat LAN exposure as handing device control to whoever holds the
+runtime token. Prefer keeping the API on loopback and reaching it through an
+authenticated reverse proxy or an SSH tunnel.
 
 ---
 

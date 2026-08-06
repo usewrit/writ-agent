@@ -1,13 +1,13 @@
 # Configuration reference
 
-Everything that configures the Writ agent binaries: environment variables and the
-on-disk `~/.writ/config.toml` (TOML — this is the only config-file format the
-agent reads). Precedence, where it matters, is: **environment variable →
-`config.toml` value → built-in default**.
+Everything that configures the agent: environment variables and the on-disk
+`~/.writ/config.toml` (TOML — the only config-file format the agent reads).
+Precedence, where it matters, is: **environment variable → `config.toml` value →
+built-in default**.
 
-Data lives under `~/.writ` by default (override with `WRIT_HOME`). The desktop
-daemon's local API binds **`127.0.0.1:8131`** by default; binding `0.0.0.0` (LAN)
-requires an explicit opt-in (see `WRIT_NETWORK_EXPOSE` below).
+Data lives under `~/.writ` by default (override with `WRIT_HOME`). Any local API
+binds **`127.0.0.1`** — reaching it from the LAN requires an explicit opt-in (see
+`WRIT_NETWORK_EXPOSE` below).
 
 ---
 
@@ -40,7 +40,7 @@ resource-governor settings from `config.toml` / the `WRIT_MAX_*` variables below
 
 **Singleton lock.** On startup the worker takes a pidfile lock at
 `$WRIT_HOME/writ.lock` and **refuses to start** if another live Writ process (a
-second worker, or the desktop daemon) already owns that directory. Two processes
+second worker, or another Writ process) already owns that directory. Two processes
 over one home each open their own connection pool against the same SQLCipher
 file, and each independently runs the managed boot policy that *quarantines* a
 database it cannot read — so one worker can rename the other's live `writ.db`
@@ -67,19 +67,9 @@ transient copy of the whole database plus an exclusive lock).
 |----------|---------|--------|
 | `WRIT_HOME` | `~/.writ` | Root data directory (DB, vault key, file stores, config, runtime.json). |
 | `WRIT_PORT` | `8131` | Local API port. Bind host is loopback unless LAN exposure is enabled. |
-| `WRIT_PROFILE` | `local` | Active profile / keyring account key. Each profile has its own data home and cloud link state. A blank value folds to `local`. |
+| `WRIT_PROFILE` | `local` | Active profile / keyring account key. Each profile has its own data home. A blank value folds to `local`. |
 | `WRIT_LANGUAGE` | (UI-set) | Default UI language (BCP-47-ish short tag) reflected to the frontend. |
 | `WRIT_ONBOARDING_COMPLETED` | `false` | Marks onboarding done (normally written by the app). |
-
-### Cloud link (optional; absent in the `fleet` build)
-
-| Variable | Default | Effect |
-|----------|---------|--------|
-| `WRIT_CLOUD_URL` | `https://api.usewrit.app` | Cloud base URL. Highest precedence over persisted link state. |
-| `WRIT_ALLOW_INSECURE_CLOUD` | unset | **Dev only.** Allows a non-HTTPS cloud base URL. Otherwise HTTPS is required (loopback is always allowed). Do not set in production. |
-| `WRIT_CLOUD_EXPOSE` | `false` | Advertise local workflows to the cloud (truthy = `1/true/yes/on`). |
-| `WRIT_CLOUD_AGENT_DISABLED` | `false` | Disable the cloud agent bridge even when linked. |
-| `WRIT_SUPPLY_POOL` | `false` | Opt in to the cloud supply pool. See DISCLOSURES §TB-3 for the trust caveat. |
 
 ### Vault / keyring
 
@@ -169,7 +159,7 @@ security-weakening toggles".
 > Live browser contexts are separately bounded at `2 × max_concurrent_runs` (floor 4), because
 > recording, monitoring, streaming and the concierge share the same browser without taking governor
 > permits.
-| `WRIT_RSS_SOFT_WATERMARK_MB` | `0` | Soft RSS watermark (MB); when resident memory exceeds it the daemon sheds new work. `0` disables memory-based shedding. |
+| `WRIT_RSS_SOFT_WATERMARK_MB` | `0` | Soft RSS watermark (MB); when resident memory exceeds it the agent sheds new work. `0` disables memory-based shedding. |
 
 ### Retention
 
@@ -194,7 +184,7 @@ security-weakening toggles".
 
 ### AI provider key fallbacks
 
-If an AI provider key is not set in the vault, the daemon falls back to these
+If an AI provider key is not set in the vault, the agent falls back to these
 environment variables. Prompts + page content go directly to *your* provider on
 *your* key (see DISCLOSURES §"AI provider data flow").
 
@@ -204,31 +194,29 @@ environment variables. Prompts + page content go directly to *your* provider on
 | `ANTHROPIC_API_KEY` | Anthropic |
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google Gemini |
 
-### Legacy recorder / dev-only
+### Development-only
 
-The `RECORDER_*` variables belong to the legacy standalone recorder server, which
-is **disabled by default** and gated behind an explicit opt-in.
+The `RECORDER_*` variables drive an optional local recorder server that is
+**disabled by default** and starts only behind an explicit opt-in. They are
+documented so their existence is not a surprise; a normal deployment sets none of
+them.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `RECORDER_ENABLE_LOCAL_SERVER` | unset | Must be `1` to start the legacy recorder server at all; otherwise `server::app::run()` refuses to start. |
+| `RECORDER_ENABLE_LOCAL_SERVER` | unset | Must be `1` for that server to start at all; without it, it refuses to run. |
 | `RECORDER_AUTH_BYPASS` | unset | **Dev only.** `1` disables WebSocket authentication entirely. Never set outside local development. |
-| `RECORDER_PORT` / `RECORDER_HOST` / `RECORDER_HEADLESS` / `RECORDER_MAX_SESSIONS` / `RECORDER_SELF_URL` / `RECORDER_LOG_FILE` / `RECORDER_AUTH_SECRET` / `RECORDER_AGENT_ID` | — | Legacy recorder-server knobs. |
-| `RECORDER_DISABLE_SANDBOX` / `RECORDER_IGNORE_CERT_ERRORS` / `RECORDER_DISABLE_WEB_SECURITY` / `RECORDER_USE_LOCAL_CHROME` | `false` | Legacy equivalents of the dangerous `WRIT_BROWSER_*` toggles for the recorder path. |
+| `RECORDER_PORT` / `RECORDER_HOST` / `RECORDER_HEADLESS` / `RECORDER_MAX_SESSIONS` / `RECORDER_SELF_URL` / `RECORDER_LOG_FILE` / `RECORDER_AUTH_SECRET` / `RECORDER_AGENT_ID` | — | Host/port and session knobs for that server. |
+| `RECORDER_DISABLE_SANDBOX` / `RECORDER_IGNORE_CERT_ERRORS` / `RECORDER_DISABLE_WEB_SECURITY` / `RECORDER_USE_LOCAL_CHROME` | `false` | Equivalents of the dangerous `WRIT_BROWSER_*` toggles above, for that path. |
 
-### Cloud-agent / relay internals (managed cloud build)
+### Build-time driver overrides
 
-Used by the managed `writ-agent` cloud build; not relevant to the self-host
-`fleet` product.
+Only relevant when you build from source; see [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
 | Variable | Effect |
 |----------|--------|
-| `WRIT_SERVICE_TOKEN` | In the managed cloud build, the service token presented on connect. In the self-host fleet build this is the **fleet token for the coordinator link** — see the fleet worker section above. |
-| `WRIT_RELAY_HEARTBEAT_SECS` / `WRIT_RELAY_MAX_BYTES_PER_CONNECT` | IP-relay data-plane knobs (local runaway-pipe backstop, never a billing source). |
-| `WRIT_BUNDLED_CHROMIUM` / `WRIT_BUNDLED_DRIVER` | Set by the Tauri shell to point at an app-bundled Chromium / patchright driver. |
-| `PLAYWRIGHT_DRIVER_PATH` | **Build time** (and, separately, a runtime override — see "Which Playwright driver gets used"). Use an already-extracted driver directory (must contain `node` + `package/cli.js`). Checked before any network access and before any cache — the offline/air-gapped path. |
-| `PLAYWRIGHT_DRIVER_URL` | **Build time.** Fetch the driver archive from a mirror instead of PyPI. Requires `PLAYWRIGHT_DRIVER_SHA256`; a URL alone is a hard error. Accepts a PyPI `playwright` wheel or a legacy Playwright driver ZIP. |
-| `PLAYWRIGHT_DRIVER_SHA256` | **Build time.** Expected SHA-256 of the driver archive, overriding the pinned digest (`vendor/playwright-rs/build.rs`). |
+| `PLAYWRIGHT_DRIVER_PATH` | Use an already-extracted driver directory (must contain `node` + `package/cli.js`). Checked before any network access and before any cache — the offline/air-gapped path. Also a runtime override; see "Which Playwright driver gets used". |
+| `PLAYWRIGHT_DRIVER_URL` | Fetch the driver archive from a mirror instead of PyPI. Requires `PLAYWRIGHT_DRIVER_SHA256`; a URL alone is a hard error. |
+| `PLAYWRIGHT_DRIVER_SHA256` | Expected SHA-256 of the driver archive, overriding the pinned digest. |
 
 ---
 
@@ -266,9 +254,6 @@ use_local_chrome = false              # WRIT_BROWSER_USE_LOCAL_CHROME
 
 [ai]
 # AI provider config (keys are vault-sealed, not stored here in plaintext).
-
-[cloud_link]
-# Cloud link state (managed builds). Absent in the fleet build.
 
 [security]
 use_keyring = false    # WRIT_USE_KEYRING — see SECURITY.md

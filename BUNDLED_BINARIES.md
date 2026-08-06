@@ -18,7 +18,7 @@ licensed and redistributed **unmodified**.
 | **Chromium** — installed by the driver CLI | BSD-3-Clause, plus the licenses enumerated in Chromium's own `LICENSE` and `third_party/` tree | no (downloaded on first browser use) | yes (`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`) |
 
 A plain `cargo build` produces none of these; the driver arrives at build time and Chromium on first
-browser use. See [`docs/DISCLOSURES.md`](./docs/DISCLOSURES.md) §5 for the download and integrity
+browser use. See [`docs/DISCLOSURES.md`](./docs/DISCLOSURES.md) §4 for the download and integrity
 story, including which of them are digest-pinned.
 
 ## Notices

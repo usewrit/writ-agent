@@ -53,7 +53,7 @@ and this project adheres to
   event flood that inflates per-action latency) with only a warning line to say so. Both drivers are
   kept as separate directories so the stealth one is chosen on merit and `WRIT_DISABLE_PATCHRIGHT=1`
   still falls back cleanly. See [`docs/CONFIGURATION.md`](./docs/CONFIGURATION.md) §"Which Playwright
-  driver gets used" and [`docs/DISCLOSURES.md`](./docs/DISCLOSURES.md) §5 — the patchright install is
+  driver gets used" and [`docs/DISCLOSURES.md`](./docs/DISCLOSURES.md) §4 — the patchright install is
   version-pinned to the 1.60 line but, unlike the Playwright wheel, **not digest-pinned**.
 - **The recorder no longer wedges on a navigation that races a user action.** The session table is
   a `DashMap`, whose guards are synchronous `RwLock`s: calling `sessions.get()` from an async task
