@@ -168,17 +168,73 @@ pub fn load_credentials() -> Option<serde_json::Value> {
     serde_json::from_str(&content).ok()
 }
 
+/// Write `credentials.json` atomically at `0600`, reporting failure instead of swallowing it.
+///
+/// This file holds the agent's ACCESS TOKEN plus the assigned `agent_id`, so it gets the same
+/// treatment `cli::setup::save_config` already uses (and for the same reasons documented there):
+///
+///   * **Perms at creation.** The old code wrote with `std::fs::write` (0644 under a typical umask)
+///     and only chmod'd afterwards, leaving a window in which any local user could read the token —
+///     and a descriptor opened across the chmod keeps the loose mode entirely.
+///   * **Atomic replace.** `std::fs::write` truncates first, so a crash or a full disk mid-write
+///     leaves a TRUNCATED credentials.json: the agent then loads nothing, loses its token AND its
+///     `agent_id`, and re-registers as a brand-new fleet member. Writing a private sibling temp and
+///     renaming over the target means the previous file survives any failure.
+///   * **Audible failure.** Every error used to be dropped with `let _ =`. A silent failure here is
+///     invisible until much later, as identity churn: the assigned `agent_id` is never persisted, so
+///     each reconnect asks for a fresh one and leaves a stale agent behind.
 pub fn save_credentials(creds: &serde_json::Value) {
     let path = setup::get_credentials_path();
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::error!(error = %e, path = %parent.display(), "could not create credentials dir");
+            return;
+        }
     }
-    if let Ok(json) = serde_json::to_string_pretty(creds) {
-        let _ = std::fs::write(&path, json);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    let json = match serde_json::to_string_pretty(creds) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!(error = %e, "could not serialize credentials");
+            return;
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let tmp = path.with_file_name(format!(".credentials.json.tmp.{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp); // a stale temp from a prior crash would fail create_new
+        let opened = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true) // O_EXCL: never adopt a file someone else planted here
+            .mode(0o600) // perms at creation → no world-readable window
+            .open(&tmp);
+        match opened {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(json.as_bytes()).and_then(|_| f.sync_all()) {
+                    let _ = std::fs::remove_file(&tmp);
+                    tracing::error!(error = %e, path = %path.display(), "could not write credentials");
+                    return;
+                }
+                drop(f);
+                if let Err(e) = std::fs::rename(&tmp, &path) {
+                    let _ = std::fs::remove_file(&tmp);
+                    tracing::error!(error = %e, path = %path.display(), "could not replace credentials");
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, path = %path.display(), "could not open credentials temp")
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: file permissions come from the parent directory's ACL (the config dir is already
+        // user-scoped), so a plain write is equivalent here — but still report failures.
+        if let Err(e) = std::fs::write(&path, json) {
+            tracing::error!(error = %e, path = %path.display(), "could not write credentials");
         }
     }
 }

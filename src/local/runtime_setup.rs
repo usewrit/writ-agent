@@ -107,7 +107,25 @@ fn existing_env_path(key: &str) -> Option<PathBuf> {
 ///   2. else a playwright/patchright-installed or system Chromium executable resolves ⇒ `system`.
 ///   3. else ⇒ `none`.
 pub fn detect_chromium() -> ChromiumStatus {
-    if let Some(p) = existing_env_path(ENV_BUNDLED_CHROMIUM) {
+    // Resolve to the EXECUTABLE, not the directory the shell exports. `chromium_version_cached`
+    // shells out to `<path> --version`, so a directory always probed as `None` and every bundled
+    // build reported a blank version. `bundled_chromium_exe` also fails closed when the bundle holds
+    // no recognisable binary, which correctly falls through to `system`/`none` rather than claiming
+    // a `bundled` browser that could never launch.
+    if let Some(p) = bundled_chromium_exe() {
+        return ChromiumStatus {
+            available: true,
+            source: ChromiumSource::Bundled,
+            version: chromium_version_cached(&p),
+            path: Some(p.to_string_lossy().into_owned()),
+        };
+    }
+    // A Chromium this app downloaded itself (browser/chromium_download.rs) lives under WRIT_HOME and
+    // is ours to manage, so it reports as `bundled` — the user did not install it and should not be
+    // told to maintain it. Checked BEFORE the system scan: when both exist, the pinned build we
+    // downloaded is the one we actually launch, and reporting the system browser instead would
+    // describe a browser that never runs.
+    if let Some(p) = crate::browser::chromium_download::installed_exe() {
         return ChromiumStatus {
             available: true,
             source: ChromiumSource::Bundled,
@@ -274,6 +292,74 @@ fn chromium_exe_candidates(browser_dir: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// Resolve the BUNDLED Chromium down to a launchable **executable**, or `None`.
+///
+/// `WRIT_BUNDLED_CHROMIUM` is exported by the Tauri shell and, by design, points at the bundle's
+/// `browsers/` ROOT — not at a binary. Everything downstream needs the actual executable:
+///
+///   * [`detect_chromium`] probes `--version`, which silently yields `None` when handed a directory,
+///     so a bundled build reported a blank version;
+///   * the browser launcher needs an `executablePath`, and without one the driver falls back to
+///     whatever happens to sit at its own pinned-revision path — i.e. the bundled browser was
+///     reported as "bundled" while a completely different binary was the one actually launched.
+///
+/// So accept either shape and always hand back a binary:
+///   1. the env value is already an executable file ⇒ use it;
+///   2. it is a single browser dir (`chromium-<rev>/`) ⇒ probe the per-OS candidates inside;
+///   3. it is a `browsers/` root ⇒ scan its `chromium*` children and probe each.
+///
+/// Returns `None` when the variable is unset, missing on disk, or contains no recognisable
+/// executable — every caller then falls back exactly as it did before, so a malformed bundle
+/// degrades to `system`/`none` rather than launching something unexpected.
+pub fn bundled_chromium_exe() -> Option<PathBuf> {
+    let Some(root) = existing_env_path(ENV_BUNDLED_CHROMIUM) else {
+        // Nothing exported by the shell — fall back to a Chromium we downloaded ourselves. This is
+        // what makes the first-run download actually take effect: without it the browser installs,
+        // `detect_chromium` reports it, and the launcher still runs something else entirely.
+        return crate::browser::chromium_download::installed_exe();
+    };
+
+    // (1) already a binary.
+    if root.is_file() {
+        return Some(root);
+    }
+
+    // (2) a single browser dir.
+    for cand in chromium_exe_candidates(&root) {
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+
+    // (3) a browsers/ root holding chromium-<rev>/ children. Sorted for determinism: `read_dir`
+    // order is filesystem-defined, and picking a different revision between runs would make
+    // "which browser am I actually driving" unanswerable.
+    let mut children: Vec<PathBuf> = std::fs::read_dir(&root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .map(|n| {
+                        let n = n.to_string_lossy();
+                        n.starts_with("chromium") || n.starts_with("chrome")
+                    })
+                    .unwrap_or(false)
+        })
+        .collect();
+    children.sort();
+    for child in children {
+        for cand in chromium_exe_candidates(&child) {
+            if cand.exists() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
 /// Resolve a usable Chromium executable installed by playwright/patchright (or a genuine system
 /// Chrome/Chromium). Returns the executable path when one exists on disk, else `None`.
 ///
@@ -428,6 +514,52 @@ pub fn start_install_chromium() -> bool {
 ///      driver — never a system `patchright`/`playwright` — is guaranteed present.
 ///   2. Fallbacks (dev machines): `patchright install chromium`, then `playwright install chromium`.
 async fn run_install_chromium() {
+    // Preferred path: download open-source Chromium ourselves.
+    //
+    // The driver-based install below is kept as a fallback, but it is NOT the default any more, for
+    // two independent reasons:
+    //   * it installs "Google Chrome for Testing" — Google-copyrighted, distributed under the Chrome
+    //     Terms of Service — rather than BSD-licensed Chromium;
+    //   * it depends on the bundled driver being present, so it cannot recover a machine where the
+    //     driver resource is missing or damaged.
+    // `ensure_chromium` needs neither an interpreter nor the driver: plain HTTPS + unzip.
+    match crate::browser::chromium_download::ensure_chromium(|pct, msg| {
+        set_progress(InstallState::Running, Some(pct), Some(msg.to_string()));
+    })
+    .await
+    {
+        Ok(exe) => {
+            tracing::info!(path = %exe.display(), "Chromium downloaded");
+            // Build the status from the path we just installed rather than mutating the process
+            // environment: `set_var` is denied crate-wide (`-D unsafe-code`), and it is genuinely
+            // unsound here — the install runs on a spawned task while other threads read the env.
+            // `detect_chromium` finds this install on its own from the next call onward.
+            let status = ChromiumStatus {
+                available: true,
+                source: ChromiumSource::Bundled,
+                version: chromium_version_cached(&exe),
+                path: Some(exe.to_string_lossy().into_owned()),
+            };
+            if let Err(reason) = verify_downloaded_chromium(&status) {
+                set_progress(InstallState::Error, None, Some(reason.clone()));
+                tracing::warn!(reason = %reason, "Chromium integrity verification failed; refusing install");
+                return;
+            }
+            set_progress(InstallState::Done, Some(100), Some("Chromium ready".into()));
+            return;
+        }
+        Err(e) => {
+            // Not fatal on its own: a platform with no published Chromium build (arm64 Linux) or a
+            // blocked network still gets the driver-based attempt below.
+            tracing::warn!(error = %e, "direct Chromium download unavailable, trying the bundled driver");
+            set_progress(
+                InstallState::Running,
+                None,
+                Some("trying the bundled installer…".into()),
+            );
+        }
+    }
+
     let cmd = match resolve_install_command() {
         Some(c) => c,
         None => {

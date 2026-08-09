@@ -1,4 +1,4 @@
-- **MIT License** (`MIT`) — 446 crates
+- **MIT License** (`MIT`) — 447 crates
 - **Unicode License v3** (`Unicode-3.0`) — 19 crates
 - **Apache License 2.0** (`Apache-2.0`) — 16 crates
 - **BSD 3-Clause "New" or "Revised" License** (`BSD-3-Clause`) — 10 crates
@@ -14,7 +14,7 @@
 
 Used by:
 
-- `writ-agent` 1.0.0 — https://github.com/usewrit/writ-agent
+- `writ-agent` 1.0.1 — https://github.com/usewrit/writ-agent
 
 <details><summary>License text — GNU Affero General Public License v3.0</summary>
 
@@ -9676,6 +9676,43 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+```
+
+</details>
+
+### MIT License (`MIT`)
+
+Used by:
+
+- `zip` 2.4.2 — https://github.com/zip-rs/zip2.git
+
+<details><summary>License text — MIT License</summary>
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2014 Mathijs van de Nes
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Some files in the "tests/data" subdirectory of this repository are under other
+licences; see files named LICENSE.*.txt for details.
 ```
 
 </details>

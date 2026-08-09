@@ -330,6 +330,9 @@ async fn run() -> anyhow::Result<std::process::ExitCode> {
     // Held for the rest of `run()`; released on EVERY exit path (see `HomeLock`).
     let _home_lock = HomeLock { paths: paths.clone() };
     tracing::info!(lock = %paths.lock().display(), "singleton lock acquired for this data home");
+    // Startup acquisition alone cannot notice the lockfile being deleted underneath us later, and a
+    // vanished lock silently lets a SECOND worker start over this same home. Keep asserting it.
+    local::app::lifecycle::spawn_lock_watchdog(paths.clone());
 
     // Vault root: OS keyring when explicitly enabled, else the `0600 vault.key` file root. Log which
     // custody path is in use so a headless operator can confirm the key is where they expect.

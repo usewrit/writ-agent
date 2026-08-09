@@ -40,22 +40,29 @@ struct PinnedKey {
     pubkey_hex: &'static str,
 }
 
-/// Pinned update-verification keys — **EMPTY in a shipped build** until the release owner adds the
-/// real public key (this is an EXTERNAL ARTIFACT — a real Ed25519 keypair; see the module TODO).
+/// Pinned update-verification keys — the raw-32-byte-hex PUBLIC halves of the real Ed25519
+/// update-signing keypairs. The PRIVATE halves live ONLY in the release secret store (GitHub Actions
+/// secret `WRIT_UPDATE_SIGNING_KEY_B64`); this binary carries nothing but the public keys.
 ///
-/// It ships empty on purpose: an unknown `kid` is already rejected, so with no pinned key EVERY
-/// manifest fails verification and the updater fails CLOSED (the app never applies an unverifiable
-/// update; local functionality is unaffected — AUTO_UPDATE.md §1 offline-first). This is the
-/// updater's OWN key set — a different trust domain from the CLOUD-6 entitlement key map.
+/// This is the updater's OWN key set — a different trust domain from the CLOUD-6 entitlement key map.
 ///
-/// TODO(release-owner / EXTERNAL BLOCKER): mint a real Ed25519 keypair on an offline host
-/// (`scripts/desktop/sign-update-manifest.sh --genkey-help`), keep the PRIVATE half only in the
-/// release secret store, and add the raw-32-byte-hex PUBLIC half here as a `PinnedKey { kid,
-/// pubkey_hex }` row (kid MUST match `WRIT_UPDATE_SIGNING_KID`). Ship N and N+1 keys across a
-/// rotation so a signing-key change never bricks updates.
+/// N / N+1 rotation (AUTO_UPDATE.md §1.3): `wtu-2026-1` signs today; `wtu-2026-2` is trusted but not
+/// yet signing, so rotating to it never bricks an installed build. When `-1` is retired, start signing
+/// with `-2` and add a `-3` row — never remove a row the field still depends on.
+///
+/// These rows MUST stay byte-identical to the SPKI constants in the Tauri shell's
+/// `src/updater/keys.rs` (each hex below is the last 32 bytes of the corresponding SPKI DER). The two
+/// are the same trust decision made in two processes; a divergence means one approves a manifest the
+/// other rejects.
 const PINNED_KEYS: &[PinnedKey] = &[
-    // Intentionally empty. Add production key(s), e.g.:
-    // PinnedKey { kid: "wtu-2026-1", pubkey_hex: "29be4be95328adf9a5b1952255ff75def...<64 hex>" },
+    PinnedKey {
+        kid: "wtu-2026-1",
+        pubkey_hex: "4cc68c37093d0c5fe64e3f8558c7cb7758caf43a7cdb76ff7067c237b58cd75d",
+    },
+    PinnedKey {
+        kid: "wtu-2026-2",
+        pubkey_hex: "1d6e66be1c1545c8de0daa4d54f5f19209a42fcfb599efc85e7a31e062e9737f",
+    },
 ];
 
 /// A test-only pinned key. Its private half is the deterministic seed in [`super::test_support`].
@@ -412,15 +419,59 @@ mod tests {
         assert!(pinned_pubkey("definitely-not-a-real-kid").is_none());
     }
 
-    /// PRODUCTION BUILD GUARD: while no real keys are provisioned the shipped `PINNED_KEYS` table is
-    /// EMPTY, so `pinned_keys_production_ready()` MUST report the build as not shippable (the updater
-    /// fails closed on every manifest). This is the gate the release pipeline / CI check relies on;
-    /// when real keys are added it flips to Ok — and this test's failure is the reminder to update it.
+    /// PRODUCTION BUILD GUARD: real keys are provisioned, so `pinned_keys_production_ready()` MUST
+    /// report the build as shippable. This is the gate the release pipeline / CI check relies on; it
+    /// asserted `is_err()` while the table was still empty.
     #[test]
-    fn production_guard_flags_empty_pinned_keys() {
-        assert!(PINNED_KEYS.is_empty(), "no real keys are provisioned yet (external blocker)");
+    fn production_guard_accepts_provisioned_pinned_keys() {
+        assert!(!PINNED_KEYS.is_empty(), "the shipped pinned-key table must not be empty");
         let verdict = pinned_keys_production_ready();
-        assert!(verdict.is_err(), "empty pinned keys must be flagged non-production; got {verdict:?}");
-        assert!(verdict.unwrap_err().to_lowercase().contains("empty"));
+        assert!(verdict.is_ok(), "provisioned pinned keys must pass the guard; got {verdict:?}");
+    }
+
+    /// The N / N+1 rotation invariant (§1.3): BOTH the active and next kids must resolve. Shipping
+    /// only the active key means the first rotation strands every installed build on a manifest it
+    /// cannot verify — a failure that surfaces only at the next release, on users' machines.
+    #[test]
+    fn active_and_next_kids_are_both_pinned() {
+        for kid in ["wtu-2026-1", "wtu-2026-2"] {
+            let hex = pinned_pubkey(kid).unwrap_or_else(|| panic!("{kid} must be pinned"));
+            assert_eq!(hex.len(), 64, "{kid} pubkey must be 32 raw bytes as hex");
+            assert!(
+                verifying_key_from_hex(hex).is_some(),
+                "{kid} must decode to a valid Ed25519 public key"
+            );
+        }
+    }
+
+    /// The shell (`src/updater/keys.rs`) pins the SAME keys as base64 SPKI DER. The last 32 bytes of
+    /// an Ed25519 SPKI DER are the raw public key, so each shell constant must end with the daemon's
+    /// hex row. Asserting it here is what keeps the two processes from drifting into a state where the
+    /// shell downloads an update the daemon then refuses to approve.
+    #[test]
+    fn daemon_rows_match_the_shell_spki_constants() {
+        // (kid, base64 SPKI DER as pinned in frontend-desktop/src-tauri/src/updater/keys.rs)
+        const SHELL_SPKI_B64: &[(&str, &str)] = &[
+            ("wtu-2026-1", "MCowBQYDK2VwAyEATMaMNwk9DF/mTj+FWMfLd1jK9Dp823b/cGfCN7WM110="),
+            ("wtu-2026-2", "MCowBQYDK2VwAyEAHW5mvhwVRcjeDapNVPXxkgmkL8+1me/IXnox4GLpc38="),
+        ];
+        use base64::Engine as _;
+        for (kid, spki_b64) in SHELL_SPKI_B64 {
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(spki_b64)
+                .unwrap_or_else(|e| panic!("{kid} shell SPKI is not valid base64: {e}"));
+            assert!(der.len() >= 32, "{kid} shell SPKI is too short to hold a key");
+            let from_shell = &der[der.len() - 32..];
+
+            let expected_hex = pinned_pubkey(kid).unwrap_or_else(|| panic!("{kid} must be pinned"));
+            let from_daemon = decode_hex_32(expected_hex)
+                .unwrap_or_else(|| panic!("{kid} daemon row is not 32 bytes of hex"));
+
+            assert_eq!(
+                from_shell,
+                &from_daemon[..],
+                "{kid}: the shell's SPKI constant and the daemon's pinned hex are different keys"
+            );
+        }
     }
 }

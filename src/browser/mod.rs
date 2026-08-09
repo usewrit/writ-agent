@@ -8,4 +8,5 @@ pub mod navigation;
 pub mod captcha;
 pub mod tabs;
 pub mod install;
+pub mod chromium_download;
 pub mod chrome_profile;

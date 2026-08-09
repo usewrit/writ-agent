@@ -59,6 +59,49 @@ const FLEET_AGENT_ID_KEY: &str = "fleet.agent_id";
 /// `auth_ok` (e.g. an immediate redeploy after reconnect) can still be opened.
 const FLEET_CHANNEL_KEY_KEY: &str = "fleet.channel_key";
 
+/// Attempts for a `config` kv write that carries IDENTITY (agent id, channel key).
+const IDENTITY_PERSIST_ATTEMPTS: u32 = 3;
+
+/// Persist an identity value to the encrypted `config` kv, retrying transient failures.
+///
+/// Why this is not a fire-and-forget `warn!`: the agent id read back at the START of every connect
+/// is what re-presents this worker as the SAME fleet member. If the write is dropped, the id exists
+/// only in memory — so the NEXT reconnect reads nothing, sends an empty id, and the coordinator
+/// mints a BRAND NEW one. Every reconnect then leaks another fleet identity: stale agent rows pile
+/// up, warm-session affinity (keyed by agent id) is orphaned, and the operator sees one machine as
+/// a crowd of agents. Observed in the wild: six ids from one host inside ten minutes.
+///
+/// The realistic failure here is transient SQLite contention (`database is locked`) — a brief
+/// writer conflict, or another process sharing this `WRIT_HOME` — so a couple of short retries
+/// recover it. If it still fails, log at `error!` with the consequence spelled out, because the
+/// symptom (identity churn) shows up far from the cause.
+async fn persist_identity(
+    db: &sqlx::SqlitePool,
+    key: &str,
+    value: &str,
+    what: &str,
+) {
+    let mut last_err = None;
+    for attempt in 1..=IDENTITY_PERSIST_ATTEMPTS {
+        match config_kv::set(db, key, value).await {
+            Ok(()) => return,
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < IDENTITY_PERSIST_ATTEMPTS {
+                    // Short, growing pause: a lock conflict clears in milliseconds.
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    tracing::error!(
+        error = ?last_err, key = %key,
+        "failed to persist fleet {what} after {IDENTITY_PERSIST_ATTEMPTS} attempts — this worker \
+         will present a DIFFERENT identity on its next reconnect, orphaning warm-session affinity \
+         and leaving a stale agent behind. Most often another process is sharing this WRIT_HOME."
+    );
+}
+
 // --- transport limits ------------------------------------------------------
 //
 // tungstenite's defaults are "trust the peer": 64 MiB max message, 16 MiB max frame, and an
@@ -1427,17 +1470,13 @@ impl FleetBridge {
             *aid = Some(final_agent_id.clone());
         }
         if final_agent_id != stored_agent_id {
-            if let Err(e) = config_kv::set(&self.db, FLEET_AGENT_ID_KEY, &final_agent_id).await {
-                tracing::warn!(error = %e, "failed to persist fleet agent_id (continuing)");
-            }
+            persist_identity(&self.db, FLEET_AGENT_ID_KEY, &final_agent_id, "agent_id").await;
         }
         if let Some(ck) = got_channel_key {
             *self.channel_key.lock().await = Some(ck.clone());
             // Persist to the encrypted config kv (Layer-A at rest) so a redeploy after a restart
             // that hasn't yet re-issued auth_ok can still open a sealed blob.
-            if let Err(e) = config_kv::set(&self.db, FLEET_CHANNEL_KEY_KEY, &ck).await {
-                tracing::warn!(error = %e, "failed to persist fleet channel key (continuing)");
-            }
+            persist_identity(&self.db, FLEET_CHANNEL_KEY_KEY, &ck, "channel key").await;
         }
 
         tracing::info!(agent_id = %final_agent_id, "FleetBridge connected to coordinator");

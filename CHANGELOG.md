@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-08-10
+
+### Added
+
+- **The agent downloads Chromium itself, with no interpreter on the machine.** The previous path
+  shelled out to `patchright` / `playwright` / `npx`, every one of which needs Python or Node
+  already installed — fine on a developer box, useless on a clean host, where the install simply
+  failed and left an agent that could not open a browser. `browser::chromium_download` replaces it
+  with plain HTTPS plus an unzip: no interpreter, no package manager, no `PATH` assumptions.
+
+### Changed
+
+- **The browser is now open-source Chromium, not "Google Chrome for Testing".** Chrome for Testing
+  is what the Playwright tooling installs; it is Google-copyrighted and distributed under the Chrome
+  Terms of Service. The agent now fetches BSD-3-Clause Chromium from the Chromium project's own
+  snapshot bucket, at a revision pinned to a stable release, so the user obtains the browser from
+  Google directly rather than receiving a copy from us. Attribution updated in
+  [`BUNDLED_BINARIES.md`](./BUNDLED_BINARIES.md).
+
+### Security
+
+- **The first-run browser download is integrity-checked and fails closed.** The launchable binary is
+  hashed and compared against a SHA-256 pin compiled into the agent, per revision and per platform;
+  a mismatch, a missing pin, or an unreadable pin table refuses the install rather than completing
+  it. The shipped pin table previously held placeholder zeros — every entry is now a real digest.
+  Archive entries with unsafe paths are skipped during extraction.
+
 ## [1.0.0] - 2026-07-28
 
 ### Added

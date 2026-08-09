@@ -51,6 +51,9 @@ pub async fn bootstrap() -> LocalResult<AppState> {
     // 2. Singleton guard — refuse to run a second live daemon over the same home.
     acquire_singleton(&paths)?;
     tracing::info!(lock = %paths.lock().display(), "singleton lock acquired");
+    // Re-assert it for the process lifetime: acquisition is a startup-only check, so a lockfile
+    // deleted afterwards would silently admit a second daemon over this home.
+    spawn_lock_watchdog(paths.clone());
 
     // 2b. Load user config from `~/.writ/config.toml` (materializing a default file on first run);
     // `WRIT_*` env overrides win. Loaded before the vault so `[security].use_keyring` applies.
@@ -354,14 +357,95 @@ pub fn release(paths: &Paths) {
     release_singleton(paths);
 }
 
+/// How often the watchdog re-checks that we still own the lockfile.
+const LOCK_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Keep asserting ownership of the singleton lock for as long as this process runs.
+///
+/// [`acquire_singleton`] only runs at startup, so on its own it cannot notice the lockfile
+/// disappearing afterwards — and once it is gone, the NEXT process starts happily alongside us and
+/// two workers share one SQLCipher home. Ownership-checked [`release_singleton`] removes the common
+/// cause, but not every one: an older build without that fix, an `rm`, a `tmpfiles`/cleaner sweep,
+/// or a restored backup can all still clear it.
+///
+/// So we re-check periodically and:
+///   * missing        → recreate it with our pid (we are the rightful owner; restore the guard),
+///   * owned by a DEAD pid → reclaim it the same way,
+///   * owned by ANOTHER LIVE pid → log an error every tick. We deliberately do NOT exit: by then the
+///     other worker is already up, and racing to `remove_file` would just ping-pong the lock. A loud,
+///     repeating error is the actionable signal, and the operator kills the duplicate.
+///
+/// Cheap by construction: one small read (plus a rare write) every 30s.
+pub fn spawn_lock_watchdog(paths: Paths) {
+    tokio::spawn(async move {
+        let lock = paths.lock();
+        loop {
+            tokio::time::sleep(LOCK_WATCHDOG_INTERVAL).await;
+            if lock_is_ours(&lock) {
+                continue;
+            }
+            if lock.exists() && lock_owner_alive(&lock) {
+                tracing::error!(
+                    lock = %lock.display(),
+                    "singleton lock is held by ANOTHER LIVE process — two workers are sharing this \
+                     WRIT_HOME. Two connection pools over one SQLCipher file corrupt state and can \
+                     quarantine the database. Stop the duplicate worker, or give it its own WRIT_HOME."
+                );
+                continue;
+            }
+            // Missing, malformed, or owned by a dead pid — restore our claim so the next process
+            // to start is correctly refused.
+            let _ = std::fs::remove_file(&lock);
+            match try_create_lock(&lock) {
+                Ok(()) => tracing::warn!(
+                    lock = %lock.display(),
+                    "singleton lock had vanished while we were running — re-asserted it"
+                ),
+                Err(e) => tracing::error!(
+                    lock = %lock.display(), error = %e,
+                    "could not re-assert the singleton lock"
+                ),
+            }
+        }
+    });
+}
+
 /// Release ONLY the singleton lock, leaving `runtime.json` alone.
 ///
 /// The fleet worker publishes no `runtime.json` (it serves no local API to discover), so it releases
 /// just the lock. Idempotent; a missing lockfile is not an error. Note the lock is a pidfile, not a
 /// kernel lock: a `kill -9` leaves it behind, and the next start reclaims it after confirming the
 /// recorded pid is dead (see the module docs).
+///
+/// OWNERSHIP-CHECKED. This used to `remove_file` unconditionally, which made the whole singleton
+/// guard defeatable by ordinary use: any short-lived process that bootstraps this home and exits
+/// (a `writ` CLI command, a failed start, a test) ran this teardown and deleted the lockfile of the
+/// LIVE daemon that legitimately owned it. The next start then found no lockfile at all, sailed
+/// past `acquire_singleton`, and a SECOND worker came up over the same `WRIT_HOME` — two connection
+/// pools and two `db::open_managed` boot policies against one SQLCipher file, which is exactly the
+/// scenario the acquire path refuses (and which can quarantine a live database). Observed in the
+/// wild: a 10-day-old fleet worker still running while a new one held the lockfile.
+///
+/// Deleting only OUR OWN pidfile makes teardown safe for every caller and keeps a live owner's lock
+/// intact. A stale lock left by a `kill -9` is still self-healing via the liveness check in
+/// [`acquire_singleton`].
 pub fn release_singleton(paths: &Paths) {
-    let _ = std::fs::remove_file(paths.lock());
+    if lock_is_ours(&paths.lock()) {
+        let _ = std::fs::remove_file(paths.lock());
+    }
+}
+
+/// True when the lockfile exists and records THIS process's pid.
+///
+/// A missing or unreadable lockfile is "not ours" — we must not delete a file we cannot prove we
+/// own. A malformed lockfile is likewise left alone here (unlike [`lock_owner_alive`], which treats
+/// it as dead so startup can self-heal): teardown has no reason to clear it, and the next
+/// `acquire_singleton` will.
+fn lock_is_ours(lock: &Path) -> bool {
+    std::fs::read_to_string(lock)
+        .ok()
+        .and_then(|c| c.trim().parse::<u32>().ok())
+        .is_some_and(|pid| pid == std::process::id())
 }
 
 /// Wait until `active()` reports zero in-flight work, or `budget` elapses. Returns `true` if the
@@ -715,7 +799,19 @@ mod tests {
             assert!(matches!(err, LocalError::Internal(_)), "live owner must refuse: {err:?}");
         }
 
-        // release clears the lock so a fresh acquire works.
+        // release() is OWNERSHIP-CHECKED: a live foreign owner's lock must survive our teardown.
+        // Deleting it unconditionally is what previously let a second worker start over a home a
+        // live daemon still owned.
+        #[cfg(unix)]
+        {
+            std::fs::write(paths.lock(), "1").unwrap();
+            release(&paths);
+            assert!(paths.lock().is_file(), "must not delete a LIVE foreign owner's lock");
+            assert_eq!(std::fs::read_to_string(paths.lock()).unwrap().trim(), "1");
+        }
+
+        // Our OWN lock is cleared, so a fresh acquire works.
+        std::fs::write(paths.lock(), std::process::id().to_string()).unwrap();
         release(&paths);
         assert!(!paths.lock().exists());
         acquire_singleton(&paths).unwrap();
@@ -741,6 +837,22 @@ mod tests {
 
         // Idempotent.
         release_singleton(&paths);
+
+        // A lock owned by someone ELSE is never removed by our teardown. This is the regression
+        // that let two fleet workers share one WRIT_HOME: a short-lived process that bootstrapped
+        // this home and exited used to delete the live owner's pidfile on its way out, after which
+        // the next start found no lock and came up alongside the running worker.
+        #[cfg(unix)]
+        {
+            std::fs::write(paths.lock(), "1").unwrap();
+            release_singleton(&paths);
+            assert!(paths.lock().is_file(), "another owner's lock must survive our teardown");
+        }
+        // A malformed lockfile is likewise not ours to delete.
+        std::fs::write(paths.lock(), "not-a-pid").unwrap();
+        release_singleton(&paths);
+        assert!(paths.lock().is_file(), "malformed lock is not ours to remove");
+        std::fs::remove_file(paths.lock()).unwrap();
 
         // A LIVE foreign owner is refused (pid 1 is always alive on unix).
         #[cfg(unix)]

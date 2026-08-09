@@ -70,10 +70,23 @@ it is readable by any authenticated API caller and grows with every change.
 
 ## 4. Silent binary / package downloads
 
-On first browser use the agent shells out to install the browser driver and
-Chromium (via the bundled driver CLI; on some paths it may run
-`patchright`/`playwright install chromium` or upgrade patchright). There is no
-in-crate integrity check on these runtime installs.
+On first browser use the agent downloads **Chromium** if it cannot find one. That
+download is made by the agent itself over plain HTTPS — no Python, Node or package
+manager involved — and it fetches **open-source Chromium** (BSD-3-Clause) from the
+Chromium project's own snapshot bucket, at a revision pinned to a stable release.
+It is deliberately *not* "Google Chrome for Testing", which is what the Playwright
+tooling installs and which is Google-copyrighted under the Chrome Terms of Service.
+
+**That download is integrity-checked.** The launchable binary is hashed and
+compared against a SHA-256 pin compiled into the agent, per revision and platform.
+A mismatch, a missing pin, or an unreadable pin table all **fail closed** — the
+install is refused rather than completed. Archive entries with unsafe paths are
+skipped during extraction.
+
+The separate `writ install-browser` CLI command still shells out to
+`patchright`/`playwright`/`npx` where those exist. That path is not pinned, and it
+requires an interpreter already on the machine; the built-in downloader above is
+what a normal deployment uses.
 
 The **build-time** driver archive (the `playwright` wheel from PyPI /
 `files.pythonhosted.org`) **is** SHA-256 pinned against PyPI's published digest,
@@ -81,10 +94,10 @@ because that archive contains a `node` binary that is later executed. The build 
 mirror override (`PLAYWRIGHT_DRIVER_URL`) is refused unless it comes with a
 matching `PLAYWRIGHT_DRIVER_SHA256`.
 
-Note the asymmetry: the **build-time** driver fetch is pinned, the **runtime**
-Chromium/driver installs described above are not. If that matters for your threat
-model, pre-install the browsers into `PLAYWRIGHT_BROWSERS_PATH` (the shipped
-Docker image does exactly this at build time) so no runtime download happens.
+So both the build-time driver fetch and the runtime Chromium download are digest-
+pinned and fail closed. If you would rather no runtime download happened at all,
+pre-install a browser into `PLAYWRIGHT_BROWSERS_PATH` — the shipped Docker image
+does exactly that at build time.
 
 The **driver** never needs a runtime download in a shipped artifact: the release
 archives carry it as `playwright-driver/` beside the binary and the container

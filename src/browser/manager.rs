@@ -9,6 +9,23 @@ use crate::config::env::AppConfig;
 use super::context::{build_launch_args, Fingerprint};
 use super::stealth;
 
+/// The bundled Chromium executable, when this build ships one and the shell exported it.
+///
+/// Feature-gated by construction rather than by convenience: a bundled browser is a **desktop**
+/// concept. The cloud agent ships no browser (it uses whatever the fleet image installed), so on the
+/// default build this is always `None` and every launch path behaves exactly as it did before —
+/// which is what keeps the cloud build byte-clean of the local backend.
+fn bundled_chromium_exe() -> Option<std::path::PathBuf> {
+    #[cfg(feature = "local")]
+    {
+        crate::local::runtime_setup::bundled_chromium_exe()
+    }
+    #[cfg(not(feature = "local"))]
+    {
+        None
+    }
+}
+
 /// Default ceiling on concurrently-LIVE browser contexts on one manager.
 ///
 /// This is the LAST-RESORT bound, not the tuned one: the local/fleet builds call
@@ -414,14 +431,20 @@ impl BrowserManager {
         };
 
         let args: Vec<String> = self.launch_args();
-        let opts = playwright_rs::BrowserContextOptions::builder()
+        let mut opts_builder = playwright_rs::BrowserContextOptions::builder()
             .headless(true)
             .args(args)
             // File assets (§6.2): accept downloads so the `download` event fires (vs the
             // browser handling/blocking them natively) — needed for wait_for_download
             // capture. Set on every create_stealth_context_* path (recording + replay).
-            .accept_downloads(true)
-            .build();
+            .accept_downloads(true);
+        // Drive the browser we ship, when we ship one. Without an explicit executablePath the driver
+        // resolves whatever sits at its OWN pinned-revision path, so the baseline could be captured
+        // from a different browser build than the one the app reports and replays with.
+        if let Some(exe) = bundled_chromium_exe() {
+            opts_builder = opts_builder.executable_path(exe.to_string_lossy().into_owned());
+        }
+        let opts = opts_builder.build();
 
         match pw.chromium().launch_persistent_context_with_options(profile_dir, opts).await {
             Ok(temp_ctx) => {
@@ -501,18 +524,37 @@ impl BrowserManager {
 
         let args: Vec<String> = self.launch_args();
 
-        let launch_opts = playwright_rs::LaunchOptions::new()
+        // Prefer the browser WE ship. Two reasons this matters beyond tidiness:
+        //   * `channel("chrome")` launches the user's installed Google Chrome — a build we do not
+        //     pin, do not test against, and which may not even be present. The bundled browser was
+        //     never actually driven on this path.
+        //   * without an explicit executablePath the driver falls back to its OWN pinned-revision
+        //     directory, so `detect_chromium()` could report `bundled` while a different binary was
+        //     the one really running.
+        // `channel` and `executablePath` are mutually exclusive in Playwright, so they are set in
+        // alternation, never together.
+        let bundled = bundled_chromium_exe();
+        let base_opts = playwright_rs::LaunchOptions::new()
             .headless(headless)
-            .args(args.clone())
-            .channel("chrome".to_string());
+            .args(args.clone());
+        let launch_opts = match &bundled {
+            Some(exe) => base_opts.executable_path(exe.to_string_lossy().into_owned()),
+            None => base_opts.channel("chrome".to_string()),
+        };
 
         let browser = match chromium.launch_with_options(launch_opts).await {
             Ok(b) => {
-                tracing::info!(headless, "Warm browser launched (chrome channel)");
+                match &bundled {
+                    Some(exe) => tracing::info!(headless, browser = %exe.display(), "Warm browser launched (bundled)"),
+                    None => tracing::info!(headless, "Warm browser launched (chrome channel)"),
+                }
                 b
             }
             Err(e) => {
-                tracing::info!(error = %e, "Chrome channel failed, trying default Chromium");
+                // The fallback drops BOTH channel and executablePath, letting the driver use its own
+                // pinned revision. That is a genuine last resort — if the bundled binary failed to
+                // launch, this may well be a different browser build than the one we ship.
+                tracing::warn!(error = %e, bundled = bundled.is_some(), "Preferred browser failed to launch, falling back to the driver's default Chromium");
                 let fallback = playwright_rs::LaunchOptions::new()
                     .headless(headless)
                     .args(args);

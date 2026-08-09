@@ -155,7 +155,7 @@ The agent makes **no** outbound calls you did not configure.
 |-------------|------|
 | Your coordinator (`WRIT_COORDINATOR_URL`) | Always — the one link it opens. TLS verified; sending the token in plaintext to a remote host is refused unless you explicitly opt in. |
 | Your AI provider — `api.openai.com`, `api.anthropic.com`, Gemini, an OpenAI-compatible endpoint, or a local Ollama | Only when you have configured a provider **and** a task uses it. Prompts and page content go **directly** from your machine on **your** key. |
-| Chromium download | First browser use only. Pre-install into `PLAYWRIGHT_BROWSERS_PATH` to avoid it; the container image already ships the browser. |
+| The Chromium project's download bucket | First browser use only, if no browser is found. The agent fetches open-source Chromium over HTTPS and verifies it against a checksum built into the binary, refusing to install on a mismatch. Pre-install into `PLAYWRIGHT_BROWSERS_PATH` to skip it; the container image already ships a browser. |
 | The sites your workflows target | When you run them. |
 
 There is no analytics, no phone-home, and no update check. Usage telemetry is off unless you both

@@ -1,13 +1,18 @@
 {
-  "_comment": "Compiled-in SHA-256 integrity pins for the Chromium that POST /v1/runtime/install-chromium downloads. Keyed by the patchright/playwright Chromium REVISION (the NNNN in the `chromium-NNNN` cache dir, e.g. chromium-1148) -> platform-key -> lowercase-hex SHA-256 of the LAUNCHABLE browser executable (the exact per-OS binary chromium_exe_candidates() resolves). runtime_setup::verify_downloaded_chromium() consults this table after an install succeeds and BEFORE InstallState::Done; a mismatch OR a missing pin fails closed (InstallState::Error, refuse to proceed). Platform keys mirror the AUTO_UPDATE.md artifact keys: macos-aarch64, macos-x86_64, windows-x86_64, linux-x86_64.",
+  "_comment": "Compiled-in SHA-256 integrity pins for the Chromium that POST /v1/runtime/install-chromium downloads. Keyed by the Chromium REVISION (the NNNN in the `chromium-NNNN` install dir) -> platform-key -> lowercase-hex SHA-256 of the LAUNCHABLE browser executable (the exact per-OS binary chromium_exe_candidates() resolves). runtime_setup::verify_downloaded_chromium() consults this table after an install succeeds and BEFORE InstallState::Done; a mismatch OR a missing pin fails closed (InstallState::Error, refuse to proceed). Platform keys mirror the AUTO_UPDATE.md artifact keys: macos-aarch64, macos-x86_64, windows-x86_64, linux-x86_64.",
   "_schema": "revision -> { platform-key -> sha256-hex }",
-  "_TODO": "PLACEHOLDER HASHES — replace every 64-zero sha256 below with the REAL SHA-256 of the launchable Chromium binary for the shipped chromium revision, per platform, then add a new top-level revision block on each Chromium bump (see RELEASE_CHECKLIST.md / chromium_revision in the update manifest). Compute with: shasum -a 256 <path-to-launchable-binary>. Until a revision has a real (non-placeholder) pin for the running platform, verify_downloaded_chromium() will FAIL CLOSED and the install will not complete.",
+  "_source": "These are OPEN-SOURCE CHROMIUM (BSD-3-Clause) builds from the Chromium project's own snapshot bucket (https://commondatastorage.googleapis.com/chromium-browser-snapshots/<platform>/<revision>/), NOT 'Google Chrome for Testing' — which is what patchright/playwright download and which is Google-copyrighted under the Chrome Terms of Service. The revision IS the Chromium main-branch position, pinned to a stable release's position. The per-platform revisions differ because the snapshot bucket does not publish every position for every platform; each is the nearest available build at or below the stable position 1654411.",
+  "_bump_procedure": "To move the Chromium pin: (1) pick the new stable branch position from https://chromiumdash.appspot.com/fetch_releases?channel=Stable, (2) for each platform find the nearest available position with a build, (3) update the matching consts in browser/chromium_download.rs::HOST_BUILD, (4) recompute each hash with: curl -sfL <archive-url> -o a.zip && unzip -p a.zip '<exe-path-in-archive>' | shasum -a 256, (5) add a NEW top-level revision block here — never edit an old one, so an already-installed browser keeps verifying.",
   "pins": {
-    "1148": {
-      "macos-aarch64": "0000000000000000000000000000000000000000000000000000000000000000",
-      "macos-x86_64": "0000000000000000000000000000000000000000000000000000000000000000",
-      "windows-x86_64": "0000000000000000000000000000000000000000000000000000000000000000",
-      "linux-x86_64": "0000000000000000000000000000000000000000000000000000000000000000"
+    "1654411": {
+      "macos-aarch64": "26a16a565ca1ec5d294f30721ffecb924aef8b6922b369dff951894d0c5cef13",
+      "macos-x86_64": "957e248442b030bced5ce30f2f911ac35d39a81c41a37050a92d6841fd5d4458"
+    },
+    "1654400": {
+      "windows-x86_64": "e6fe7fd621165d7835aeaf90acc1e8773c586d617c986a9583d2aa419501883c"
+    },
+    "1654408": {
+      "linux-x86_64": "15c75cb45c13afc8d8393bd1c30c8802805324c265148b5907d08cd1d122c41f"
     }
   }
 }

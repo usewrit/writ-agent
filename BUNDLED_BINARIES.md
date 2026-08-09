@@ -15,7 +15,7 @@ licensed and redistributed **unmodified**.
 | **Playwright driver** (`playwright-driver/`) — the Node.js driver extracted from the PyPI `playwright` wheel | Apache-2.0 | yes | yes (`/app/playwright-driver`) |
 | **Node.js** — the `node` executable inside each driver directory | MIT (plus its own bundled dependencies, see the runtime's own notices) | yes | yes |
 | **patchright driver** (`patchright-driver/`) — stealth-patched Playwright fork, from the PyPI `patchright` package | Apache-2.0 | no | yes (`/app/patchright-driver`) |
-| **Chromium** — installed by the driver CLI | BSD-3-Clause, plus the licenses enumerated in Chromium's own `LICENSE` and `third_party/` tree | no (downloaded on first browser use) | yes (`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`) |
+| **Chromium** — open-source Chromium, fetched by the agent from the Chromium project's snapshot bucket | BSD-3-Clause, plus the licenses enumerated in Chromium's own `LICENSE` and `third_party/` tree | no (downloaded on first browser use, direct from Google's bucket) | yes (`PLAYWRIGHT_BROWSERS_PATH=/ms-playwright`) |
 
 A plain `cargo build` produces none of these; the driver arrives at build time and Chromium on first
 browser use. See [`docs/DISCLOSURES.md`](./docs/DISCLOSURES.md) §4 for the download and integrity
@@ -47,9 +47,14 @@ licenses; the authoritative list is the `LICENSE` file shipped in the Node.js di
 
 Chromium is Copyright 2015 The Chromium Authors, licensed under a BSD-3-Clause license, and embeds a
 large number of third-party components under their own terms. The authoritative notices are the
-`LICENSE` file and `third_party/` tree inside the installed browser, under
-`PLAYWRIGHT_BROWSERS_PATH` (`/ms-playwright` in the container image). Chromium is **not** included in
-the release archives — the driver downloads it on first browser use.
+`LICENSE` file and `third_party/` tree inside the installed browser.
+
+Chromium is **not** included in the release archives. On first browser use the agent downloads it
+directly from the Chromium project's own snapshot bucket, so you obtain it from Google rather than
+receiving a copy from us. The build is **open-source Chromium**, deliberately not "Google Chrome for
+Testing" — the browser the Playwright tooling installs by default, which is Google-copyrighted and
+distributed under the Chrome Terms of Service rather than the BSD licence above. The container image
+ships a browser under `PLAYWRIGHT_BROWSERS_PATH` (`/ms-playwright`) so no download happens there.
 
 ---
 
