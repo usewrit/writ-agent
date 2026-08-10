@@ -143,6 +143,19 @@ pub(crate) fn resolve_credentials(
     HashMap::new()
 }
 
+/// Whether this run is headless — and therefore whether a synthetic device signature
+/// should be advertised at all.
+///
+/// A HEADLESS run (the cloud fleet, a self-host server) has no real display: its
+/// hardware/screen values are the container's, which is exactly the tell we want to
+/// replace with a coherent desktop device. A HEADED run is a real machine that already
+/// reports real, self-consistent hardware — faking it there would swap truth for a
+/// constant, so only the geo (locale/timezone/language) is applied. Defaults to true, the
+/// same default the launch path uses when the backend omits the flag.
+fn headless_for_identity(config: &serde_json::Value) -> bool {
+    config.get("headless").and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
 /// Extract the per-run BYO persona proxy carried as the reserved `__proxy__` key inside the run
 /// credentials, and map it to `ProxySettings`. Returns None when absent/invalid → env proxy /
 /// direct egress. Mirrors `saas_bridge::extract_proxy_override`.
@@ -424,11 +437,49 @@ pub(crate) async fn handle_execute_workflow(
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     // Warm session → reuse the exact fingerprint captured with the auth (returning
-    // user, so the restored session is not invalidated). Fresh session → random.
+    // user, so the restored session is not invalidated). Fresh session → derive a
+    // STABLE identity below rather than a random one.
     let restored_fp: Option<crate::browser::context::Fingerprint> = saved_state
         .as_ref()
         .and_then(|s| s.fingerprint.clone())
         .and_then(|v| serde_json::from_value(v).ok());
+
+    // No banked fingerprint → build a DETERMINISTIC identity instead of rolling a fresh
+    // random one. Seeded on the persona (the identity that owns the login), falling back
+    // to the workflow id, so the same "machine" reconstructs on every run and on every
+    // agent — an aged, cookie-bearing session then keeps appearing from one consistent
+    // device instead of a new computer each visit. Locale/timezone/Accept-Language follow
+    // the egress exit country so the clock always agrees with the IP.
+    //
+    // The device is only FAKED for headless runs (fleet/self-host server). A headed run is
+    // a real machine whose hardware is already real and coherent — overriding it there
+    // would replace truth with a constant, so `want_device` is false and only the geo
+    // applies.
+    let egress_country = config
+        .get("egress_country")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let identity_seed = config
+        .get("persona")
+        .filter(|v| !v.is_null())
+        .and_then(|p| p.get("persona_id"))
+        .map(|v| format!("persona:{v}"))
+        .or_else(|| config.get("workflow_id").map(|v| format!("wf:{v}")))
+        .unwrap_or_default();
+    let restored_fp = match restored_fp {
+        Some(fp) => Some(fp),
+        None if !identity_seed.is_empty() => {
+            let chrome_major = browser_mgr.chrome_major().await;
+            Some(crate::browser::context::Fingerprint::for_identity(
+                &chrome_major,
+                &identity_seed,
+                egress_country.as_deref(),
+                headless_for_identity(config),
+            ))
+        }
+        None => None,
+    };
 
     // Per-run BYO persona proxy: read the reserved `__proxy__` object from the run
     // credentials (backend-gated — present only when no creator-IP relay is bound

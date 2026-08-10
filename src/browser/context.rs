@@ -47,11 +47,22 @@ pub struct Fingerprint {
     pub user_agent: String,
     pub locale: String,
     pub timezone: String,
+    /// The stable device signature (screen / cores / memory / platform) this identity
+    /// runs as. Banked with the warm session and restored on every run so an aged,
+    /// cookie-bearing session keeps one consistent machine instead of a fresh random one.
+    /// `#[serde(default)]` so fingerprints banked before this field existed still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<super::device_identity::DeviceProfile>,
+    /// Accept-Language for this identity's exit country. Not part of the legacy shape, so
+    /// defaulted; when empty the client-hint builder falls back to en-US.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub accept_language: String,
 }
 
 impl Fingerprint {
     /// Randomly choose user_agent / locale / timezone — matches Python's
-    /// `random.choice(...)` for each field independently.
+    /// `random.choice(...)` for each field independently. No pinned device (the caller
+    /// gets the browser's real hardware — correct for a real headed machine).
     pub fn random() -> Self {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -61,6 +72,8 @@ impl Fingerprint {
             user_agent: pick(USER_AGENT_POOL, seed).to_string(),
             locale: pick(LOCALE_POOL, seed.wrapping_mul(31)).to_string(),
             timezone: pick(TIMEZONE_POOL, seed.wrapping_mul(37)).to_string(),
+            device: None,
+            accept_language: String::new(),
         }
     }
 
@@ -77,6 +90,47 @@ impl Fingerprint {
             user_agent: uas[seed % uas.len()].clone(),
             locale: pick(LOCALE_POOL, seed.wrapping_mul(31)).to_string(),
             timezone: pick(TIMEZONE_POOL, seed.wrapping_mul(37)).to_string(),
+            device: None,
+            accept_language: String::new(),
+        }
+    }
+
+    /// A COHERENT, STABLE identity for a run/record: a deterministic device seeded on
+    /// `seed` (persona id, falling back to workflow/session id), with locale / timezone /
+    /// Accept-Language derived from the exit `country` and the UA re-skinned to the
+    /// device's OS at the real `chrome_major`. Returns a plain geo-only fingerprint (no
+    /// pinned device) when `seed` is empty or device generation is not wanted, so a real
+    /// headed machine keeps its real hardware.
+    ///
+    /// `want_device`: fake the hardware signature (headless server / fleet) vs. leave the
+    /// real machine's values (headed desktop).
+    pub fn for_identity(
+        chrome_major: &str,
+        seed: &str,
+        country: Option<&str>,
+        want_device: bool,
+    ) -> Self {
+        let geo = super::geo::resolve(country);
+        let device = if want_device {
+            super::device_identity::generate(seed, country, None)
+        } else {
+            None
+        };
+        let user_agent = match &device {
+            Some(d) => super::device_identity::build_user_agent(d, chrome_major),
+            None => {
+                // No pinned device: keep a coherent UA at the real major from the pool.
+                let uas = build_user_agents(chrome_major);
+                let idx = seed.bytes().fold(0usize, |a, b| a.wrapping_add(b as usize));
+                uas[idx % uas.len()].clone()
+            }
+        };
+        Self {
+            user_agent,
+            locale: geo.locale,
+            timezone: geo.timezone,
+            device,
+            accept_language: geo.accept_language,
         }
     }
 }
@@ -122,6 +176,14 @@ pub fn build_user_agents(chrome_major: &str) -> Vec<String> {
 /// forcing static values onto sub-resources breaks loads on Chrome 148+
 /// (net::ERR_INVALID_ARGUMENT) and is itself a bot signal.
 pub fn build_stealth_headers(user_agent: &str) -> HashMap<String, String> {
+    build_stealth_headers_lang(user_agent, "")
+}
+
+/// Like [`build_stealth_headers`] but with an explicit Accept-Language, so the advertised
+/// language agrees with the egress exit country (a hardcoded en-US under a de-DE / en-CA
+/// locale is exactly the contradiction the residential IP is bought to avoid). An empty
+/// `accept_language` keeps the neutral en-US default.
+pub fn build_stealth_headers_lang(user_agent: &str, accept_language: &str) -> HashMap<String, String> {
     let major = chrome_major_from_ua(user_agent);
     let platform = if user_agent.contains("Windows") {
         "\"Windows\""
@@ -132,8 +194,9 @@ pub fn build_stealth_headers(user_agent: &str) -> HashMap<String, String> {
     } else {
         "\"macOS\""
     };
+    let lang = if accept_language.is_empty() { "en-US,en;q=0.9" } else { accept_language };
     let mut h = HashMap::new();
-    h.insert("Accept-Language".to_string(), "en-US,en;q=0.9".to_string());
+    h.insert("Accept-Language".to_string(), lang.to_string());
     h.insert(
         "sec-ch-ua".to_string(),
         format!(

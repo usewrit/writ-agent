@@ -93,6 +93,62 @@ impl PlaywrightRecorder {
         record_wait_steps: bool,
         tenant_id: Option<String>,
     ) -> Result<String, StartSessionError> {
+        self.start_session_with_proxy(start_url, record_wait_steps, tenant_id, None)
+            .await
+    }
+
+    /// `start_session_with_proxy`, plus the egress EXIT COUNTRY so the recorded identity
+    /// (locale / timezone / Accept-Language, and the device it is banked under) agrees
+    /// with the address the session exits from. See `start_session_with_proxy`.
+    pub async fn start_session_with_egress(
+        &self,
+        start_url: String,
+        record_wait_steps: bool,
+        tenant_id: Option<String>,
+        egress_proxy: Option<playwright_rs::protocol::ProxySettings>,
+        egress_country: Option<String>,
+    ) -> Result<String, StartSessionError> {
+        self.start_session_inner(
+            start_url,
+            record_wait_steps,
+            tenant_id,
+            egress_proxy,
+            egress_country,
+        )
+        .await
+    }
+
+    /// `start_session`, but routing the recording's browser context through `egress_proxy`.
+    ///
+    /// The coordinator resolves egress per recording and ships it on the `start` frame as
+    /// `egress_proxy` (see backend routers/internal.py::recording_authorize and
+    /// routers/recorder_proxy::_inject_recording_egress). For PLATFORM-residential that dict is
+    /// the relay broker's CONNECT endpoint plus an OPAQUE per-session routing token as the
+    /// username — the provider's own credentials never reach this process.
+    ///
+    /// Honouring it here is what makes a recording egress from the same address family as the
+    /// RUNS it is recorded for. Ignoring it (which this agent did) meant every capture opened on
+    /// the box's own datacenter IP no matter what the platform policy said, so selectors, geo
+    /// content and anti-bot behaviour all diverged between recording and replay.
+    pub async fn start_session_with_proxy(
+        &self,
+        start_url: String,
+        record_wait_steps: bool,
+        tenant_id: Option<String>,
+        egress_proxy: Option<playwright_rs::protocol::ProxySettings>,
+    ) -> Result<String, StartSessionError> {
+        self.start_session_inner(start_url, record_wait_steps, tenant_id, egress_proxy, None)
+            .await
+    }
+
+    async fn start_session_inner(
+        &self,
+        start_url: String,
+        record_wait_steps: bool,
+        tenant_id: Option<String>,
+        egress_proxy: Option<playwright_rs::protocol::ProxySettings>,
+        egress_country: Option<String>,
+    ) -> Result<String, StartSessionError> {
         let _lock = self.sessions_lock.lock().await;
 
         if self.sessions.len() >= constants::MAX_SESSIONS {
@@ -113,10 +169,36 @@ impl PlaywrightRecorder {
             return Err(StartSessionError::UnsafeUrl(format!("{start_url} — {reason}")));
         }
 
-        // Create a stealth browser context with a new page
-        let (context, page) = self
+        // Create a stealth browser context with a new page, on the resolved egress route.
+        // `None` keeps the manager's default (direct / configured) proxy behaviour.
+        if let Some(p) = egress_proxy.as_ref() {
+            tracing::info!(
+                proxy = %crate::browser::manager::proxy_endpoint_for_log(&p.server),
+                "recording egress: routing this session through the coordinator-supplied proxy"
+            );
+        }
+        // IDENTITY = the SAME coherent, stable device a RUN presents, geo-correlated to
+        // the egress exit. The login captured here seeds the persona, so the device it is
+        // banked under MUST be the one replays reproduce — a random UA + a US timezone on
+        // a foreign residential exit made the recording and every later run look like two
+        // different machines in two different countries. The profile is derived from THIS
+        // session and banked with the captured auth (`Fingerprint.device`), so it travels
+        // onto the persona and every run restores this exact returning-user device.
+        //
+        // Headed recording = a real display, so only the geo is applied and the machine's
+        // own (already coherent) hardware shows through; headless = the device is faked.
+        let session_id_seed = uuid::Uuid::new_v4().to_string();
+        let chrome_major = self.browser_manager.chrome_major().await;
+        let want_device = self.browser_manager.is_headless();
+        let identity = crate::browser::context::Fingerprint::for_identity(
+            &chrome_major,
+            &format!("rec:{session_id_seed}"),
+            egress_country.as_deref(),
+            want_device,
+        );
+        let (context, page, _fp) = self
             .browser_manager
-            .create_stealth_context()
+            .create_stealth_context_with_fingerprint_proxy(Some(identity), egress_proxy)
             .await
             .map_err(|e| StartSessionError::Browser(e.to_string()))?;
 

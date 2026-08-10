@@ -15,6 +15,21 @@ and this project adheres to
   already installed — fine on a developer box, useless on a clean host, where the install simply
   failed and left an agent that could not open a browser. `browser::chromium_download` replaces it
   with plain HTTPS plus an unzip: no interpreter, no package manager, no `PATH` assumptions.
+- **A persona now runs from one consistent machine.** A residential proxy buys a clean IP; it does
+  not answer the next question a detector asks — *is this the same device as last time, and is that
+  device internally consistent?* A freshly randomised context fails both: the hardware signature
+  changed on every run, so an aged, cookie-bearing session kept reappearing on a "new computer",
+  and the pieces contradicted each other (a Windows user-agent alongside a `MacIntel` platform).
+  `browser::device_identity` derives one coherent desktop device deterministically from the persona
+  id, so the same persona reconstructs the same machine on every run and on every agent, with no
+  state to share between them.
+- **Locale, timezone and `Accept-Language` follow the egress exit country.** `browser::geo` derives
+  the triple per session from where the connection actually exits, because anti-bot systems compare
+  those against the GeoIP of the connecting address — a US timezone on a Canadian exit is a
+  contradiction no real user produces. Unknown countries fall back to a neutral, self-consistent
+  default rather than guessing.
+- `Fingerprint` gains `device` and `accept_language`. Both default when absent, so fingerprints
+  banked before these fields existed still load unchanged.
 
 ### Changed
 

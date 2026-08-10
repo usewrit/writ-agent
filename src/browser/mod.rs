@@ -1,5 +1,7 @@
 pub mod manager;
 pub mod context;
+pub mod geo;
+pub mod device_identity;
 pub mod stealth;
 pub mod page_actions;
 pub mod page_query;

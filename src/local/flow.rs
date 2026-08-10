@@ -865,13 +865,21 @@ async fn run_ai_session_loop(
     use crate::local::error::LocalError;
     let entry_url = spec.entry_url.as_deref().unwrap_or("about:blank");
 
-    let fingerprint = resolved_persona.and_then(|p| p.fingerprint.clone());
     let proxy = resolved_persona.and_then(|p| p.proxy.clone());
 
     browser
         .ensure_warm_browser_with(true)
         .await
         .map_err(|e| LocalError::Internal(format!("browser launch failed: {e}")))?;
+    // The persona's banked fingerprint, or a deterministic one seeded on its id — so a
+    // persona without saved warmth still presents ONE stable machine across runs instead
+    // of a fresh random identity each time. Resolved after the launch so the UA can carry
+    // the real browser's Chrome major. This loop always runs headless (above), so the
+    // device signature is synthesized rather than leaking the container's.
+    let fingerprint = match resolved_persona {
+        Some(p) => Some(p.identity(&browser.chrome_major().await, None, true)),
+        None => None,
+    };
     let (context, page, _fp) = browser
         .create_stealth_context_with_fingerprint_proxy(fingerprint, proxy)
         .await

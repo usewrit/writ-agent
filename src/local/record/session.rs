@@ -214,7 +214,54 @@ impl<S: RecordSink> SessionDriver<S> {
         tracing::info!(%url, "local recording: start");
 
         // Single-user desktop → no tenant scoping.
-        let sid = match self.recorder.start_session(url.clone(), record_wait, None).await {
+        // Coordinator-resolved egress for THIS recording (backend
+        // routers/internal.py::recording_authorize -> ws-gateway injects it onto the start
+        // frame). Shape matches Playwright's ProxySettings 1:1 — {server, username, password,
+        // bypass} — where for platform-residential `username` is an opaque per-session routing
+        // token for the relay broker, never the provider's credentials.
+        //
+        // A malformed dict must NOT silently drop us onto the box's datacenter IP: that is the
+        // exact failure this field exists to prevent, and it is invisible from the outside. Warn
+        // loudly instead, so a bad payload is diagnosable rather than looking like "residential
+        // just doesn't work".
+        let egress_proxy = match msg.get("egress_proxy") {
+            None | Some(Value::Null) => None,
+            Some(v) => match serde_json::from_value::<playwright_rs::protocol::ProxySettings>(
+                v.clone(),
+            ) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "recording egress: coordinator sent an egress_proxy this agent could not \
+                         parse — recording DIRECTLY on this machine's own IP"
+                    );
+                    None
+                }
+            },
+        };
+
+        // Exit country of that egress, shipped alongside it, so the recorded identity's
+        // locale / timezone / Accept-Language agree with the address the session exits
+        // from (a US timezone on a foreign residential exit is the contradiction the
+        // residential spend exists to avoid). Absent → neutral self-consistent default.
+        let egress_country = msg
+            .get("egress_country")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        let sid = match self
+            .recorder
+            .start_session_with_egress(
+                url.clone(),
+                record_wait,
+                None,
+                egress_proxy,
+                egress_country,
+            )
+            .await
+        {
             Ok(sid) => sid,
             Err(e) => {
                 self.sink.send_json(json!({"type": "error", "message": e.to_string()})).await;

@@ -193,7 +193,6 @@ pub(crate) async fn optimize_workflow_live_core(
     if let Some(p) = &resolved_persona {
         p.merge_into_credentials(&mut credentials);
     }
-    let fingerprint = resolved_persona.as_ref().and_then(|p| p.fingerprint.clone());
     let proxy = resolved_persona.as_ref().and_then(|p| p.proxy.clone());
 
     // Every credential key K resolves to its vault ref `{{secret:K}}` at record time, so a synthesized
@@ -219,6 +218,14 @@ pub(crate) async fn optimize_workflow_live_core(
         .ensure_warm_browser_with(true)
         .await
         .map_err(|e| LocalError::Internal(format!("browser launch failed: {e}")))?;
+    // The persona's banked fingerprint, or a deterministic one seeded on its id, so a
+    // persona without saved warmth still presents ONE stable machine across runs. Built
+    // after launch so the UA carries the real Chrome major; headless here → synthesize
+    // the device rather than leak the container's hardware.
+    let fingerprint = match resolved_persona.as_ref() {
+        Some(p) => Some(p.identity(&browser.chrome_major().await, None, true)),
+        None => None,
+    };
     let (context, page, _fp) = browser
         .create_stealth_context_with_fingerprint_proxy(fingerprint, proxy)
         .await

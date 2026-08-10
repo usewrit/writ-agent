@@ -788,8 +788,8 @@ impl RealEngine {
         if let Some(p) = &resolved_persona {
             p.merge_into_credentials(&mut credentials);
         }
-        // Pin the persona's captured fingerprint (returning-user warmth) + BYO proxy egress.
-        let fingerprint = resolved_persona.as_ref().and_then(|p| p.fingerprint.clone());
+        // Persona BYO proxy egress. The identity itself is resolved after the browser
+        // launch below, so a synthesized UA can carry the REAL Chrome major.
         let proxy_override = resolved_persona.as_ref().and_then(|p| p.proxy.clone());
 
         let timeout_ms = if wf.timeout_ms > 0 { wf.timeout_ms as u64 } else { 60_000 };
@@ -954,6 +954,22 @@ impl RealEngine {
             .ensure_warm_browser_with(headless)
             .await
             .map_err(|e| RunFailure::step(format!("Browser launch failed: {e}"), "infra"))?;
+        // Pin the persona's captured fingerprint (returning-user warmth), or — when it has
+        // none — a DETERMINISTIC identity seeded on the persona id, so a persona without
+        // saved warmth still presents one stable machine across runs instead of a fresh
+        // random UA/locale/timezone each time. A HEADED run keeps the real machine's
+        // hardware (only a headless run synthesizes a device); no persona → unchanged
+        // fresh-fingerprint behaviour.
+        // `match` rather than `.map()`: the closure `.map()` takes is not async, so awaiting
+        // `chrome_major()` inside it does not compile. Matching also keeps the probe lazy — with no
+        // persona there is no fingerprint to build, so we never pay for it.
+        let fingerprint = match resolved_persona.as_ref() {
+            Some(p) => {
+                let chrome_major = browser.chrome_major().await;
+                Some(p.identity(&chrome_major, None, headless))
+            }
+            None => None,
+        };
         let (context, page, fp_used) = browser
             .create_stealth_context_with_fingerprint_proxy(fingerprint, proxy_override)
             .await

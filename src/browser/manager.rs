@@ -140,7 +140,10 @@ pub fn init_driver_env() {
 /// sink-level redactor now masks URL userinfo too, but the credential must not be handed to the
 /// formatter in the first place. Falls back to `<unparseable-proxy>` rather than echoing the raw
 /// string, so a value that is not a URL at all can't leak by accident.
-fn proxy_endpoint_for_log(server: &str) -> String {
+/// Redact a proxy server URL down to host:port for logs (credentials in the userinfo of a
+/// proxy URL must never be logged). `pub(crate)` so the recorder can log which egress a
+/// session was routed through without re-implementing the redaction.
+pub(crate) fn proxy_endpoint_for_log(server: &str) -> String {
     // Playwright accepts a bare `host:port` (no scheme) too. We cannot simply try `Url::parse` first
     // and fall back: `bob:pass@host:3128` parses "successfully" as scheme `bob` with no host, which
     // would report `<unparseable-proxy>` for a perfectly valid credential-bearing proxy string. So key
@@ -299,11 +302,17 @@ impl BrowserManager {
         browser: playwright_rs::Browser,
     ) {
         tokio::spawn(async move {
+            use playwright_rs::server::channel_owner::ChannelOwner as _;
             // Bound to `_permit` so it is released exactly when this task ends.
             let _permit = permit;
+            let guid = context.guid().to_string();
             loop {
                 tokio::time::sleep(CONTEXT_SLOT_POLL).await;
                 if context.is_closed() || !browser.is_connected() {
+                    // Drop this context's device init script alongside its slot, so the
+                    // registry tracks LIVE contexts and cannot grow without bound on a
+                    // long-lived agent.
+                    super::stealth::forget_device(&guid);
                     return;
                 }
             }
@@ -703,8 +712,13 @@ impl BrowserManager {
         // `sec-fetch-mode: navigate` onto sub-resource requests — an invalid
         // combination newer Chrome (148+) rejects with net::ERR_INVALID_ARGUMENT
         // (pages load with no CSS/JS).
+        // Accept-Language follows the identity's exit country when one was resolved
+        // (Fingerprint::for_identity); empty keeps the neutral en-US default.
         let extra_headers: HashMap<String, String> =
-            crate::browser::context::build_stealth_headers(&fingerprint.user_agent);
+            crate::browser::context::build_stealth_headers_lang(
+                &fingerprint.user_agent,
+                &fingerprint.accept_language,
+            );
 
         // Build context options — exact Python context_opts (lines 861-885) plus the
         // captured baseline storage state and proxy if configured.
@@ -729,12 +743,29 @@ impl BrowserManager {
             None => self.proxy_settings(),
         };
 
+        // Viewport precedence: an explicit caller pin (monitoring's visual-region size)
+        // always wins; otherwise the identity's own device viewport (derived from its
+        // screen, so window < screen stays true); otherwise the 1920x1080 default.
+        // `unwrap_or`, not `unwrap_or_else`: the fallback is a couple of field reads and a small
+        // struct literal, so there is nothing to defer and clippy rejects the closure.
+        let effective_viewport = viewport.unwrap_or({
+            match fingerprint.device.as_ref() {
+                Some(d) => playwright_rs::Viewport {
+                    width: d.viewport.width,
+                    height: d.viewport.height,
+                },
+                None => playwright_rs::Viewport { width: 1920, height: 1080 },
+            }
+        });
         let mut builder = playwright_rs::BrowserContextOptions::builder()
-            .viewport(viewport.unwrap_or(playwright_rs::Viewport { width: 1920, height: 1080 }))
+            .viewport(effective_viewport)
             .user_agent(fingerprint.user_agent.clone())
             .locale(fingerprint.locale.clone())
             .timezone_id(fingerprint.timezone.clone())
             .color_scheme("light".to_string())
+            // device_scale_factor stays 1.0 for every identity: device_identity pins
+            // dpr 1 (screencast frames are captured at this scale and clicks are mapped
+            // against a 1x frame), so this never contradicts the advertised device.
             .device_scale_factor(1.0)
             .has_touch(false)
             .is_mobile(false)
@@ -753,6 +784,27 @@ impl BrowserManager {
         }
         let context = browser.new_context_with_options(builder.build()).await
             .map_err(|e| anyhow::anyhow!("Context creation (with options) failed: {}", e))?;
+
+        // Register this identity's DEVICE overrides against the context guid so every
+        // stealth (re)injection on any of its pages stamps the matching
+        // hardwareConcurrency / deviceMemory / navigator.platform / window.screen. No-op
+        // when the identity pins no device (a real headed machine keeps real values).
+        // Unregistered by the slot watcher when the context closes.
+        {
+            use playwright_rs::server::channel_owner::ChannelOwner as _;
+            super::stealth::register_device(context.guid(), fingerprint.device.as_ref());
+            if let Some(d) = fingerprint.device.as_ref() {
+                tracing::info!(
+                    platform = %d.platform,
+                    screen = %format!("{}x{}", d.screen.width, d.screen.height),
+                    cores = d.hardware_concurrency,
+                    memory_gb = d.device_memory,
+                    locale = %fingerprint.locale,
+                    timezone = %fingerprint.timezone,
+                    "Device identity applied to context"
+                );
+            }
+        }
 
         // From here on the context EXISTS inside Chromium, so every failure path below must close it
         // — `BrowserContext` has no `Drop`, so returning `Err` with the handle would strand the
@@ -803,8 +855,13 @@ impl BrowserManager {
             }
         };
 
-        // Evaluate stealth on the first page (covers about:blank before first nav).
-        let _: Result<serde_json::Value, _> = page.evaluate(stealth::STEALTH_SCRIPTS, None::<&()>).await;
+        // Evaluate stealth on the first page (covers about:blank before first nav), with
+        // THIS context's device overrides appended (registered just above).
+        {
+            use playwright_rs::server::channel_owner::ChannelOwner as _;
+            let script = stealth::scripts_for_context(context.guid());
+            let _: Result<serde_json::Value, _> = page.evaluate(&script, None::<&()>).await;
+        }
 
         // The context is now the CALLER's to close (the engine/bridge close it on every exit path and
         // arm their own guard for the panic case). Disarm so this function's guard doesn't also close it.
@@ -834,6 +891,26 @@ impl BrowserManager {
 
     pub async fn browser_ref(&self) -> Option<playwright_rs::Browser> {
         self.warm_browser.lock().await.clone()
+    }
+
+    /// Whether this agent runs headless by default.
+    ///
+    /// Drives whether a synthetic DEVICE signature is advertised: a headless run (cloud
+    /// fleet / self-host server) has no real display and would otherwise leak the
+    /// container's hardware, while a HEADED run is a real machine whose values are already
+    /// real and coherent — faking them there would replace truth with a constant.
+    pub fn is_headless(&self) -> bool {
+        self.config.headless
+    }
+
+    /// Chrome major version of the warm browser ("120" when none is running yet), so a
+    /// caller can build a UA whose advertised version matches the REAL engine before a
+    /// context exists. Same derivation `create_stealth_context_full_proxy` uses.
+    pub async fn chrome_major(&self) -> String {
+        match self.warm_browser.lock().await.as_ref() {
+            Some(b) => crate::browser::context::chrome_major_from_version(b.version()),
+            None => "120".to_string(),
+        }
     }
 
     pub async fn shutdown(&self) -> Result<()> {

@@ -93,6 +93,35 @@ impl ResolvedPersona {
                 .or_insert_with(|| code.clone());
         }
     }
+
+    /// The identity this persona's contexts should present: the fingerprint captured with
+    /// its saved auth when it has one, otherwise a DETERMINISTIC one seeded on the persona
+    /// id.
+    ///
+    /// Without the fallback a persona with no banked fingerprint got a freshly RANDOM
+    /// user-agent/locale/timezone on every run, so its aged cookies kept reappearing from
+    /// a different machine each time — the pattern that reads as a farmed/hijacked
+    /// account. Seeding on the persona id means the same "machine" reconstructs on every
+    /// run and on every agent, with no storage to share.
+    ///
+    /// `want_device` should be true only for headless runs (see
+    /// `BrowserManager::is_headless`): a headed run is a real machine whose hardware is
+    /// already real and coherent.
+    pub fn identity(
+        &self,
+        chrome_major: &str,
+        country: Option<&str>,
+        want_device: bool,
+    ) -> Fingerprint {
+        self.fingerprint.clone().unwrap_or_else(|| {
+            Fingerprint::for_identity(
+                chrome_major,
+                &format!("persona:{}", self.persona_id),
+                country,
+                want_device,
+            )
+        })
+    }
 }
 
 /// Load + decrypt a persona by id. Returns `Ok(None)` when there is no such row (a dangling
@@ -371,6 +400,11 @@ mod tests {
             user_agent: "UA/1".into(),
             locale: "en-US".into(),
             timezone: "UTC".into(),
+            // This test is about credential resolution, not device identity: leave the identity
+            // fields at their "not banked yet" values, which is what an older stored fingerprint
+            // deserialises to.
+            device: None,
+            accept_language: String::new(),
         };
         let p = personas::insert(
             &pool,

@@ -17,9 +17,16 @@ use crate::util::logging::redact_url_for_log;
 /// idempotent (`__stealth_injected`), so this is cheap and safe to call on every
 /// navigation. Errors (e.g. a destroyed context) are intentionally ignored.
 pub async fn reinject_stealth(page: &Page) {
-    let _: Result<serde_json::Value, _> = page
-        .evaluate(crate::browser::stealth::STEALTH_SCRIPTS, None::<&()>)
-        .await;
+    // The DEVICE overrides are per-context (they must agree with THAT context's UA), so
+    // resolve them from the page's own context rather than injecting a shared constant.
+    // A page whose context has no pinned device (a real headed machine) gets the generic
+    // payload only and keeps its real hardware values.
+    use playwright_rs::server::channel_owner::ChannelOwner as _;
+    let script = match page.context() {
+        Ok(ctx) => crate::browser::stealth::scripts_for_context(ctx.guid()),
+        Err(_) => crate::browser::stealth::STEALTH_SCRIPTS.to_string(),
+    };
+    let _: Result<serde_json::Value, _> = page.evaluate(&script, None::<&()>).await;
 }
 
 pub async fn goto(page: &Page, url: &str, wait_until: &str, timeout: Duration) -> Result<()> {

@@ -163,14 +163,14 @@
         return originalToDataURL.apply(this, arguments);
     };
 
-    // --- 11. Hardware properties ---
-    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8, configurable: true });
-    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8, configurable: true });
-    Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel', configurable: true });
-
-    // --- 12. Headless detection fixes ---
-    try { Object.defineProperty(screen, 'availHeight', { get: () => screen.height }); } catch(e) {}
-    try { Object.defineProperty(screen, 'availWidth', { get: () => screen.width }); } catch(e) {}
+    // --- 11 & 12. Hardware / screen properties ---
+    // hardwareConcurrency, deviceMemory, navigator.platform and the window.screen
+    // geometry are set by the per-run DEVICE init script (browser::device_identity::
+    // build_device_init_js) appended after this script, so they agree with THIS
+    // identity's device AND its UA — a fixed 'MacIntel' here contradicted every Windows
+    // UA. When no device is pinned (a real headed machine) nothing is appended and the
+    // browser's own real, coherent values show through. See BrowserManager stealth
+    // injection.
     if (window.outerWidth === 0) {
         Object.defineProperty(window, 'outerWidth', { get: () => window.innerWidth });
     }

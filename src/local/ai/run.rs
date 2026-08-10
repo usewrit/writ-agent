@@ -401,13 +401,25 @@ async fn run_ai_session_loop(
     let entry_url = entry_url.unwrap_or("about:blank");
     let headless = true; // background/unattended by default (parity with automation runs).
 
-    let fingerprint = resolved_persona.as_ref().and_then(|p| p.fingerprint.clone());
     let proxy = resolved_persona.as_ref().and_then(|p| p.proxy.clone());
 
     browser
         .ensure_warm_browser_with(headless)
         .await
         .map_err(|e| LocalError::Internal(format!("browser launch failed: {e}")))?;
+    // The persona's banked fingerprint, or a deterministic one seeded on its id, so a
+    // persona without saved warmth still presents ONE stable machine across runs. Built
+    // after launch so the UA carries the real Chrome major.
+    // `match` rather than `.map()`: the closure `.map()` takes is not async, so awaiting
+    // `chrome_major()` inside it does not compile. Matching also keeps the probe lazy — with no
+    // persona there is no fingerprint to build, so we never pay for it.
+    let fingerprint = match resolved_persona.as_ref() {
+        Some(p) => {
+            let chrome_major = browser.chrome_major().await;
+            Some(p.identity(&chrome_major, None, headless))
+        }
+        None => None,
+    };
     let (context, page, _fp) = browser
         .create_stealth_context_with_fingerprint_proxy(fingerprint, proxy)
         .await
