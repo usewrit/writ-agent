@@ -30,6 +30,17 @@ and this project adheres to
   default rather than guessing.
 - `Fingerprint` gains `device` and `accept_language`. Both default when absent, so fingerprints
   banked before these fields existed still load unchanged.
+- **Uploads are recordable.** A page's file chooser opens an operating-system dialog, and the
+  recorded browser runs on an agent — so the person recording could never answer it, and the chooser
+  could only be dismissed empty. Everything downstream of the upload (submit, preview, progress, the
+  success screen) was therefore unrecordable. The recorder now turns the dialog into a round-trip:
+  it emits an `upload_prompt`, the client answers with a stored file, and the bytes are handed to
+  the chooser so the page performs a real upload exactly as it would for a person. The client
+  supplies the URL because it is the only side that can authenticate for the bytes. Skipping, a
+  timeout or an unreachable file all fall back to dismiss-empty, so a recording is never blocked by
+  the prompt.
+- A `windows-aarch64` digest for a new Chromium revision in the pinned download table. Additive
+  only — no existing pin changed.
 
 ### Changed
 

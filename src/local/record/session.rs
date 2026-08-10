@@ -162,6 +162,11 @@ impl<S: RecordSink> SessionDriver<S> {
             "agent_action" if self.session_id.is_some() => self.handle_agent_action(&msg).await,
             "replay_steps" if self.session_id.is_some() => self.handle_replay_steps(&msg).await,
             "replay_cancel" if self.session_id.is_some() => self.handle_replay_cancel().await,
+            "upload_file_selected" if self.session_id.is_some() => {
+                if let Some(ref sid) = self.session_id {
+                    self.recorder.deliver_upload_answer(sid, &msg).await;
+                }
+            }
             "stop" if self.session_id.is_some() => {
                 self.handle_stop().await;
                 // A cloud bridge / loopback UI may reuse the transport (a fresh `start` reopens

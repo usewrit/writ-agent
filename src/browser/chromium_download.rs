@@ -84,6 +84,18 @@ const HOST_BUILD: Option<ChromiumBuild> = {
             exe_rel: "chrome-win/chrome.exe",
         })
     }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        // Windows on ARM. The Chromium project DOES publish an arm64 desktop build (Win_Arm64),
+        // unlike arm64 Linux, so this is a real download rather than a `None`. The archive layout
+        // matches the x64 Windows build (chrome-win/chrome.exe).
+        Some(ChromiumBuild {
+            platform_dir: "Win_Arm64",
+            position: 1_654_438,
+            archive: "chrome-win.zip",
+            exe_rel: "chrome-win/chrome.exe",
+        })
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         Some(ChromiumBuild {
@@ -97,6 +109,7 @@ const HOST_BUILD: Option<ChromiumBuild> = {
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64"),
         all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "aarch64"),
         all(target_os = "linux", target_arch = "x86_64"),
     )))]
     {
@@ -403,6 +416,8 @@ mod tests {
             "macos-aarch64"
         } else if cfg!(target_os = "macos") {
             "macos-x86_64"
+        } else if cfg!(target_os = "windows") && cfg!(target_arch = "aarch64") {
+            "windows-aarch64"
         } else if cfg!(target_os = "windows") {
             "windows-x86_64"
         } else {

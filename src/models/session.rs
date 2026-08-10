@@ -61,6 +61,26 @@ pub struct PendingDropdown {
     pub dropdown_type: String,
 }
 
+/// A file-chooser prompt awaiting the client's answer.
+///
+/// Not `Clone`/`Debug`-able as a whole (a oneshot sender is single-use), so it is
+/// `take()`n out of the session when answered — which also makes double-answering
+/// impossible.
+pub struct PendingUpload {
+    /// Correlates the answer with THIS prompt, so a stale reply from an earlier
+    /// (timed-out) chooser can never satisfy the one that is open now.
+    pub request_id: String,
+    /// Resolved with the client's `upload_file_selected` payload, or `None` when the
+    /// operator skipped.
+    pub responder: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
+}
+
+impl std::fmt::Debug for PendingUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingUpload").field("request_id", &self.request_id).finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingScroll {
     pub total_delta_y: f64,
@@ -98,6 +118,12 @@ pub struct RecordingSession {
     pub pending_dropdown: Option<PendingDropdown>,
     pub pending_dropdown_nav: Option<PendingDropdown>,
     pub pending_scroll: Option<PendingScroll>,
+    /// In-flight file-chooser prompt. The page opened a file dialog, which nobody can
+    /// answer from a remote browser, so the recorder asked the client to pick a stored
+    /// file and is parked on `responder` until the answer arrives (or it times out).
+    /// One at a time — a chooser is modal in the page, so a second cannot open while
+    /// this is pending.
+    pub pending_upload: Option<PendingUpload>,
     pub last_focus_click: Option<FocusClick>,
     pub last_captcha_step: Option<f64>,
     /// True once a 2FA `twofa` step has been auto-emitted for this recording, so we
@@ -190,6 +216,7 @@ impl RecordingSession {
             pending_dropdown: None,
             pending_dropdown_nav: None,
             pending_scroll: None,
+            pending_upload: None,
             last_focus_click: None,
             last_captcha_step: None,
             twofa_emitted: false,

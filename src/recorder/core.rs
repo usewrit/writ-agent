@@ -470,6 +470,14 @@ impl PlaywrightRecorder {
         Ok(())
     }
 
+    /// Deliver a client's `upload_file_selected` answer to a session parked on a file
+    /// chooser. Returns true when a live prompt was resolved. The sessions map is
+    /// private, so every transport (fleet bridge, loopback WS, local record socket)
+    /// routes the answer through here.
+    pub async fn deliver_upload_answer(&self, session_id: &str, msg: &serde_json::Value) -> bool {
+        crate::recorder::upload_prompt::deliver_answer(&self.sessions, session_id, msg).await
+    }
+
     pub async fn end_session(&self, session_id: &str) -> Result<SessionResult, EndSessionError> {
         let (_, mut session) = self
             .sessions

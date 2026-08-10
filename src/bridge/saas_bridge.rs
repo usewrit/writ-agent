@@ -2161,6 +2161,13 @@ async fn run_session_loop(
                 }
             }
 
+            // Answer to an `upload_prompt`: unparks the page's file chooser so the
+            // real file is uploaded (or, on skip, dismissed) and recording continues.
+            "upload_file_selected" => {
+                if let Some(ref sid) = local_session_id {
+                    recorder.deliver_upload_answer(sid, &msg).await;
+                }
+            }
             "stop" => {
                 if let Some(ref sid) = local_session_id {
                     match recorder.end_session(sid).await {

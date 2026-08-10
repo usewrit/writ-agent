@@ -316,6 +316,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 }
             }
 
+            // Answer to an `upload_prompt` — unparks the page's file chooser.
+            "upload_file_selected" if session_id.is_some() => {
+                let sid = session_id.as_ref().unwrap().clone();
+                state.recorder.deliver_upload_answer(&sid, &parsed).await;
+            }
             "stop" if session_id.is_some() => {
                 let sid = session_id.take().unwrap();
                 tracing::info!(session_id = %sid, "WS: Stop recording");

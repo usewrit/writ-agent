@@ -112,7 +112,7 @@ pub async fn setup_page_listeners(
         }).await;
     }
 
-    // 2b/2c. download + filechooser listeners (File assets §6.2). Factored into a
+    // 2b/2c. download + filechooser listeners. Factored into a
     // shared helper so new tabs (context.on_page) get the same coverage as the
     // initial page (mirrors Python _switch_to_page re-registering listeners).
     register_file_listeners(&page, sessions.clone(), session_id.clone()).await;
@@ -200,7 +200,7 @@ pub async fn setup_page_listeners(
                 }
 
                 // Wire download + filechooser listeners on the new tab so uploads /
-                // downloads triggered in it are recorded too (File assets §6.2).
+                // downloads triggered in it are recorded too.
                 register_file_listeners(&new_page, sessions.clone(), sid.clone()).await;
 
                 // Switch the session to the new page (brief lock, no await held).
@@ -343,7 +343,7 @@ async fn on_page_closed(
     }
 }
 
-/// Register `download` + `filechooser` listeners on a page (File assets §6.2).
+/// Register `download` + `filechooser` listeners on a page.
 ///
 /// * download → record a `wait_for_download` step, then DELETE the recording-time
 ///   artifact so nothing is persisted (§10.5). The replay-side wait_for_download
@@ -422,8 +422,31 @@ async fn register_file_listeners(
                 let selector = derive_file_input_selector(fc.page(), is_multiple).await;
                 tracing::info!(session_id = %sid, selector = %selector, is_multiple, "File chooser detected during recording");
 
+                // Is this session recording at all? (Cheap check under a brief lock; the
+                // prompt round-trip below must NOT hold it.)
+                let recording = super::session_lock::session_mut(&sessions, &sid)
+                    .await
+                    .map(|s| s.is_recording)
+                    .unwrap_or(false);
+
+                // Ask the operator which stored file to upload, and fetch its bytes.
+                // A remote browser's native dialog is unanswerable, so without this the
+                // chooser could only ever be dismissed empty — the page then behaves as
+                // if the user picked nothing, and the REST of the flow (submit, preview,
+                // progress) can't be recorded. None = skipped / timed out / unreachable,
+                // in which case we fall back to the original dismiss-empty.
+                let picked = if recording {
+                    super::upload_prompt::prompt_for_upload_file(&sessions, &sid, &selector, is_multiple).await
+                } else {
+                    None
+                };
+
                 if let Some(mut session) = super::session_lock::session_mut(&sessions, &sid).await {
                     if session.is_recording {
+                        let description = match picked.as_ref().and_then(|p| p.filename.as_deref()) {
+                            Some(name) => format!("Upload {}", name),
+                            None => "Upload file".to_string(),
+                        };
                         let step = RecordedStep {
                             step_type: StepType::Upload,
                             timestamp: step_recording::current_timestamp(),
@@ -431,7 +454,7 @@ async fn register_file_listeners(
                             selector: Some(selector.clone()),
                             url: None,
                             value: None,
-                            description: Some("Upload file".to_string()),
+                            description: Some(description),
                             coordinates: None,
                             viewport: None,
                             options: Some({
@@ -440,6 +463,14 @@ async fn register_file_listeners(
                                 // mode=input: the derived selector targets the
                                 // <input type=file> directly (set_input_files at replay).
                                 opts.insert("mode".to_string(), serde_json::json!("input"));
+                                // Bind the chosen StoredFile so REPLAY uploads the same
+                                // file with no extra configuration.
+                                if let Some(p) = picked.as_ref() {
+                                    opts.insert("file_id".to_string(), serde_json::json!(p.file_id));
+                                    if let Some(n) = p.filename.as_ref() {
+                                        opts.insert("filename".to_string(), serde_json::json!(n));
+                                    }
+                                }
                                 opts
                             }),
                         };
@@ -448,10 +479,15 @@ async fn register_file_listeners(
                     // else: not recording — still dismiss so the page isn't left waiting.
                 } // lock released before the await below
 
-                // Dismiss with empty files so recording continues without uploading a
-                // recording-time file (v1 = dismiss-empty; no throwaway file stored).
-                if let Err(e) = fc.set_files(&[]).await {
-                    tracing::debug!(error = %e, "Failed to dismiss file chooser with empty files (ignored)");
+                // Satisfy the chooser with the picked bytes, or dismiss it. Either way
+                // the page is never left parked on a dialog.
+                let files: Vec<std::path::PathBuf> = picked
+                    .as_ref()
+                    .map(|p| vec![p.path.clone()])
+                    .unwrap_or_default();
+                if let Err(e) = fc.set_files(&files).await {
+                    tracing::warn!(error = %e, "set_files failed — dismissing chooser empty");
+                    let _ = fc.set_files(&[]).await;
                 }
                 Ok(())
             }
@@ -460,7 +496,7 @@ async fn register_file_listeners(
 }
 
 /// Derive a stable selector for the `<input type="file">` that triggered a file
-/// chooser (File assets §6.2). The crate's `ElementHandle` (from `fc.element()`)
+/// chooser. The crate's `ElementHandle` (from `fc.element()`)
 /// cannot evaluate JS, so we run the recorder's selector strategy (id > name >
 /// placeholder > tag) against the page's file input in-page — the same id/name/tag
 /// heuristic the click/fill helper uses (action_handler.rs `getSelector`). When more
