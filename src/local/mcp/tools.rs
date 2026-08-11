@@ -148,7 +148,10 @@ fn tool_description(wf: &Workflow) -> String {
 /// When neither source yields anything we return an empty object schema (no caller arguments).
 pub fn derive_input_schema(wf: &Workflow) -> Value {
     let names = scan_input_placeholders(&wf.steps);
-    let slots = scan_file_slots(&wf.steps);
+    // Every upload step, not just the ones declaring an abstract slot — a step with a
+    // pinned file still needs to be addressable so a caller can run against a
+    // different one. All optional: a pinned step runs untouched.
+    let slots = scan_file_inputs(&wf.steps);
 
     let mut properties = serde_json::Map::new();
     let mut required = Vec::with_capacity(names.len());
@@ -165,13 +168,16 @@ pub fn derive_input_schema(wf: &Workflow) -> Value {
         if properties.contains_key(slot) {
             continue;
         }
-        properties.insert(
-            slot.clone(),
-            json!({
-                "type": "string",
-                "description": format!("File slot: stored-file handle (file_…) to upload for '{slot}'"),
-            }),
-        );
+        let description = if let Some(id) = slot.strip_prefix("step:") {
+            format!(
+                "File for upload step {id}: stored-file handle (file_…). Optional — the \
+                 step's own pinned file is used when omitted; pass one to run against a \
+                 different file."
+            )
+        } else {
+            format!("File slot: stored-file handle (file_…) to upload for '{slot}'")
+        };
+        properties.insert(slot.clone(), json!({ "type": "string", "description": description }));
     }
 
     // Advertise the freshness control so `max_age` works the same whether an agent calls
@@ -211,6 +217,56 @@ pub fn scan_file_slots(steps_text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     collect_file_slots(&parsed, &mut out, &mut seen);
+    out
+}
+
+/// Every upload step's binding key — the DECLARED slots above, plus a `step:<id>` key
+/// for each upload step that declares none.
+///
+/// An upload step usually just pins a file (picked while recording or in the editor)
+/// rather than declaring an abstract slot. Such a step runs fine with no argument, so
+/// it is deliberately absent from [`scan_file_slots`] — the elicitation path uses that
+/// list to decide what to ASK the user for, and prompting for an already-satisfied
+/// step would be a regression. But it must still be ADDRESSABLE, so a caller can run
+/// the workflow against a different file without editing it; that is what this returns.
+///
+/// Keyed on the step's own id so a binding survives reordering (an ordinal would not),
+/// matching the coordinator, the run form and the replay engine. Order-preserving.
+pub fn scan_file_inputs(steps_text: &str) -> Vec<String> {
+    let mut out = scan_file_slots(steps_text);
+    let mut seen: BTreeSet<String> = out.iter().cloned().collect();
+    let parsed: Value = match serde_json::from_str(steps_text) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    let Some(steps) = parsed.as_array() else {
+        return out;
+    };
+    for step in steps {
+        let Some(map) = step.as_object() else { continue };
+        if map.get("type").and_then(Value::as_str) != Some("upload") {
+            continue;
+        }
+        // A declared slot is already covered by the walk above.
+        let declared = ["file_slot"].iter().any(|k| {
+            map.get(*k).and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+        }) || ["config", "options"].iter().any(|obj| {
+            map.get(*obj)
+                .and_then(Value::as_object)
+                .and_then(|o| o.get("file_slot"))
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        });
+        if declared {
+            continue;
+        }
+        if let Some(id) = map.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            let key = format!("step:{id}");
+            if seen.insert(key.clone()) {
+                out.push(key);
+            }
+        }
+    }
     out
 }
 
@@ -397,6 +453,31 @@ mod tests {
             "the workflow's own declaration wins"
         );
         assert_eq!(schema["required"], json!(["max_age"]));
+    }
+
+    /// A pinned upload step must be ADDRESSABLE (so a caller can swap the file) without
+    /// becoming something the elicitation path asks the user to supply.
+    #[test]
+    fn file_inputs_add_pinned_steps_but_slots_do_not() {
+        let steps = r#"[
+            {"id":"s1","type":"upload","config":{"file_slot":"resume"}},
+            {"id":"s2","type":"upload","config":{"file_id":"file_pinned"}},
+            {"id":"s3","type":"upload","options":{"file_id":"file_rec"}},
+            {"id":"s4","type":"click","config":{"selector":".go"}}
+        ]"#;
+        // Declared-only: what the user is PROMPTED for. The pinned steps are satisfied.
+        assert_eq!(scan_file_slots(steps), vec!["resume".to_string()]);
+        // Every upload step: what a caller may BIND. Pinned steps keyed by step id.
+        assert_eq!(
+            scan_file_inputs(steps),
+            vec![
+                "resume".to_string(),
+                "step:s2".to_string(),
+                "step:s3".to_string(),
+            ]
+        );
+        // A step with no id can't be addressed — it is skipped, not keyed on an ordinal.
+        assert!(scan_file_inputs(r#"[{"type":"upload","config":{"file_id":"f"}}]"#).is_empty());
     }
 
     #[test]

@@ -39,6 +39,12 @@ pub struct StepRunContext<'a> {
     /// Values pulled by prior steps' `response_extractions` (and, later, auth-recipe vars). Empty for
     /// callers that don't chain extractions.
     pub extracted: &'a HashMap<String, serde_json::Value>,
+    /// The running step's own id. An upload step that declares no `file_slot` is addressed
+    /// as `step:<id>` in the run's files map — that is the key the run form, REST and MCP
+    /// all bind an override to — so without it a per-run file choice cannot be matched.
+    /// `None` for callers that don't track step identity; the step then falls back to the
+    /// file pinned on it, which is the pre-existing behaviour.
+    pub step_id: Option<&'a str>,
 }
 
 /// Backwards-compatible entry point: runs a step with an EMPTY extracted map. Callers that chain
@@ -62,6 +68,7 @@ pub async fn execute_step(
         timeout_ms,
         fast_mode,
         extracted: &empty,
+        step_id: None,
     };
     execute_step_ctx(page, step_type, config, &ctx).await
 }
@@ -109,7 +116,7 @@ pub async fn execute_step_ctx(
         "ai_fill" => super::step_ai::execute_ai_fill(page, config, credentials, form_data, timeout_ms).await,
         "ai_continue" => super::step_ai::execute_ai_continue(page, config, credentials, form_data, timeout_ms).await,
         "ai_navigate" => super::step_ai::execute_ai_navigate(page, config, credentials, form_data, timeout_ms).await,
-        "upload" => super::step_upload::execute_upload(page, config, run_files, timeout_ms).await,
+        "upload" => super::step_upload::execute_upload(page, config, run_files, timeout_ms, ctx.step_id).await,
         "wait_for_download" => super::step_download::execute_wait_for_download(page, config, run_files, timeout_ms).await,
         "wait_for_tab" => super::step_misc::execute_wait_for_tab(page, config, timeout_ms).await,
         "open_tab" => super::step_misc::execute_open_tab(page, config, timeout_ms).await,

@@ -177,6 +177,32 @@ fn spectate_tasks() -> &'static DashMap<String, Arc<AtomicBool>> {
     SPECTATE.get_or_init(DashMap::new)
 }
 
+/// Pages that are spectate-able but are NOT interactive browsing sessions, keyed by the WIRE
+/// session id the viewer opens (`ai-<db_id>`).
+///
+/// `execute_ai_task` runs the whole agent loop on-device against its own context/page and never
+/// registers in [`sessions`] — so a spectator asking for `ai-<id>` matched nothing and
+/// [`start_spectate`] returned silently, leaving the preview black forever. (The
+/// `ai_session_open` path is unaffected: it inserts into `sessions` under that same wire id.)
+/// Registering here makes the task's page watchable WITHOUT making it addressable by
+/// `agent_action`/`session_close` or visible to the idle reaper — it is a view, not a session.
+static SPECTATE_PAGES: OnceLock<DashMap<String, playwright_rs::Page>> = OnceLock::new();
+fn spectate_pages() -> &'static DashMap<String, playwright_rs::Page> {
+    SPECTATE_PAGES.get_or_init(DashMap::new)
+}
+
+/// Publish `page` as spectate-able under `session_id` (the wire id). Idempotent.
+pub fn register_spectate_page(session_id: &str, page: playwright_rs::Page) {
+    spectate_pages().insert(session_id.to_string(), page);
+}
+
+/// Withdraw a page published by [`register_spectate_page`] and stop any live screencast of it, so
+/// a spectator arriving after the task finished sees nothing rather than a closed/reused page.
+pub fn unregister_spectate_page(session_id: &str) {
+    spectate_pages().remove(session_id);
+    stop_spectate(session_id);
+}
+
 /// Screencast cadence (~2.5 fps) + JPEG quality — parity with the local `live_preview` screencast.
 const SPECTATE_INTERVAL_MS: u64 = 400;
 const SPECTATE_QUALITY: u8 = 55;
@@ -190,9 +216,15 @@ pub fn start_spectate(session_id: &str, outgoing_tx: mpsc::UnboundedSender<Messa
     if spectate_tasks().contains_key(&sid) {
         return; // already streaming this session
     }
+    // Interactive browsing session first, then a spectate-only page published by an on-device
+    // AI task (see `spectate_pages`) — without the second lookup an `execute_ai_task` preview
+    // resolved to nothing and silently never streamed.
     let page = match sessions().get(&sid) {
         Some(s) => s.page.clone(),
-        None => return, // no such live session
+        None => match spectate_pages().get(&sid) {
+            Some(p) => p.clone(),
+            None => return, // no such live session
+        },
     };
     let cancel = Arc::new(AtomicBool::new(false));
     spectate_tasks().insert(sid.clone(), cancel.clone());

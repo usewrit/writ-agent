@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-08-11
+
+### Fixed
+
+- **A file chosen at run time is no longer ignored.** An upload step resolves its file from two
+  places: the slot a caller bound for *this* run (the run form's picker, a `files` map over REST or
+  MCP, a buyer-bound recipe slot) and the file pinned on the step itself. The pin was resolved
+  first, so picking a different file in the run form silently uploaded the old one. Slot now wins;
+  with nothing bound to the slot the pinned file is still used, so an untouched run behaves exactly
+  as before. This matches the precedence the replay engine already documented.
+- **An on-device AI task's live preview is no longer blank.** Such a task runs its whole loop
+  against its own browser context and was never registered as a browsing session, so opening the
+  viewer for it matched nothing and returned silently — a permanently black preview, while the
+  equivalent interactive path worked. The task now publishes its page under the session id a viewer
+  actually opens, after navigation succeeds so a spectator never attaches to a dead page, and
+  withdraws it on the single cleanup exit.
+
+### Changed
+
+- **Every upload step is addressable over MCP, not just those declaring a named slot.** A recorded
+  step usually just pins a file rather than declaring an abstract slot, which left no way to run the
+  workflow against a different file without editing it. Each such step now exposes a `step:<id>`
+  key — its own step id rather than an ordinal, so reordering or disabling a step cannot shift it.
+  Every key is optional and a pinned step still runs untouched; steps that already have a file stay
+  out of the elicitation list, so nothing prompts for something it does not need.
+
 ## [1.0.1] - 2026-08-10
 
 ### Added

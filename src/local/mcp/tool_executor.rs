@@ -527,9 +527,14 @@ async fn resolve_workflow_id(state: &AppState, name: &str) -> Result<i64, CallEr
 /// map keyed by the file handle, in the `config["files"]` shape `RunFiles::from_config` reads
 /// (`{ file_id -> { file_id, slots:[slot] } }`). Any existing `inputs.files` object is preserved and
 /// extended. Args whose value is not a non-empty string are left in place (no silent drop). No-op
-/// when the workflow declares no file slots.
+/// when the workflow has no upload steps.
+///
+/// Uses `scan_file_inputs`, not `scan_file_slots`: an upload step that merely PINS a
+/// file is addressable as `step:<id>`, and a caller passing that key means "run against
+/// this file instead". The engine resolves a slot binding ahead of the pinned file, so
+/// lifting it here is what makes the override take effect.
 fn lift_file_slots(inputs: &mut Value, steps_text: &str) {
-    let slots = super::tools::scan_file_slots(steps_text);
+    let slots = super::tools::scan_file_inputs(steps_text);
     if slots.is_empty() {
         return;
     }

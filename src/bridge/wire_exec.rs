@@ -865,6 +865,9 @@ pub(crate) async fn handle_execute_workflow(
             fast_mode,
             // Prior steps' response_extractions so `{{extracted:key}}` resolves in api_call bodies/headers.
             extracted: &extracted_data,
+            // An upload step with no declared file_slot is bound as `step:<id>` in the
+            // run's files map, so a caller-supplied file can be matched to it.
+            step_id: raw_step.get("id").and_then(|v| v.as_str()),
         };
         let result = crate::automation::step_executor::execute_step_ctx(
             &active_page,

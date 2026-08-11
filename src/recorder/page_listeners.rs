@@ -382,7 +382,15 @@ async fn register_file_listeners(
                         selector: None,
                         url: None,
                         value: None,
-                        description: Some("File download".to_string()),
+                        // Name the step after the file the page actually produced, so the
+                        // step list reads "Download report.pdf" rather than an anonymous
+                        // "File download". The name is an EXPECTATION only — replay stores
+                        // whatever the live page sends and never compares the two.
+                        description: Some(if suggested.is_empty() {
+                            "File download".to_string()
+                        } else {
+                            format!("Download {}", suggested)
+                        }),
                         coordinates: None,
                         viewport: None,
                         options: Some({

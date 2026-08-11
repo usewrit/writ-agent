@@ -18,6 +18,7 @@ pub async fn execute_upload(
     config: &WorkflowStepConfig,
     run_files: &RunFiles,
     timeout_ms: u64,
+    step_id: Option<&str>,
 ) -> StepResult {
     let selector = config
         .selector
@@ -44,14 +45,44 @@ pub async fn execute_upload(
         .or_else(|| config.options.as_ref().and_then(|o| o.get("is_multiple")).and_then(|v| v.as_bool()))
         .unwrap_or(false);
 
-    // Resolve the file descriptor(s) this step targets (file_id then file_slot).
-    let descs = run_files.resolve_step_files(
-        config.file_id.as_deref(),
-        config.file_slot.as_deref(),
-    );
+    // The slot this step's file is bound under for THIS run. A recorded step usually
+    // declares none — it just pins a file — so it is addressed by its own step id, the
+    // same `step:<id>` key the run form, REST and MCP bind an override to. An ordinal
+    // would break the moment a step is reordered or disabled.
+    let slot = config
+        .file_slot
+        .clone()
+        .or_else(|| {
+            config
+                .options
+                .as_ref()
+                .and_then(|o| o.get("file_slot"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .filter(|s| !s.is_empty())
+        .or_else(|| step_id.filter(|s| !s.is_empty()).map(|s| format!("step:{}", s)));
+
+    // The file pinned on the step, from either shape: `config` when the editor wrote it,
+    // `options` when the recorder did. Used when this run bound nothing to the slot.
+    let pinned = config
+        .file_id
+        .clone()
+        .or_else(|| {
+            config
+                .options
+                .as_ref()
+                .and_then(|o| o.get("file_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .filter(|s| !s.is_empty());
+
+    // Resolve the file descriptor(s): this run's binding first, then the pinned file.
+    let descs = run_files.resolve_step_files(pinned.as_deref(), slot.as_deref());
     if descs.is_empty() {
         return Err(StepError::Execution(
-            "upload step: no file resolved — provide config.file_id or a config.file_slot bound in the run files map".into(),
+            "upload step: no file resolved — pin a file on the step or bind its slot in the run files map".into(),
         ));
     }
 

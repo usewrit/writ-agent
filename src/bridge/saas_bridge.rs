@@ -2680,6 +2680,33 @@ async fn handle_execute_ai_task(
         return;
     }
 
+    // WATCHABLE: publish this task's page under the WIRE session id a viewer opens
+    // (`ai-<db_id>`). An on-device AI task runs its whole loop against its own context and is
+    // never registered as a browsing session, so `spectate_start` for `ai-<id>` previously
+    // matched nothing and returned silently — a permanently black preview, while the
+    // `ai_session_open` path (which DOES register under the wire id) worked. Published only
+    // after navigation succeeds, so a spectator never attaches to a blank//dead page, and
+    // withdrawn at the single cleanup exit below.
+    let spectate_sid: Option<String> = msg
+        .get("ai_session_id")
+        .and_then(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        })
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("ai-{s}"));
+    if let Some(sid) = &spectate_sid {
+        // The spectate registry lives in `local::browse`, and so does its only reader
+        // (the preview screenshot lookup). A build without the `local` feature — which
+        // is the DEFAULT one — has neither, so publishing the page there is both
+        // impossible and pointless. Ungated, this failed to compile at all.
+        #[cfg(feature = "local")]
+        crate::local::browse::register_spectate_page(sid, page.clone());
+        #[cfg(not(feature = "local"))]
+        let _ = sid;
+    }
+
     // Create a BridgeAIClient for AI completions through the bridge WS.
     // Echo the initiating api_key_id (if any) so the gateway bills per key.
     let api_key_id = config.get("api_key_id").and_then(|v| {
@@ -2816,7 +2843,14 @@ async fn handle_execute_ai_task(
                  error.as_deref().unwrap_or("unknown"));
     }
 
-    // Cleanup
+    // Cleanup. Withdraw the spectate page FIRST (it also stops any live screencast) so no
+    // watcher keeps screenshotting a context that is about to close.
+    if let Some(sid) = &spectate_sid {
+        #[cfg(feature = "local")]
+        crate::local::browse::unregister_spectate_page(sid);
+        #[cfg(not(feature = "local"))]
+        let _ = sid;
+    }
     let _ = context.close().await;
 }
 

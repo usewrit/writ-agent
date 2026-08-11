@@ -147,22 +147,30 @@ impl RunFiles {
     /// Resolve the descriptor(s) an upload step targets.
     ///
     /// Looks up, in order:
-    ///   * `config.file_id`   — a concrete file id (own runs); direct lookup.
-    ///   * `config.file_slot` — a slot name bound by the buyer/caller; matched against
-    ///                          each descriptor's `slots` list.
+    ///   * `file_slot` — the slot name bound by THIS RUN's caller (the run form's file
+    ///                   picker, a REST/MCP `files` map, a buyer-bound recipe slot);
+    ///                   matched against each descriptor's `slots` list.
+    ///   * `file_id`   — the file PINNED on the step; a direct lookup.
+    ///
+    /// Slot first, deliberately. A run-time binding is the caller saying "run this one
+    /// against THAT file", so it has to outrank the file baked into the step —
+    /// otherwise picking a different file in the run modal would be silently ignored
+    /// and the pinned file uploaded instead. With no binding for the slot the pinned
+    /// file is used, so an untouched run behaves exactly as before. This mirrors the
+    /// Python engine's precedence (form_data > slot-bound > config > options).
     pub fn resolve_step_files(
         &self,
         file_id: Option<&str>,
         file_slot: Option<&str>,
     ) -> Vec<ResolvedFile> {
-        if let Some(fid) = file_id.filter(|s| !s.is_empty()) {
-            if let Some(d) = self.files.get(fid) {
-                return vec![d.clone()];
-            }
-        }
         if let Some(slot) = file_slot.filter(|s| !s.is_empty()) {
             if let Some(d) = self.find_by_slot(slot) {
                 return vec![d];
+            }
+        }
+        if let Some(fid) = file_id.filter(|s| !s.is_empty()) {
+            if let Some(d) = self.files.get(fid) {
+                return vec![d.clone()];
             }
         }
         Vec::new()
@@ -346,5 +354,39 @@ mod tests {
         let by_slot = rf.resolve_step_files(None, Some("resume"));
         assert_eq!(by_slot.len(), 1);
         assert_eq!(by_slot[0].file_id, "file_abc");
+    }
+
+    /// A file bound to the step's slot for THIS run must beat the file pinned on the
+    /// step. Resolving the pin first would silently upload the old file whenever a
+    /// runner picked a different one in the run form (or passed `files` over REST/MCP).
+    #[test]
+    fn run_binding_outranks_pinned_file() {
+        let cfg = serde_json::json!({
+            "files": {
+                "file_pinned": {
+                    "file_id": "file_pinned",
+                    "url": "https://store/file_pinned?sig=x",
+                    "filename": "pinned.pdf"
+                },
+                "file_chosen": {
+                    "file_id": "file_chosen",
+                    "url": "https://store/file_chosen?sig=y",
+                    "filename": "chosen.pdf",
+                    "slots": ["step:abc-123"]
+                }
+            }
+        });
+        let rf = RunFiles::from_config(&cfg, None);
+
+        // Both a pin and a binding for this step's slot → the binding wins.
+        let picked = rf.resolve_step_files(Some("file_pinned"), Some("step:abc-123"));
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].file_id, "file_chosen");
+
+        // Nothing bound to the slot → fall back to the pinned file, so an untouched
+        // run behaves exactly as it did before.
+        let fallback = rf.resolve_step_files(Some("file_pinned"), Some("step:unbound"));
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].file_id, "file_pinned");
     }
 }
