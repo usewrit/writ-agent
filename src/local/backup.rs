@@ -545,7 +545,11 @@ async fn snapshot_db(db_path: &Path, db_key: &str) -> BackupResult<Vec<u8>> {
         let _ = std::fs::remove_file(sidecar(&snap, ext));
     }
 
-    let keyed = format!("'{}'", db_key.replace('\'', "''"));
+    // MUST be the same key FORM the daemon's pool uses. A 64-hex vault key is applied as SQLCipher's
+    // RAW key (`x'<hex>'`), not as a passphrase (`'<hex>'`) — the two derive DIFFERENT AES keys, so
+    // the passphrase form this used to build could not decrypt a DB written by `db::open` and every
+    // export died with `VACUUM INTO snapshot failed: … (code: 26) file is not a database`.
+    let keyed = crate::local::db::key_pragma_value(db_key);
     let open = SqliteConnectOptions::new()
         .filename(db_path)
         .create_if_missing(false)

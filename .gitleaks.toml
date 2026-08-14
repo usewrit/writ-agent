@@ -72,6 +72,17 @@ targetRules = ["generic-api-key"]
 paths = ['''src/local/api/v1/personas\.rs$''']
 regexes = ['''hunter2-PLAIN''']
 
+# `src/local/db.rs` proves two things about the SQLCipher key form: that a full 64-char hex key is
+# passed as a RAW key (`x'…'`) rather than a passphrase, and that a database written by an older
+# build under the passphrase form migrates to the raw form WITH ITS DATA INTACT rather than being
+# quarantined. Both need a literal 64-hex-character key; it names a temp database created and
+# dropped inside the test.
+[[allowlists]]
+description = "db.rs — 64-hex fixture key for the raw-key form and the legacy-passphrase migration test"
+targetRules = ["generic-api-key"]
+paths = ['''src/local/db\.rs$''']
+regexes = ['''e4d170b7e13d345279997ffe7d9c1f7a292ae4c5989b2ac314f36fb79999be97''']
+
 # --- Published-on-purpose test signing keys --------------------------------
 #
 # `src/local/cloud/entitlements.rs` verifies entitlement documents against a

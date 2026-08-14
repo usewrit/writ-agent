@@ -109,7 +109,18 @@ pub async fn prompt_for_upload_file(
         slots: Vec::new(),
     };
     let run_files = crate::automation::files::RunFiles::from_prefetched(Vec::new());
-    let path = match run_files.fetch_to_temp(&desc).await {
+    // Cloud and self-host answer with a pre-signed URL, which authorizes itself. The
+    // DESKTOP client answers with its own daemon's `/v1/files/{id}/content` — an
+    // ordinary authenticated route — and that daemon is THIS process, so supply its
+    // bearer. Without it every desktop pick 401'd and the chooser was dismissed empty:
+    // the prompt worked, the file was chosen, and the page still uploaded nothing.
+    // Scoped to loopback so a token can never be attached to an off-box URL.
+    let bearer = if is_loopback_url(&desc.url) {
+        daemon_bearer()
+    } else {
+        None
+    };
+    let path = match run_files.fetch_to_temp_authed(&desc, bearer.as_deref()).await {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(session_id, %file_id, error = %e, "could not fetch the picked file");
@@ -118,6 +129,66 @@ pub async fn prompt_for_upload_file(
     };
 
     Some(PickedUpload { file_id, filename, path })
+}
+
+/// True when `url` addresses this machine over loopback.
+///
+/// Deliberately strict — parsed host equality, never a substring test, so a URL like
+/// `https://127.0.0.1.evil.test/…` cannot collect the daemon's bearer.
+fn is_loopback_url(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    // authority = everything before the first '/', '?' or '#'; then drop any :port.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@') // ignore any userinfo
+        .next()
+        .unwrap_or("");
+    // An IPv6 literal is bracketed and full of colons, so the port can only be found
+    // AFTER the closing bracket — `rfind(':')` alone would cut the address in half.
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        match stripped.find(']') {
+            Some(end) => &stripped[..end],
+            None => return false, // unterminated literal — not something to trust
+        }
+    } else {
+        match authority.rfind(':') {
+            Some(i) => &authority[..i],
+            None => authority,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// This daemon's own bearer token, for fetching its own content route.
+///
+/// Only compiled into the `local` build — a cloud agent has no local daemon and no such
+/// token, and its answers carry pre-signed URLs that need none.
+#[cfg(feature = "local")]
+fn daemon_bearer() -> Option<String> {
+    let paths = crate::local::config::Paths::resolve().ok()?;
+    let seed = std::fs::read_to_string(paths.local_token())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    // Honour a live `POST /v1/token/rotate`: the file holds the boot seed, and the
+    // overlay holds the value the auth layer is actually checking right now.
+    Some(crate::local::runtime_token::current(&seed))
+}
+
+#[cfg(not(feature = "local"))]
+fn daemon_bearer() -> Option<String> {
+    None
 }
 
 /// Drop any pending prompt for this session (idempotent).
@@ -158,4 +229,40 @@ pub async fn deliver_answer(
     };
     let _ = pending.responder.send(payload);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_url;
+
+    /// The bearer is only ever attached to this machine's own daemon. A host that
+    /// merely CONTAINS a loopback literal is a different machine, and handing it the
+    /// token would leak full local API access to whoever controls that name.
+    #[test]
+    fn only_real_loopback_hosts_get_the_token() {
+        for url in [
+            "http://127.0.0.1:8131/v1/files/file_a/content",
+            "http://localhost:8131/v1/files/file_a/content",
+            "http://LOCALHOST:8131/v1/files/file_a/content",
+            "https://127.0.0.1:8132/v1/files/file_a/content",
+            "http://[::1]:8131/v1/files/file_a/content",
+            "http://127.0.0.2:8131/v1/files/file_a/content", // whole 127/8 is loopback
+        ] {
+            assert!(is_loopback_url(url), "should be loopback: {url}");
+        }
+
+        for url in [
+            "https://127.0.0.1.evil.test/v1/files/file_a/content",
+            "https://localhost.evil.test/v1/files/file_a/content",
+            "https://evil.test/?x=127.0.0.1",
+            "https://evil.test/127.0.0.1/content",
+            "https://api.usewrit.app/api/files/dl/tok",
+            "https://user@evil.test/v1/files/a/content",
+            "http://192.168.1.10:8131/v1/files/a/content",
+            "ftp://127.0.0.1/x",
+            "",
+        ] {
+            assert!(!is_loopback_url(url), "must NOT be loopback: {url}");
+        }
+    }
 }

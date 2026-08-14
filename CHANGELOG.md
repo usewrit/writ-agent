@@ -6,6 +6,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-08-13
+
+### Fixed
+
+- **The desktop shell could not stop the daemon on Windows.** Windows has no `SIGTERM`, so "Quit"
+  reached for `taskkill /PID <pid> /T` — which asks by posting to the target's console or windows,
+  and a daemon spawned as a sidecar by a GUI-subsystem shell has neither. Quit therefore exited the
+  app and left `writ-agentd` running; `/F` would only have traded that for a `TerminateProcess`,
+  leaving `runtime.json` and the singleton lock behind for the next start to collide with. A new
+  `POST /v1/shutdown` (loopback + bearer gated) enters the same graceful path `Ctrl-C` and `SIGTERM`
+  already used: drain the scheduler, stop the supervisors, release the lock, remove the runtime file.
+- **Chromium could never finish installing on ARM64 Windows.** "Which platforms can we download a
+  build for" and "which platforms do we hold a verification pin for" had drifted into two
+  independent `cfg!` ladders. The download succeeded and the integrity gate then refused it with
+  "no Chromium pin for this platform" — and because that gate fails closed, onboarding could never
+  complete, even though the pin was in the file all along. Both questions are now answered by one
+  function, so a platform cannot be half-added again.
+- **Home-directory lookup failed on Windows.** `HOME` is not set there, so every home-derived
+  driver candidate resolved to `None` — silently, since each caller reads `None` as "not present"
+  rather than "could not look". `USERPROFILE`, then `HOMEDRIVE` + `HOMEPATH`, are now consulted.
+  When nothing resolves, the daemon logs the executable path, the environment overrides, the
+  resolved home and every candidate it tried, so a shipped build can answer "where did you look?"
+  instead of surfacing an opaque driver timeout.
+
+### Changed
+
+- **Opening an encrypted database is fast again.** A full 64-character hex key is now passed to
+  SQLCipher as a raw key rather than a passphrase, skipping per-connection key derivation. A
+  database written by an older build under the passphrase form is migrated in place, with its data
+  intact — not quarantined.
+- Every OS-keyring secret kept outside the encrypted database — vault root, cloud token, per-agent
+  channel key, relay credential — now opens its entry through one seam. Behaviour is unchanged, and
+  no environment variable or runtime switch can divert a real secret away from the OS keyring.
+
 ## [1.0.2] - 2026-08-11
 
 ### Fixed

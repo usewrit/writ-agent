@@ -10,7 +10,7 @@
 //!   POST /v1/cloud/link/start    → { user_code, verification_uri, verification_uri_complete?,
 //!                                     expires_in, interval, device_code }
 //!   POST /v1/cloud/link/poll     → { status, account? }
-//!   POST /v1/cloud/unlink        → { ok: true }
+//!   POST /v1/cloud/unlink        → { ok, keyring_error }  (200 ⇒ local link gone; ok ⇒ complete)
 //!   GET  /v1/cloud/entitlements  → { plan, features, limits, can_monetize, nav, web_url, failed_closed }
 //!   POST /v1/cloud/sync/pull     → { ok, counts, diverged, errors }  (authoritative cloud→app import)
 //!   GET  /v1/cloud/sync/status   → { in_progress, last_pull_at, counts, diverged_count }
@@ -269,15 +269,30 @@ async fn link_poll(State(st): State<AppState>) -> LocalResult<Json<Value>> {
 }
 
 /// `POST /v1/cloud/unlink` — clear the keyring account token AND the persisted `LinkState` (and any
-/// in-flight device flow). Idempotent; always reports `{ ok: true }` on success.
+/// in-flight device flow). Idempotent.
+///
+/// CONTRACT: **a 200 always means the local link metadata is gone** — the desktop no longer presents
+/// itself as linked, and the caller is free to proceed with its own sign-out steps (the shell's
+/// profile switch, cache wipe). `ok` then says whether the unlink was COMPLETE:
+///
+/// * `{ ok: true, keyring_error: null }` — nothing of the link survives.
+/// * `{ ok: false, keyring_error: "…" }` — the local link is gone, but the OS keyring refused to
+///   drop a credential (a locked/ACL-gated keychain), so a still-valid token remains on this
+///   machine. The caller MUST surface this: the credential can still authenticate against the
+///   cloud. Retrying the route is safe and re-attempts only what is left.
+///
+/// A non-200 means the local store itself could not be updated — nothing else could be done.
 async fn unlink(State(st): State<AppState>) -> LocalResult<Json<Value>> {
-    link::unlink(&st.db).await?;
-    // Tear down the cloud execution agent: unlinking removes the token + channel key, so the agent
-    // must stop advertising/serving immediately (its `can_run` gate would refuse a restart anyway).
+    let outcome = link::unlink(&st.db).await;
+    // Tear down the cloud execution agent whatever the outcome: the credentials it needs are gone
+    // (or unmanageable), so it must stop advertising/serving immediately — including on the error
+    // path, where leaving it running would keep serving cloud work under the account the user just
+    // signed out of. Its `can_run` gate would refuse a restart anyway.
     if let Some(mgr) = crate::local::cloud::agent::manager::global() {
         mgr.stop();
     }
-    Ok(Json(json!({ "ok": true })))
+    let outcome = outcome?;
+    Ok(Json(json!({ "ok": outcome.fully_unlinked(), "keyring_error": outcome.keyring_error })))
 }
 
 /// `GET /v1/cloud/entitlements` — the REFLECTION-ONLY entitlements reflection
@@ -1043,15 +1058,73 @@ mod tests {
 
     #[tokio::test]
     async fn unlink_is_ok_and_idempotent() {
+        // Shares the env guard with `unlink_partially_succeeds_when_the_keyring_refuses`, which
+        // repoints WRIT_PROFILE and injects a keyring delete failure on the profile it repoints to.
+        // Without the guard that injection could land on the entry THIS test deletes.
+        let _g = crate::local::config::test_env_guard();
         let (_dir, st) = test_state().await;
         // Unlink with nothing linked still succeeds.
         let (code, body) = call(&st, "POST", "/v1/cloud/unlink").await;
         assert_eq!(code, 200, "body={body}");
         assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["keyring_error"], Value::Null, "a clean unlink reports no residue");
         // And again (idempotent).
         let (code, body) = call(&st, "POST", "/v1/cloud/unlink").await;
         assert_eq!(code, 200, "body={body}");
         assert_eq!(body["ok"], json!(true));
+    }
+
+    /// A keyring that refuses the delete (locked / ACL-gated keychain → `errSecAuthFailed`) must NOT
+    /// abort the unlink. The local link metadata is what the UI reads and what gates the shell's
+    /// account-exit steps, so it has to be cleared regardless — while the surviving credential is
+    /// reported, never swallowed.
+    #[tokio::test]
+    async fn unlink_partially_succeeds_when_the_keyring_refuses() {
+        use crate::local::keyring_store;
+        // Hold the env guard: this repoints the process-global WRIT_PROFILE so the injected failure
+        // lands on an entry no other test addresses.
+        let _g = crate::local::config::test_env_guard();
+        let profile = format!("acct_unlink_refused_{}", std::process::id());
+        std::env::set_var(crate::local::cloud::token::ENV_PROFILE, &profile);
+        keyring_store::fail_deletes(crate::local::cloud::token::KEYRING_SERVICE, &profile);
+
+        let (_dir, st) = test_state().await;
+        // Linked on paper: the metadata row the UI reads.
+        LinkState {
+            account_id: "acct_refused".into(),
+            email: "u@example.com".into(),
+            cloud_base_url: "https://cloud.example.com/".into(),
+            scopes: vec![],
+            linked_at: Some(chrono::Utc::now()),
+            language: None,
+        }
+        .save(&st.db)
+        .await
+        .unwrap();
+
+        let (code, body) = call(&st, "POST", "/v1/cloud/unlink").await;
+
+        keyring_store::stop_failing_deletes(crate::local::cloud::token::KEYRING_SERVICE, &profile);
+        std::env::remove_var(crate::local::cloud::token::ENV_PROFILE);
+
+        // 200 — the route did everything it could, and the caller may proceed with its own steps.
+        assert_eq!(code, 200, "a refused keyring delete must not 500 the route: body={body}");
+        // ...but NOT `ok`: a still-valid token survives on the machine and the user must be told.
+        assert_eq!(body["ok"], json!(false), "body={body}");
+        let detail = body["keyring_error"].as_str().unwrap_or_default();
+        assert!(detail.contains("account token"), "names which credential survived: {body}");
+        assert!(detail.contains("authorization"), "carries the backend reason: {body}");
+        assert!(!detail.contains("wto_") && !detail.contains("wtr_"), "no token material: {body}");
+
+        // The whole point: local state is gone anyway, so the UI is unstuck and re-linking works.
+        assert!(
+            LinkState::load(&st.db).await.unwrap().is_none(),
+            "the LinkState row must be cleared even when the keyring refuses"
+        );
+        let (code, body) = call(&st, "GET", "/v1/cloud/status").await;
+        assert_eq!(code, 200, "body={body}");
+        assert_eq!(body["linked"], json!(false), "the desktop must read as unlinked: {body}");
+        assert_eq!(body["account"], Value::Null, "body={body}");
     }
 
     #[tokio::test]

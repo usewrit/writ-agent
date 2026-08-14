@@ -81,6 +81,12 @@ async fn async_main() -> std::process::ExitCode {
         _ => init_tracing(),
     }
 
+    // Replay the driver decision made in the sync prologue. `init_driver_env()` had to run BEFORE
+    // this subscriber existed (it writes the process environment, which must happen single-threaded),
+    // so everything it logged went nowhere — including which `node` the driver resolved to, the
+    // single most useful line when a Playwright handshake times out.
+    writ_agent::browser::manager::log_driver_init();
+
     // Crash reporting: install the scrubbed panic hook EARLY (right after tracing, before any work
     // that could panic) so even an init-time / bootstrap panic is captured to ~/.writ/logs/crash-*.json
     // and logged. The hook REPLACES the default hook (which printed the panic payload to stderr
@@ -150,6 +156,98 @@ async fn async_main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+
+    // PRE-WARM the browser stack at startup.
+    //
+    // The daemon used to defer ALL browser bootstrap to first use, so the first "record" paid for
+    // the Playwright driver handshake AND the browser process start before anything appeared on
+    // screen — the long gap between "Playwright init" and the record view. The desktop app spawns
+    // this daemon at APP start and the user then spends seconds-to-minutes in the UI before asking
+    // for a browser, so that work belongs in the idle time we already have. Driving a browser IS
+    // what the app is for; paying for it at first use is paying at the worst possible moment.
+    //
+    // Rules this must respect:
+    // * NON-BLOCKING — spawned, never awaited. The loopback API must bind on time regardless.
+    // * BEST-EFFORT — a failure here is logged and dropped; `ensure_warm_browser` runs again at
+    // first real use, so a failed pre-warm costs nothing but the log line.
+    // * NEVER PUT A WINDOW ON SCREEN. In headed mode the pre-warm stops after the DRIVER:
+    // launching the browser would pop a visible Chromium at app start with nobody asking for
+    // it, which is the exact bug the Windows `--version` probe already caused once.
+    // `WRIT_PREWARM=0` opts out (low-memory machines), leaving the old lazy behaviour.
+    if std::env::var("WRIT_PREWARM").map(|v| v != "0").unwrap_or(true) {
+        if let Some(browser) = state.engine.browser() {
+            tokio::spawn(async move {
+                let t0 = std::time::Instant::now();
+                if let Err(e) = browser.initialize().await {
+                    tracing::warn!(error = %e, "pre-warm: Playwright driver failed to start (will retry at first use)");
+                    return;
+                }
+                if !browser.is_headless() {
+                    tracing::info!(
+                        elapsed_ms = t0.elapsed().as_millis(),
+                        "pre-warm: driver ready; browser NOT launched (headed mode — a window at \
+                         startup is never launched unprompted)"
+                    );
+                    return;
+                }
+                // WAIT FOR A BROWSER TO EXIST before trying to launch one.
+                //
+                // Pre-warm fires seconds after boot, which on a machine whose Chromium install has
+                // not finished (or not happened) is guaranteed to fail — and it used to fail LOUDLY
+                // and in someone else's words: with nothing installed the launcher falls back to
+                // `channel("chrome")`, and Playwright's error tells the user to run
+                // `patchright install chrome`. There is no `patchright` on a user's machine, and
+                // Writ ships its own downloader, so that advice is simply wrong.
+                //
+                // Polling rather than checking once is what makes the install case work: the moment
+                // a browser appears — from first-run setup or from Settings → Runtime — the browser
+                // warms, so the next recording is fast, which is the entire point of pre-warming.
+                // PERF: deliberately NOT `detect_chromium()` on a timer. That walks the system
+                // browser caches AND, once a browser resolves, shells out for a version string — on
+                // Windows that is a PowerShell spawn. Far too much to repeat every few seconds.
+                //
+                // Split it by what can actually change: a user does not install Google Chrome while
+                // this loop is waiting, so resolve the system half ONCE, and poll only the
+                // app-managed browser — the half an install changes — with the cheap path check.
+                let system_browser = local::runtime_setup::resolve_system_chromium().is_some();
+                let app_browser = || local::runtime_setup::bundled_chromium_exe_for(true).is_some();
+                if !system_browser && !app_browser() {
+                    tracing::info!(
+                        "pre-warm: no browser installed yet — waiting for an install to finish"
+                    );
+                    let mut waited = std::time::Duration::ZERO;
+                    while waited < PREWARM_BROWSER_WAIT {
+                        if local::shutdown::is_requested() {
+                            return;
+                        }
+                        tokio::time::sleep(PREWARM_BROWSER_POLL).await;
+                        waited += PREWARM_BROWSER_POLL;
+                        if app_browser() {
+                            break;
+                        }
+                    }
+                    if !app_browser() {
+                        tracing::info!(
+                            waited_s = waited.as_secs(),
+                            "pre-warm: still no browser — leaving it to first use (which reports \
+                             the real reason if it is still missing then)"
+                        );
+                        return;
+                    }
+                }
+                match browser.ensure_warm_browser().await {
+                    Ok(()) => tracing::info!(
+                        elapsed_ms = t0.elapsed().as_millis(),
+                        "pre-warm: driver + browser ready"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "pre-warm: browser launch failed (will retry at first use)"
+                    ),
+                }
+            });
+        }
+    }
 
     // Background work: the scheduler drives DUE monitor checks (+ their change_detected automations)
     // and DUE time-scheduled workflows through the SAME encrypted store + warm-browser engine the
@@ -255,6 +353,13 @@ async fn async_main() -> std::process::ExitCode {
             tracing::info!("shutdown signal received — stopping writ-agentd");
             std::process::ExitCode::SUCCESS
         }
+        _ = local::shutdown::requested() => {
+            // `POST /v1/shutdown` — the desktop shell's "Quit". Same teardown as a signal; this arm
+            // exists because Windows has no SIGTERM and the shell could not otherwise stop a daemon
+            // it spawned without a hard TerminateProcess (which skips all the cleanup below).
+            tracing::info!("graceful shutdown requested over the API — stopping writ-agentd");
+            std::process::ExitCode::SUCCESS
+        }
     };
 
     scheduler.shutdown().await;
@@ -280,6 +385,14 @@ async fn async_main() -> std::process::ExitCode {
     exit
 }
 
+/// How long the pre-warm waits for a browser to appear before giving up and leaving it to first use.
+/// Generous: it covers a first-run Chromium download (~320 MB) on a slow connection, and costs
+/// nothing but one cheap filesystem check per poll while it waits.
+const PREWARM_BROWSER_WAIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// How often to re-check whether a browser has appeared.
+const PREWARM_BROWSER_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Resolve when the process is asked to terminate: Ctrl-C (all platforms) or SIGTERM (unix).
 async fn shutdown_signal() {
     let ctrl_c = async {
@@ -303,16 +416,33 @@ async fn shutdown_signal() {
     }
 }
 
-/// Console tracing for the daemon. Kept self-contained (no log-file appender) so the binary stays
-/// tiny and free of `AppConfig`; honors `RUST_LOG`, defaulting to `info`. Quiets the two benign
-/// playwright-rs internal targets (the `Disposable` channel-object spam) the same way
-/// `util::logging` does, since the engine drives the same vendored driver.
+/// Tracing for the daemon: stdout PLUS a rolling `~/.writ/logs/agentd.log`. Honors `RUST_LOG`,
+/// defaulting to `info`. Quiets the two benign playwright-rs internal targets (the `Disposable`
+/// channel-object spam) the same way `util::logging` does, since the engine drives the same
+/// vendored driver.
 ///
-/// Every rendered line is routed through the [`local::logging`] redaction writer, a last-line scrub
-/// so no token / sealed blob / `~/.writ` path can reach stdout even if some field is logged by
-/// accident (defense in depth — handlers/stores already avoid logging secrets by construction).
+/// The FILE sink is the reason this is not just `fmt().init()`. The daemon used to log to stdout
+/// only, on the assumption that whatever launched it captured that stream — `retention.rs` even
+/// calls `agentd.log` "the supervisor's stdout+stderr capture", and both the diagnostics bundle
+/// and the crash reporter collect `logs/agentd.log`. Nothing ever wrote it. The CLI launcher
+/// redirects to `agentd.out`/`agentd.err`, so that path looked fine; the DESKTOP app pipes the
+/// sidecar's output into the shell's own tracing instead, and on Windows — a GUI-subsystem parent
+/// spawning a console-subsystem child — that relay is exactly where output goes nowhere. The result
+/// was a daemon whose boot failures (a failed Playwright init, say) left no trace anywhere on disk,
+/// on the one platform where you most need one, while the diagnostics bundle promised a file that
+/// never existed.
+///
+/// Both sinks are routed through the [`local::logging`] redaction writer — a last-line scrub so no
+/// token / sealed blob / `~/.writ` path can reach stdout OR the file even if some field is logged
+/// by accident (defense in depth; handlers/stores already avoid logging secrets by construction).
+/// The file lands under the resolved `Paths` (so `WRIT_HOME` / a per-account profile keeps its own
+/// log next to its own data), rotates daily, and keeps 5 days. If the directory cannot be created —
+/// a read-only or sandboxed home — the daemon still boots with stdout alone rather than failing.
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{fmt, EnvFilter};
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
         .add_directive(
@@ -325,12 +455,36 @@ fn init_tracing() {
                 .parse()
                 .expect("static directive"),
         );
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_ansi(false) // the redacting writer forwards bytes verbatim; ANSI codes only add noise
-        .with_writer(local::logging::RedactingMakeWriter)
-        .init();
+
+    let file_layer = local::config::Paths::resolve().ok().and_then(|paths| {
+        let dir = paths.logs_dir();
+        std::fs::create_dir_all(&dir).ok()?;
+        tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("agentd.log")
+            .max_log_files(5)
+            .build(&dir)
+            .ok()
+            .map(|appender| {
+                fmt::layer()
+                    .with_writer(local::logging::Redacting(appender))
+                    .with_ansi(false)
+                    .with_target(true)
+            })
+    });
+
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        // stdout stays: a supervisor that DOES capture it (the CLI launcher, `tauri dev`)
+        // keeps working exactly as before, and a terminal run still shows everything live.
+        .with(
+            fmt::layer()
+                .with_writer(local::logging::RedactingMakeWriter)
+                .with_ansi(false)
+                .with_target(true),
+        )
+        .with(file_layer)
+        .try_init();
 }
 
 /// Tracing for `mcp` mode → stderr only (stdout is the JSON-RPC stream). Quiet by default (`warn`)

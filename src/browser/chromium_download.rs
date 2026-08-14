@@ -117,6 +117,58 @@ const HOST_BUILD: Option<ChromiumBuild> = {
     }
 };
 
+/// This platform's key in `resources/engine/chromium-pins.json`.
+///
+/// Lives HERE, next to [`HOST_BUILD`], because the two must agree: a platform we can DOWNLOAD a
+/// Chromium for must also have a pin key to VERIFY it with. They had drifted into two independent
+/// `cfg!` ladders — this module's (in a test) knew `windows-aarch64`, while the integrity gate's
+/// copy in `local::runtime_setup` listed only macOS×2 / windows-x86_64 / linux-x86_64. On ARM64
+/// Windows the download therefore SUCCEEDED and the gate then refused it with "no Chromium pin for
+/// this platform", and because that gate fails CLOSED, onboarding could **never** finish installing
+/// a browser on that platform — despite the pin for revision 1654438 being present in the file all
+/// along. One function, so a new platform cannot be half-added again.
+///
+/// `None` means "no published Chromium build for this platform" (e.g. arm64 Linux) — the same
+/// condition under which `HOST_BUILD` is `None`.
+// Its only non-test caller is the integrity gate in `local::runtime_setup`, which is behind the
+// `local` feature — so a default (cloud) lib build has no user for it and `-D warnings` rejects it
+// as dead. Kept present unconditionally rather than cfg'd away: the whole point of this function is
+// that ONE ladder answers "can we download it" and "can we verify it", and a copy that vanishes in
+// some builds is how those two drifted apart in the first place.
+#[cfg_attr(not(feature = "local"), allow(dead_code))]
+pub(crate) fn platform_pin_key() -> Option<&'static str> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some("macos-aarch64")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        Some("macos-x86_64")
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        Some("windows-x86_64")
+    }
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    {
+        Some("windows-aarch64")
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some("linux-x86_64")
+    }
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+    )))]
+    {
+        None
+    }
+}
+
 const SNAPSHOT_BASE: &str = "https://commondatastorage.googleapis.com/chromium-browser-snapshots";
 
 /// Root under which downloaded browsers are installed: `$WRIT_HOME/browsers` (else `~/.writ/browsers`).
@@ -328,6 +380,35 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A platform we can DOWNLOAD for must also be VERIFIABLE, and the pin must actually be in the
+    /// file. This is the invariant that broke on ARM64 Windows: `HOST_BUILD` had a `Win_Arm64` build
+    /// and `chromium-pins.json` had its digest, but the integrity gate's own copy of the platform
+    /// ladder had never learned `windows-aarch64` — so the gate refused every install, permanently.
+    /// Runs on whatever platform CI is on, and each of them asserts its own row.
+    #[test]
+    fn a_downloadable_platform_is_also_verifiable() {
+        let Some(build) = HOST_BUILD else {
+            assert!(
+                platform_pin_key().is_none(),
+                "no Chromium build for this platform, so it must not claim a pin key"
+            );
+            return;
+        };
+        let key = platform_pin_key()
+            .expect("this platform has a Chromium build, so it MUST have a pin key");
+
+        let pins: serde_json::Value =
+            serde_json::from_str(include_str!("../../resources/engine/chromium-pins.json"))
+                .expect("chromium-pins.json parses");
+        let digest = pins["pins"][build.position.to_string()][key].as_str();
+        assert!(
+            digest.is_some_and(|d| d.len() == 64 && d.chars().all(|c| c.is_ascii_hexdigit())),
+            "chromium-pins.json has no usable sha256 for revision {} on {key} — the fail-closed \
+             integrity gate would refuse every install on this platform",
+            build.position
+        );
+    }
+
     /// The pinned executable path must match what the resolver probes, per OS. If these drift, a
     /// download "succeeds" and the app still reports no browser — a failure with no obvious cause.
     #[test]
@@ -412,17 +493,7 @@ mod tests {
         let pins: serde_json::Value =
             serde_json::from_str(include_str!("../../resources/engine/chromium-pins.json")).unwrap();
         let build = HOST_BUILD.unwrap();
-        let key = if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-            "macos-aarch64"
-        } else if cfg!(target_os = "macos") {
-            "macos-x86_64"
-        } else if cfg!(target_os = "windows") && cfg!(target_arch = "aarch64") {
-            "windows-aarch64"
-        } else if cfg!(target_os = "windows") {
-            "windows-x86_64"
-        } else {
-            "linux-x86_64"
-        };
+        let key = platform_pin_key().expect("a downloadable platform must have a pin key");
         let want = pins["pins"][build.position.to_string()][key]
             .as_str()
             .expect("a pin must exist for this platform/revision");

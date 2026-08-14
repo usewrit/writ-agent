@@ -189,8 +189,13 @@ mod tests {
         let res = tempfile::tempdir().unwrap();
         let exe = res.path().join("Chromium");
         std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        // A REAL driver layout — `driver.bundled` now requires node[.exe] + package/cli.js to be
+        // present, not merely a directory that exists (an empty dir could never launch anything).
         let driver = res.path().join("driver");
-        std::fs::create_dir_all(&driver).unwrap();
+        std::fs::create_dir_all(driver.join("package")).unwrap();
+        std::fs::write(driver.join("package").join("cli.js"), "").unwrap();
+        std::fs::write(driver.join("node"), "").unwrap();
+        std::fs::write(driver.join("node.exe"), "").unwrap();
         std::env::set_var(ENV_BUNDLED_CHROMIUM, &exe);
         std::env::set_var(ENV_BUNDLED_DRIVER, &driver);
 

@@ -140,7 +140,9 @@ async fn rekey_db_file(path: &std::path::Path, old_key_hex: &str, new_key_hex: &
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{ConnectOptions, Connection};
 
-    let old_keyed = format!("'{}'", old_key_hex.replace('\'', "''"));
+    // Same key form the daemon's pool uses (raw-key for a real hex key — see db::key_pragma_value),
+    // so this opens the live, already-raw-keyed file rather than failing as a passphrase mismatch.
+    let old_keyed = super::db::key_pragma_value(old_key_hex);
     let mut conn = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
@@ -157,7 +159,8 @@ async fn rekey_db_file(path: &std::path::Path, old_key_hex: &str, new_key_hex: &
         return Err(LocalError::CipherUnavailable);
     }
 
-    let new_keyed = format!("'{}'", new_key_hex.replace('\'', "''"));
+    // Rekey to the raw-key form too, so the rotated DB keeps skipping per-connection PBKDF2.
+    let new_keyed = super::db::key_pragma_value(new_key_hex);
     sqlx::query(&format!("PRAGMA rekey = {new_keyed}"))
         .execute(&mut conn)
         .await
@@ -356,20 +359,35 @@ fn decode_root_hex(s: &str) -> LocalResult<[u8; 32]> {
 }
 
 /// Does the SQLCipher DB at `path` open (i.e. decrypt page 1) under `key_hex`? Non-mutating probe.
+///
+/// Tries BOTH key forms. A 64-hex key is applied as SQLCipher's RAW key (`x'<hex>'`) by `db::open`,
+/// but a file written before that migration is still under the PASSPHRASE form (`'<hex>'`) — and
+/// this probe decides which key a rotation is mid-way through, so a false "does not open" sends
+/// crash recovery down the wrong branch. Building only the passphrase form made it answer `false`
+/// for every DB the current daemon writes.
 async fn db_opens_under(path: &Path, key_hex: &str) -> bool {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    let keyed = format!("'{}'", key_hex.replace('\'', "''"));
-    let opts = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(false)
-        .pragma("key", keyed)
-        .pragma("busy_timeout", "5000");
-    let Ok(pool) = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await else {
-        return false;
-    };
-    let ok = sqlx::query("SELECT count(*) FROM sqlite_master").fetch_one(&pool).await.is_ok();
-    pool.close().await;
-    ok
+    let mut forms = vec![super::db::key_pragma_value(key_hex)];
+    let pass = super::db::passphrase_pragma_value(key_hex);
+    if forms[0] != pass {
+        forms.push(pass);
+    }
+    for keyed in forms {
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .pragma("key", keyed)
+            .pragma("busy_timeout", "5000");
+        let Ok(pool) = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await else {
+            continue;
+        };
+        let ok = sqlx::query("SELECT count(*) FROM sqlite_master").fetch_one(&pool).await.is_ok();
+        pool.close().await;
+        if ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// Complete a vault rotation that a crash interrupted before it could persist the new root.

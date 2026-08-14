@@ -33,6 +33,39 @@ pub struct PlaywrightServer {
     /// In production code, you should use the Connection layer instead of
     /// accessing the process directly.
     pub process: Child,
+
+    /// writ-agent patch: the last few lines the driver wrote to STDERR.
+    ///
+    /// The driver's stderr was drained into `tracing::debug!` and otherwise discarded. When the
+    /// handshake then failed, the caller reported only "Playwright initialization timeout after 30
+    /// seconds" — while node had usually already explained itself on stderr (bad architecture,
+    /// missing DLL, unreadable bundle) at a log level nobody runs in production. Keep a bounded tail
+    /// so the failure can carry the reason. Bounded, so a chatty driver cannot grow it without limit.
+    pub stderr_tail: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+
+/// How many trailing stderr lines to keep for diagnostics.
+const STDERR_TAIL_LINES: usize = 20;
+
+impl PlaywrightServer {
+    /// writ-agent patch: a one-line summary of why the driver may have failed — its exit status (if
+    /// it has already died) plus the tail of its stderr. Empty string when there is nothing to add.
+    pub fn failure_context(&mut self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        match self.process.try_wait() {
+            Ok(Some(status)) => parts.push(format!("driver process exited with {status}")),
+            Ok(None) => parts.push("driver process still running".to_string()),
+            Err(e) => parts.push(format!("could not query driver process: {e}")),
+        }
+        let tail = self.stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
+        if !tail.is_empty() {
+            parts.push(format!(
+                "driver stderr: {}",
+                tail.iter().cloned().collect::<Vec<_>>().join(" | ")
+            ));
+        }
+        parts.join("; ")
+    }
 }
 
 impl PlaywrightServer {
@@ -53,6 +86,14 @@ impl PlaywrightServer {
         // Get the driver executable paths
         // The driver should already be downloaded by build.rs
         let (node_exe, cli_js) = get_driver_executable()?;
+
+        // writ-agent patch: name the driver being spawned. Every "Playwright timed out" report so
+        // far had to be debugged by hand because nothing in a shipped build said WHICH `node` ran.
+        tracing::info!(
+            node = %node_exe.display(),
+            cli = %cli_js.display(),
+            "spawning the Playwright driver"
+        );
 
         // Launch the server process. Stderr is piped (not inherited)
         // because the Node driver writes terminal-capability queries
@@ -90,6 +131,26 @@ impl PlaywrightServer {
             cmd.process_group(0);
         }
 
+        // writ-agent patch: CREATE_NO_WINDOW on Windows.
+        //
+        // `node.exe` is a CONSOLE-subsystem program. When the parent has no console of its own —
+        // which is exactly the case for the daemon spawned as a Tauri SIDECAR from a
+        // `windows_subsystem = "windows"` GUI shell — Windows ALLOCATES a fresh console (and a
+        // conhost.exe) for the child unless a creation flag says otherwise. That is both a visible
+        // console flash and real startup work that the same binary does not do when it is launched
+        // from a PowerShell window, where a console already exists to inherit. It matches the
+        // reported behaviour precisely: running the sidecar by hand in a terminal works, the same
+        // build spawned by the desktop app hangs in the driver handshake.
+        //
+        // CREATE_NO_WINDOW keeps the child console-less and windowless. Playwright's own Node
+        // implementation does the same thing (`windowsHide: true`), so this matches upstream rather
+        // than diverging from it. stdio is piped either way, so nothing about the protocol changes.
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::LaunchFailed(format!("Failed to spawn process: {}", e)))?;
@@ -99,13 +160,24 @@ impl PlaywrightServer {
         // block the driver's writes; we don't want that. Bytes are
         // forwarded line-by-line via `tracing::debug!` so they're
         // accessible when needed without polluting the terminal.
+        // writ-agent patch: ALSO retain a bounded tail, so a failed handshake can report what the
+        // driver said instead of only that it timed out.
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<String>::with_capacity(STDERR_TAIL_LINES),
+        ));
         if let Some(stderr) = child.stderr.take() {
+            let tail = std::sync::Arc::clone(&stderr_tail);
             tokio::spawn(
                 async move {
                     use tokio::io::{AsyncBufReadExt, BufReader};
                     let mut lines = BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         tracing::debug!(target: "playwright_rs::driver_stderr", "{}", line);
+                        let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
+                        if t.len() == STDERR_TAIL_LINES {
+                            t.pop_front();
+                        }
+                        t.push_back(line);
                     }
                 }
                 .in_current_span(),
@@ -134,7 +206,7 @@ impl PlaywrightServer {
             }
         }
 
-        Ok(Self { process: child })
+        Ok(Self { process: child, stderr_tail })
     }
 
     /// Shut down the server gracefully

@@ -47,15 +47,53 @@ pub const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// `config.toml` `CONFIG_SCHEMA_VERSION` (that versions the TOML file shape, this versions the DB).
 pub const APP_SCHEMA_VERSION: u32 = 1;
 
-/// Open (creating if needed) the SQLCipher-encrypted DB at `path` with raw `key`, assert the
-/// cipher is genuinely active (fail-closed), apply pragmas, and run migrations.
+/// True when `key` is a clean 64-char lowercase-or-uppercase hex string — i.e. a raw 256-bit
+/// SQLCipher key (32 bytes), as the vault mints ([`vault`]). Only such a key may use the raw-key
+/// PRAGMA form; anything else (a test passphrase) falls back to the passphrase form.
+fn is_raw_hex_key(key: &str) -> bool {
+    key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The `PRAGMA key`/`rekey` VALUE for `key`, choosing the form that is correct AND fast.
+///
+/// A full-entropy 256-bit key is passed as SQLCipher's **raw key** — `"x'<hex>'"` — so the bytes
+/// are used DIRECTLY as the AES-256 key. The alternative, a passphrase (`'<hex>'`), makes SQLCipher
+/// run **256,000 PBKDF2-HMAC-SHA512 iterations to derive the key on EVERY connection open**. That
+/// stretching exists to make a low-entropy password expensive to brute-force; a random 256-bit key
+/// has nothing to stretch, so the KDF is pure waste — and on an ARM64 Windows build whose bundled
+/// OpenSSL lacks SHA hardware acceleration it costs ~4 seconds PER connection, stalling the pool and
+/// every API call that waits on it (observed: `PRAGMA key` elapsed 3.9s, connection acquire 4.1s).
+/// Raw-key open is sub-millisecond.
+///
+/// A non-hex `key` (only ever a test passphrase) keeps the passphrase form, so its create+reopen
+/// stay mutually consistent.
+pub(crate) fn key_pragma_value(key: &str) -> String {
+    if is_raw_hex_key(key) {
+        // SQLCipher's documented raw-key literal: the value IS the string x'<hex>'.
+        format!("\"x'{key}'\"")
+    } else {
+        format!("'{}'", key.replace('\'', "''"))
+    }
+}
+
+/// Legacy passphrase form of `key` (`'<hex>'`), used only to open a pre-migration DB so it can be
+/// rekeyed to the raw form. Never used for a normal open.
+///
+/// `pub(crate)` for the probes that must accept a DB in EITHER form while the migration is in
+/// flight (`can_open_under_key`, `vault_rotate::db_opens_under`). Every site that OPENS a DB for
+/// real use must go through [`key_pragma_value`] instead.
+pub(crate) fn passphrase_pragma_value(key: &str) -> String {
+    format!("'{}'", key.replace('\'', "''"))
+}
+
+/// Open (creating if needed) the SQLCipher-encrypted DB at `path` with `key`, assert the cipher is
+/// genuinely active (fail-closed), apply pragmas, and run migrations. Uses the raw-key PRAGMA form
+/// for a real vault key (no per-connection PBKDF2) — see [`key_pragma_value`].
 pub async fn open(path: &Path, key: &str) -> LocalResult<SqlitePool> {
-    // SQLCipher needs the key value quoted inside the PRAGMA; escape any embedded quote.
-    let keyed = format!("'{}'", key.replace('\'', "''"));
     let opts = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .pragma("key", keyed) // MUST precede any access to the encrypted DB
+        .pragma("key", key_pragma_value(key)) // MUST precede any access to the encrypted DB
         .pragma("foreign_keys", "ON")
         .pragma("journal_mode", "WAL")
         .pragma("busy_timeout", "5000");
@@ -72,6 +110,45 @@ pub async fn open(path: &Path, key: &str) -> LocalResult<SqlitePool> {
         .await
         .map_err(|e| LocalError::Migrate(e.to_string()))?;
     Ok(pool)
+}
+
+/// One-time, NON-DESTRUCTIVE upgrade of a legacy passphrase-keyed DB to the raw-key form, so every
+/// later open skips PBKDF2. Called only after a raw-key [`open`] has already FAILED as unreadable.
+///
+/// Opens `path` under the OLD passphrase form (no create, no migrations); if — and only if — that
+/// decrypts cleanly (cipher active + integrity passes, proving the file is genuinely ours, just
+/// old-format), it `PRAGMA rekey`s the file in place to the raw key. Returns:
+///   * `Ok(true)`  — migrated; the caller should retry [`open`], which now succeeds with data intact;
+///   * `Ok(false)` — not a legacy DB we own (passphrase didn't open it) → leave it for normal
+///                   corrupt-recovery, which must not be pre-empted;
+///   * `Err(_)`    — the rekey itself started but failed.
+///
+/// A no-op (returns `Ok(false)`) unless `key` is a raw-hex vault key, since only those change form.
+async fn rekey_passphrase_to_raw(path: &Path, key: &str) -> LocalResult<bool> {
+    if !path.exists() || !is_raw_hex_key(key) {
+        return Ok(false);
+    }
+    let opts = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .pragma("key", passphrase_pragma_value(key))
+        .pragma("busy_timeout", "5000");
+    let Ok(pool) = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await else {
+        return Ok(false); // not openable under the passphrase either — not our migration to make
+    };
+    // Prove it actually decrypts before we rewrite a single page. A wrong key surfaces here as an
+    // integrity/`code 26` failure, so we never rekey a file that isn't provably the old-format DB.
+    if assert_cipher_active(&pool).await.is_err() || integrity_check(&pool).await.is_err() {
+        pool.close().await;
+        return Ok(false);
+    }
+    // Re-encrypt in place with the raw key (SQLCipher rewrites every page under the new key).
+    let sql = format!("PRAGMA rekey = {}", key_pragma_value(key));
+    let res = sqlx::query(&sql).execute(&pool).await;
+    pool.close().await;
+    res.map_err(LocalError::Db)?;
+    tracing::info!("migrated local DB to a raw SQLCipher key (per-connection PBKDF2 eliminated)");
+    Ok(true)
 }
 
 /// Boot-time managed open: keep the daemon bootable in the face of an unusable DB (recover from a
@@ -93,11 +170,20 @@ pub async fn open_managed(path: &Path, key: &str) -> LocalResult<SqlitePool> {
     let pool = match open(path, key).await {
         Ok(pool) => pool,
         Err(e) if is_recoverable_open_failure(&e) => {
+            // BEFORE treating the file as corrupt: a DB written by an older build used the passphrase
+            // key form, which the new raw-key `open` rejects as "not a database" (code 26) — the exact
+            // shape of a recoverable failure. Try the one-time passphrase→raw migration first; if it
+            // converts (proven by a clean passphrase decrypt), the retried [`open`] succeeds with the
+            // user's data intact. Only if the file is NOT a legacy DB do we fall through to recovery,
+            // so a real upgrade never loses data to quarantine.
+            if rekey_passphrase_to_raw(path, key).await.unwrap_or(false) {
+                open(path, key).await?
+            }
             // A `Corrupt` error means the cipher already decrypted page 1 (right key, damaged data),
             // so SQLCipher is provably linked. A driver "not a database" refusal is ambiguous — it is
             // ALSO what a plain-SQLite build yields on an encrypted file — so gate that branch on a
             // real cipher probe and fail closed if the cipher isn't linked (never discard a good DB).
-            if matches!(e, LocalError::Corrupt(_)) || cipher_linked().await {
+            else if matches!(e, LocalError::Corrupt(_)) || cipher_linked().await {
                 recover_or_start_fresh(path, key, &e.to_string()).await?
             } else {
                 return Err(LocalError::CipherUnavailable);
@@ -232,18 +318,30 @@ async fn can_open_under_key(path: &Path, key: &str) -> bool {
     if !path.exists() {
         return false;
     }
-    let keyed = format!("'{}'", key.replace('\'', "''"));
-    let opts = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(false)
-        .pragma("key", keyed)
-        .pragma("busy_timeout", "5000");
-    let Ok(pool) = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await else {
-        return false;
-    };
-    let ok = assert_cipher_active(&pool).await.is_ok() && integrity_check(&pool).await.is_ok();
-    pool.close().await;
-    ok
+    // A sibling backup may be in EITHER key form: newer copies are raw-key, pre-migration ones are
+    // passphrase. Probe raw first (what current opens produce), then fall back to passphrase, so a
+    // recoverable backup is found regardless of when it was written.
+    let mut forms = vec![key_pragma_value(key)];
+    let pass = passphrase_pragma_value(key);
+    if forms[0] != pass {
+        forms.push(pass);
+    }
+    for keyed in forms {
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .pragma("key", keyed)
+            .pragma("busy_timeout", "5000");
+        let Ok(pool) = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await else {
+            continue;
+        };
+        let ok = assert_cipher_active(&pool).await.is_ok() && integrity_check(&pool).await.is_ok();
+        pool.close().await;
+        if ok {
+            return true;
+        }
+    }
+    false
 }
 
 /// Is SQLCipher actually linked into this binary? Probes an in-memory DB's `PRAGMA cipher_version`
@@ -389,6 +487,68 @@ mod tests {
         assert!(
             !bytes.starts_with(b"SQLite format 3\0"),
             "DB must be SQLCipher-encrypted at rest"
+        );
+    }
+
+    /// A real 64-hex vault key uses the raw-key form; a passphrase keeps the passphrase form.
+    #[test]
+    fn key_form_is_raw_only_for_a_full_hex_key() {
+        let hex = "e4d170b7e13d345279997ffe7d9c1f7a292ae4c5989b2ac314f36fb79999be97";
+        assert!(is_raw_hex_key(hex));
+        assert_eq!(key_pragma_value(hex), format!("\"x'{hex}'\""));
+        // Not 64 hex chars → passphrase form (so tests / any non-vault key stay self-consistent).
+        assert!(!is_raw_hex_key("managed-key"));
+        assert_eq!(key_pragma_value("managed-key"), "'managed-key'");
+        assert!(!is_raw_hex_key(&"z".repeat(64))); // right length, not hex
+    }
+
+    /// A DB written by an OLDER build under the passphrase key form must open under the new raw-key
+    /// `open_managed` WITH ITS DATA INTACT — the one-time rekey migration, not a quarantine-and-wipe.
+    #[tokio::test]
+    async fn legacy_passphrase_db_migrates_to_raw_key_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        let key = "e4d170b7e13d345279997ffe7d9c1f7a292ae4c5989b2ac314f36fb79999be97";
+
+        // 1. Simulate the OLD on-disk format: create + migrate the DB under the PASSPHRASE form and
+        //    insert a marker row, exactly as a pre-fix build would have left it.
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .pragma("key", passphrase_pragma_value(key))
+                .pragma("journal_mode", "WAL");
+            let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+            assert_cipher_active(&pool).await.unwrap();
+            MIGRATOR.run(&pool).await.unwrap();
+            sqlx::query("INSERT INTO config (key, value) VALUES ('marker', 'survives')")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+
+        // 2. A raw-key open must FAIL on that passphrase DB (proving the forms really differ, so the
+        //    migration path is actually exercised rather than silently opening).
+        assert!(open(&path, key).await.is_err(), "raw open must reject a passphrase-keyed DB");
+
+        // 3. open_managed migrates it in place and comes up with the marker row intact.
+        let pool = open_managed(&path, key).await.expect("managed open migrates the legacy DB");
+        let v: String = sqlx::query("SELECT value FROM config WHERE key = 'marker'")
+            .fetch_one(&pool)
+            .await
+            .expect("marker row survived the rekey")
+            .try_get(0)
+            .unwrap();
+        assert_eq!(v, "survives");
+        pool.close().await;
+
+        // 4. The file is now raw-keyed: a plain raw-key open succeeds directly (no migration needed),
+        //    and the passphrase form no longer opens it.
+        open(&path, key).await.expect("raw open works after migration").close().await;
+        assert!(
+            !can_open_under_key(&path, "e4d170b7e13d345279997ffe7d9c1f7a292ae4c5989b2ac314f36fb70000000").await,
+            "a WRONG key must not open the migrated DB"
         );
     }
 

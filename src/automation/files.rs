@@ -191,6 +191,23 @@ impl RunFiles {
     /// The signed GET URL is single-object, short-TTL (§10.4). Returns the local path
     /// (cleaned up at run end via [`cleanup_temps`]).
     pub async fn fetch_to_temp(&self, desc: &ResolvedFile) -> anyhow::Result<PathBuf> {
+        self.fetch_to_temp_authed(desc, None).await
+    }
+
+    /// [`fetch_to_temp`] with an optional bearer token.
+    ///
+    /// A run's file URLs are pre-signed, so they carry their own authorization and
+    /// `bearer` is `None` — that is the whole reason a signed URL exists. The desktop
+    /// RECORD path is the exception: the client answers an upload prompt with its own
+    /// daemon's `/v1/files/{id}/content`, which is an ordinary authenticated route, and
+    /// the daemon 401s every `/v1/*` request without a bearer. Fetching it bare returned
+    /// HTTP 401, which surfaced only as "continuing unbound" — the chooser was dismissed
+    /// empty and the page uploaded nothing, with no visible error.
+    pub async fn fetch_to_temp_authed(
+        &self,
+        desc: &ResolvedFile,
+        bearer: Option<&str>,
+    ) -> anyhow::Result<PathBuf> {
         if desc.url.is_empty() {
             anyhow::bail!("file descriptor has no signed URL");
         }
@@ -208,13 +225,25 @@ impl RunFiles {
         let tmp = unique_temp_path("psfile_", &suffix);
 
         let client = reqwest::Client::new();
-        let resp = client
+        let mut req = client
             .get(&desc.url)
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(120));
+        if let Some(token) = bearer.filter(|t| !t.is_empty()) {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("fetch stored file failed: {}", e))?;
         if !resp.status().is_success() {
+            // Name the 401 explicitly: the generic message sent every past investigation
+            // looking at storage/SSRF instead of at a missing credential.
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+                anyhow::bail!(
+                    "fetch stored file failed: HTTP 401 — the URL needs a bearer token \
+                     and none was supplied (a pre-signed URL should not need one)"
+                );
+            }
             anyhow::bail!("fetch stored file failed: HTTP {}", resp.status());
         }
         let bytes = resp

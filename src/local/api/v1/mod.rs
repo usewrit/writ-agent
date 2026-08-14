@@ -28,6 +28,7 @@ pub mod extractors;
 pub mod files;
 pub mod hooks;
 pub mod keys;
+pub mod lifecycle;
 pub mod mcp_connect;
 pub mod monitors;
 pub mod network;
@@ -92,6 +93,7 @@ pub fn router() -> Router<AppState> {
         .merge(notifications::router())
         .merge(ws_ticket::router())
         .merge(update::router())
+        .merge(lifecycle::router())
         .merge(token::router());
     // Cloud-only REST surfaces are merged only when the `cloud` feature is compiled in.
     #[cfg(feature = "cloud")]

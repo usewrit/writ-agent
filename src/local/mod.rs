@@ -16,6 +16,10 @@ pub mod data_query;
 pub mod db;
 pub mod backup;
 pub mod retention;
+// The single seam every OS-keyring entry is opened through (vault root, cloud token, channel key,
+// relay credential). Production is a pass-through; `cfg(test)` swaps in an in-memory store so unit
+// tests neither touch the developer's real Keychain nor contend on it under the parallel run.
+pub mod keyring_store;
 pub mod vault;
 pub mod vault_lock;
 pub mod vault_recovery;
@@ -56,6 +60,7 @@ pub mod cloud;
 // `ip_relay` feature so no default build (managed desktop included) compiles it.
 #[cfg(feature = "ip_relay")]
 pub mod relay;
+pub mod shutdown;
 pub mod server;
 pub mod store;
 pub mod api;

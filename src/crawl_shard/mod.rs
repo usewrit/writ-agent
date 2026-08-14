@@ -3166,18 +3166,20 @@ mod tests {
         // the measured deadline. The property under test is "one delay apart, not
         // all at once", so absorb that rather than asserting to the microsecond.
         const TOL: Duration = Duration::from_millis(5);
-        // Four requests, three gaps: the batch must span at least three delays. A
-        // per-worker sleep would fire all four after ONE delay.
-        assert!(
-            stamps[3].duration_since(start) + TOL >= Duration::from_millis(90),
-            "four requests took {:?} — the window outpaced delay_ms",
-            stamps[3].duration_since(start),
-        );
-        for (n, pair) in stamps.windows(2).enumerate() {
+        // Measure every stamp against `start`, never against its predecessor. The pacer gives
+        // slot k the deadline `start + k * delay` and a sleep can only overshoot it — but an
+        // overshoot on stamp k SHORTENS the k→k+1 gap by exactly what it added to k-1→k, so a
+        // pairwise-gap assertion fails on a loaded machine even when pacing held perfectly
+        // (observed: "gap 2 was 20.3ms" under a 30ms delay). Distances from `start` only ever
+        // grow under load, so they state the same property in a jitter-proof way — and they pin
+        // all four stamps, not just the last. A per-worker sleep fires the whole window after ONE
+        // delay, which fails at k = 2.
+        for (k, stamp) in stamps.iter().enumerate() {
+            let paced_to = Duration::from_millis(30) * k as u32;
             assert!(
-                pair[1].duration_since(pair[0]) + TOL >= Duration::from_millis(30),
-                "gap {n} was {:?}, under the configured delay",
-                pair[1].duration_since(pair[0]),
+                stamp.duration_since(start) + TOL >= paced_to,
+                "request {k} landed {:?} after start, inside the {paced_to:?} its slot was paced to",
+                stamp.duration_since(start),
             );
         }
     }

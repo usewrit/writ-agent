@@ -136,7 +136,22 @@ impl Playwright {
 
         // 5. Initialize Playwright (sends initialize message, waits for Playwright object)
         tracing::debug!("Initializing Playwright protocol");
-        let playwright_obj = connection.initialize_playwright().await?;
+        // writ-agent patch: on failure, attach WHY. The handshake previously surfaced as a bare
+        // "Playwright initialization timeout after 30 seconds" — indistinguishable between a driver
+        // that died on startup (wrong architecture, missing DLL, unreadable bundle) and one that is
+        // merely slow, because the only liveness check happens 100ms after spawn and the driver's
+        // own stderr was logged at DEBUG. Both answers are available here; report them.
+        let playwright_obj = match connection.initialize_playwright().await {
+            Ok(obj) => obj,
+            Err(e) => {
+                let context = server.failure_context();
+                let _ = server.shutdown().await;
+                return Err(crate::error::Error::ServerError(format!(
+                    "Playwright driver handshake failed: {e}{}{context}",
+                    if context.is_empty() { "" } else { " — " }
+                )));
+            }
+        };
 
         // 6. Downcast to Playwright type using get_typed
         let guid = playwright_obj.guid().to_string();

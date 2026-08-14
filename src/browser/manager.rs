@@ -15,13 +15,14 @@ use super::stealth;
 /// concept. The cloud agent ships no browser (it uses whatever the fleet image installed), so on the
 /// default build this is always `None` and every launch path behaves exactly as it did before —
 /// which is what keeps the cloud build byte-clean of the local backend.
-fn bundled_chromium_exe() -> Option<std::path::PathBuf> {
+fn bundled_chromium_exe_for(headless: bool) -> Option<std::path::PathBuf> {
     #[cfg(feature = "local")]
     {
-        crate::local::runtime_setup::bundled_chromium_exe()
+        crate::local::runtime_setup::bundled_chromium_exe_for(headless)
     }
     #[cfg(not(feature = "local"))]
     {
+        let _ = headless;
         None
     }
 }
@@ -47,6 +48,25 @@ const CONTEXT_SLOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// How often the per-context slot watcher re-checks whether its context has closed. Small enough
 /// that a freed slot is reusable promptly, large enough that `limit` sleeping tasks cost nothing.
 const CONTEXT_SLOT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long to wait for the browser PROCESS to come up, in ms.
+///
+/// Playwright's default is 30s, which is fine for a warm launch and far too tight for a COLD one on
+/// Windows: the first start after an install/download has an antivirus reading every file of a
+/// freshly-extracted ~200 MB Chromium before the process makes progress, and an x64 build running
+/// under emulation on an ARM64 machine is slower again. Users hit "browser takes a long time, then
+/// Playwright times out after 30s" on exactly that first launch — a timeout that reports a
+/// PERMANENT failure for what was only a slow start, and then discards the work already done.
+/// Generous here costs nothing when the browser is healthy (it resolves as soon as it is up) and
+/// turns a hard failure into a wait on a cold machine.
+const BROWSER_LAUNCH_TIMEOUT_MS: f64 = 120_000.0;
+
+/// Launch budget for the LAST-RESORT fallback (no channel, no executablePath → the driver's own
+/// compile-time pinned revision). That directory belongs to the machine that built the driver, so on
+/// a user's install it typically does not exist and the attempt cannot succeed; keep it short so a
+/// failed real launch surfaces its error promptly instead of making the user wait out a second full
+/// timeout on a hopeless retry.
+const FALLBACK_LAUNCH_TIMEOUT_MS: f64 = 15_000.0;
 
 /// Resolve the Playwright driver override into the PROCESS ENVIRONMENT — exactly once, and from a
 /// SYNCHRONOUS context.
@@ -85,52 +105,99 @@ const CONTEXT_SLOT_POLL: std::time::Duration = std::time::Duration::from_millis(
 /// `PLAYWRIGHT_DRIVER_PATH`, which the vendored resolver ranks ABOVE them and would let a vanilla
 /// sibling driver silently shadow patchright's stealth one.
 pub fn init_driver_env() {
-    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let _ = driver_init();
+}
+
+/// What [`init_driver_env`] decided, recorded so it can be LOGGED once tracing exists.
+///
+/// `init_driver_env` runs in the SYNCHRONOUS prologue of `main`, BEFORE `init_tracing()` — it has
+/// to, because it writes the process environment and that must happen while the process is still
+/// single-threaded. Every `tracing::info!`/`warn!` it emitted was therefore written to a subscriber
+/// that did not exist yet and **silently discarded**. The result: on the one platform where driver
+/// resolution keeps failing, the log contained NO line naming the driver, no "patchright driver not
+/// found", and none of the `candidates_tried` diagnostics — the daemon looked like it had never
+/// tried. Decide here, log from [`log_driver_init`] after the subscriber is installed.
+#[derive(Debug, Clone)]
+pub enum DriverInit {
+    /// `PLAYWRIGHT_DRIVER_PATH` / `PLAYWRIGHT_NODE_EXE` was already set by an operator.
+    OperatorOverride,
+    /// patchright's stealth driver, resolved and exported.
+    Patchright { node: std::path::PathBuf },
+    /// `WRIT_DISABLE_PATCHRIGHT` forced vanilla, and a sibling driver was found.
+    VanillaByRequest { node: Option<std::path::PathBuf> },
+    /// No patchright driver; fell back to a driver shipped next to this binary.
+    VanillaSibling { node: std::path::PathBuf },
+    /// Nothing resolved — the compile-time baked path is all that is left, and it is a path on the
+    /// machine that BUILT this binary, so a browser launch will fail late and opaquely.
+    CompileTimeOnly,
+}
+
+fn driver_init() -> &'static DriverInit {
+    static DONE: std::sync::OnceLock<DriverInit> = std::sync::OnceLock::new();
     DONE.get_or_init(|| {
         // `PLAYWRIGHT_DRIVER_PATH` outranks everything this function can set, so an operator who
         // pinned one has already decided; touching the pair below would be a no-op at best.
         if std::env::var_os("PLAYWRIGHT_DRIVER_PATH").is_some()
             || std::env::var_os("PLAYWRIGHT_NODE_EXE").is_some()
         {
-            return; // operator override already in place
+            return DriverInit::OperatorOverride;
         }
 
         let disable_patchright = std::env::var_os("WRIT_DISABLE_PATCHRIGHT").is_some();
-        if disable_patchright {
-            tracing::warn!("WRIT_DISABLE_PATCHRIGHT set — using vanilla Playwright (no stealth)");
-        } else if let Some((node, cli)) = crate::browser::install::find_patchright_driver() {
-            std::env::set_var("PLAYWRIGHT_NODE_EXE", &node);
-            std::env::set_var("PLAYWRIGHT_CLI_JS", &cli);
-            tracing::info!(
-                driver = %node.display(),
-                "Using patchright stealth driver (Runtime.enable suppressed)"
-            );
-            return;
-        } else {
-            tracing::warn!(
-                "patchright driver not found — falling back to vanilla Playwright \
-                 (DETECTABLE by anti-bot + slower). Install with `patchright install` \
-                 (or set WRIT_PATCHRIGHT_DRIVER)."
-            );
+        if !disable_patchright {
+            if let Some((node, cli)) = crate::browser::install::find_patchright_driver() {
+                std::env::set_var("PLAYWRIGHT_NODE_EXE", &node);
+                std::env::set_var("PLAYWRIGHT_CLI_JS", &cli);
+                return DriverInit::Patchright { node };
+            }
         }
 
         // Vanilla path. Prefer a driver that travelled with this binary over the compile-time one,
         // which only exists on the machine that built it.
-        match crate::browser::install::find_sibling_driver() {
-            Some((node, cli)) => {
-                std::env::set_var("PLAYWRIGHT_NODE_EXE", &node);
-                std::env::set_var("PLAYWRIGHT_CLI_JS", &cli);
-                tracing::info!(
-                    driver = %node.display(),
-                    "Using the Playwright driver shipped alongside this binary"
-                );
-            }
-            None => tracing::debug!(
-                "no sibling Playwright driver found — relying on the compile-time bundled path \
-                 (valid only on the machine that built this binary)"
-            ),
+        let sibling = crate::browser::install::find_sibling_driver();
+        if let Some((node, cli)) = &sibling {
+            std::env::set_var("PLAYWRIGHT_NODE_EXE", node);
+            std::env::set_var("PLAYWRIGHT_CLI_JS", cli);
         }
-    });
+        match (disable_patchright, sibling) {
+            (true, s) => DriverInit::VanillaByRequest { node: s.map(|(n, _)| n) },
+            (false, Some((node, _))) => DriverInit::VanillaSibling { node },
+            (false, None) => DriverInit::CompileTimeOnly,
+        }
+    })
+}
+
+/// Emit [`init_driver_env`]'s decision into tracing. Call ONCE, right after the subscriber is
+/// installed. Safe to call before `init_driver_env` (it resolves on first use either way) and safe
+/// to call more than once — the decision itself is made at most once.
+///
+/// This is the line that answers "which node.exe is the driver, and where did it come from" when a
+/// Playwright handshake times out. Without it that question is unanswerable from a shipped build.
+pub fn log_driver_init() {
+    match driver_init() {
+        DriverInit::OperatorOverride => tracing::info!(
+            driver = ?std::env::var_os("PLAYWRIGHT_NODE_EXE"),
+            "Playwright driver pinned by the environment (operator override)"
+        ),
+        DriverInit::Patchright { node } => tracing::info!(
+            driver = %node.display(),
+            "Using patchright stealth driver (Runtime.enable suppressed)"
+        ),
+        DriverInit::VanillaByRequest { node } => tracing::warn!(
+            driver = ?node.as_ref().map(|n| n.display().to_string()),
+            "WRIT_DISABLE_PATCHRIGHT set — using vanilla Playwright (no stealth)"
+        ),
+        DriverInit::VanillaSibling { node } => tracing::warn!(
+            driver = %node.display(),
+            "patchright driver not found — using the vanilla Playwright driver shipped alongside \
+             this binary (DETECTABLE by anti-bot + slower)"
+        ),
+        DriverInit::CompileTimeOnly => tracing::error!(
+            "NO Playwright driver resolved — falling back to the compile-time baked path, which is \
+             a path on the machine that BUILT this binary. Browser launches will fail. Set \
+             WRIT_PATCHRIGHT_DRIVER or reinstall."
+        ),
+    }
 }
 
 /// Reduce a proxy `server` string to the only part that is safe to log: `scheme://host[:port]`.
@@ -339,10 +406,15 @@ impl BrowserManager {
 
         let mut pw_lock = self.pw.lock().await;
         if pw_lock.is_none() {
+            // TIMED. This spawns the driver's `node` and completes the JSON-pipe handshake, and it
+            // is the first half of the wait between "start recording" and a visible page. Without
+            // the number there is no way to tell a slow driver handshake (an emulated x64 `node`,
+            // an antivirus scanning the driver tree on first touch) from a slow browser launch.
+            let t0 = std::time::Instant::now();
             let pw = playwright_rs::Playwright::launch().await
                 .map_err(|e| anyhow::anyhow!("Playwright init failed: {}", e))?;
             *pw_lock = Some(pw);
-            tracing::info!("Playwright initialized");
+            tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "Playwright initialized");
         }
         drop(pw_lock);
 
@@ -450,7 +522,9 @@ impl BrowserManager {
         // Drive the browser we ship, when we ship one. Without an explicit executablePath the driver
         // resolves whatever sits at its OWN pinned-revision path, so the baseline could be captured
         // from a different browser build than the one the app reports and replays with.
-        if let Some(exe) = bundled_chromium_exe() {
+        // `true`: this builder sets `.headless(true)` above, so ask for the HEADLESS binary.
+        // Handing over the full browser here is what put a visible window on screen.
+        if let Some(exe) = bundled_chromium_exe_for(true) {
             opts_builder = opts_builder.executable_path(exe.to_string_lossy().into_owned());
         }
         let opts = opts_builder.build();
@@ -542,31 +616,68 @@ impl BrowserManager {
         //     the one really running.
         // `channel` and `executablePath` are mutually exclusive in Playwright, so they are set in
         // alternation, never together.
-        let bundled = bundled_chromium_exe();
+        let bundled = bundled_chromium_exe_for(headless);
         let base_opts = playwright_rs::LaunchOptions::new()
             .headless(headless)
-            .args(args.clone());
+            .args(args.clone())
+            .timeout(BROWSER_LAUNCH_TIMEOUT_MS);
         let launch_opts = match &bundled {
             Some(exe) => base_opts.executable_path(exe.to_string_lossy().into_owned()),
             None => base_opts.channel("chrome".to_string()),
         };
 
+        // TIMED — the second half of the pre-record wait (browser process start + CDP attach).
+        let t_launch = std::time::Instant::now();
         let browser = match chromium.launch_with_options(launch_opts).await {
             Ok(b) => {
+                let elapsed_ms = t_launch.elapsed().as_millis();
                 match &bundled {
-                    Some(exe) => tracing::info!(headless, browser = %exe.display(), "Warm browser launched (bundled)"),
-                    None => tracing::info!(headless, "Warm browser launched (chrome channel)"),
+                    Some(exe) => tracing::info!(headless, elapsed_ms, browser = %exe.display(), "Warm browser launched (bundled)"),
+                    None => tracing::info!(headless, elapsed_ms, "Warm browser launched (chrome channel)"),
                 }
                 b
+            }
+            // NO BROWSER IS INSTALLED AT ALL. Report THAT, in our own terms, and stop.
+            //
+            // Without this the failure told the user to run `patchright install chrome` /
+            // `npx playwright install` — Playwright's advice, embedded in Playwright's error, and
+            // wrong for this app: Writ ships its own Chromium downloader and an install button, and
+            // the user has no `patchright` or `npx` to run. Someone who had already installed
+            // Chromium through onboarding reasonably read it as the app demanding a Chrome download.
+            //
+            // The driver-default retry below cannot help here either: it resolves the driver's
+            // compile-time pinned revision, which is a path on the machine that BUILT the driver, so
+            // it fails a second time and buries the real reason under a second stack trace.
+            Err(e) if bundled.is_none() => {
+                tracing::warn!(
+                    error = %e,
+                    elapsed_ms = t_launch.elapsed().as_millis(),
+                    "no browser is installed and no system Chrome was usable"
+                );
+                return Err(anyhow::anyhow!(
+                    "No browser is installed. Writ needs Chromium to record and run workflows — \
+                     install it from Settings → Runtime (or finish first-run setup), then try \
+                     again. Nothing needs to be installed by hand."
+                ));
             }
             Err(e) => {
                 // The fallback drops BOTH channel and executablePath, letting the driver use its own
                 // pinned revision. That is a genuine last resort — if the bundled binary failed to
                 // launch, this may well be a different browser build than the one we ship.
-                tracing::warn!(error = %e, bundled = bundled.is_some(), "Preferred browser failed to launch, falling back to the driver's default Chromium");
+                tracing::warn!(
+                    error = %e,
+                    bundled = bundled.is_some(),
+                    elapsed_ms = t_launch.elapsed().as_millis(),
+                    "Preferred browser failed to launch, falling back to the driver's default Chromium"
+                );
+                // SHORT timeout on the fallback. The driver's pinned-revision directory is a path on
+                // the machine that BUILT the driver, so on a user's install it usually does not
+                // exist and this attempt is hopeless — giving it the full launch budget just made
+                // the user wait out a second long timeout before seeing the error from the first.
                 let fallback = playwright_rs::LaunchOptions::new()
                     .headless(headless)
-                    .args(args);
+                    .args(args)
+                    .timeout(FALLBACK_LAUNCH_TIMEOUT_MS);
                 chromium.launch_with_options(fallback).await
                     .map_err(|e| anyhow::anyhow!("Browser launch failed: {}", e))?
             }

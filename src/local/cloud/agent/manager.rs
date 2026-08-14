@@ -428,16 +428,18 @@ mod tests {
         .await
         .unwrap();
 
-        // In the test process there is no keyring channel key sealed for this link → can_run false.
-        // `channel::get()` yields Ok(None) when nothing is sealed — but in a session with no
-        // default keychain (headless / CI / a parallel `cargo test` run) it yields Err instead,
-        // so `.unwrap()` here would panic on the ENVIRONMENT rather than fail on the behaviour.
-        // Match Ok(None) explicitly: assert only when we could actually consult the keyring.
-        if matches!(super::super::super::channel::get(), Ok(None)) {
-            assert!(!mgr.can_run().await.unwrap(), "linked but no channel key ⇒ must not run");
-            assert!(!mgr.start().await.unwrap(), "must not start without a channel key");
-            assert!(!mgr.is_desired_running());
-        }
+        // No keyring channel key is sealed for this link → can_run false. Unit tests resolve keyring
+        // entries through the in-memory store in `crate::local::keyring_store`, so `channel::get()`
+        // is a deterministic Ok(None) here. (This used to run only `if matches!(.., Ok(None))`,
+        // because a headless/parallel `cargo test` made the REAL keychain answer Err — which meant
+        // the behaviour below silently went unasserted on exactly the runs that mattered.)
+        assert!(
+            matches!(super::super::super::channel::get(), Ok(None)),
+            "precondition: no channel key is sealed in the test keyring"
+        );
+        assert!(!mgr.can_run().await.unwrap(), "linked but no channel key ⇒ must not run");
+        assert!(!mgr.start().await.unwrap(), "must not start without a channel key");
+        assert!(!mgr.is_desired_running());
     }
 
     #[tokio::test]

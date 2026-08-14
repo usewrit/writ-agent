@@ -25,8 +25,30 @@ fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// The user's home directory.
+///
+/// `HOME` IS NOT SET ON WINDOWS. Reading only `HOME` made every home-derived candidate in this
+/// module resolve to `None` on the one platform whose driver resolution has repeatedly failed —
+/// silently, because each caller treats `None` as "not present" rather than "could not look".
+/// Windows exposes the home directory as `USERPROFILE` (and, on domain-joined machines, as
+/// `HOMEDRIVE` + `HOMEPATH`), so fall through those before giving up.
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    if let Some(h) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(h));
+    }
+    if let Some(h) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(h));
+    }
+    match (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
+        (Some(drive), Some(path)) if !drive.is_empty() && !path.is_empty() => {
+            // `drive` is already an `OsString` from `var_os`; wrapping it in `OsString::from`
+            // is a no-op that clippy rejects under -D warnings.
+            let mut p = drive;
+            p.push(path);
+            Some(PathBuf::from(p))
+        }
+        _ => None,
+    }
 }
 
 /// Check whether a usable Chromium binary already exists in known cache paths.
@@ -70,26 +92,35 @@ fn find_installed_browser() -> bool {
 /// common site-packages globs. Returns `None` when nothing is found, so the caller transparently
 /// falls back to the bundled vanilla driver.
 pub fn find_patchright_driver() -> Option<(PathBuf, PathBuf)> {
-    // 1. Explicit operator override — a `.../patchright/driver` directory.
-    if let Ok(d) = std::env::var("WRIT_PATCHRIGHT_DRIVER") {
-        if let Some(r) = driver_from_dir(Path::new(&d)) {
-            return Some(r);
-        }
-    }
-    // 2. The driver the INSTALLER bundled.
-    //
-    // The desktop app ships a patchright driver and hands the daemon `WRIT_BUNDLED_DRIVER`
-    // ("wiring bundled patchright driver for writ-agentd"), but only `runtime_setup`'s
-    // chromium-install resolver ever read that variable — this lookup checked a DIFFERENT name
-    // (`WRIT_PATCHRIGHT_DRIVER`). So the bundle installed Chromium and was then ignored for the
-    // stealth path: the daemon reported the driver as bundled while launching VANILLA. Read the
-    // same variable here, with the same dir-or-node-exe tolerance `resolve_install_command` uses.
-    if let Ok(raw) = std::env::var("WRIT_BUNDLED_DRIVER") {
-        let p = PathBuf::from(raw);
-        let dir = if p.is_dir() { p.clone() } else { p.parent().map(Path::to_path_buf).unwrap_or(p) };
+    // 1/2/2b — the driver this app SHIPS. One resolver, shared with `runtime_setup` (see
+    // [`bundled_driver_dir`]): the operator override, the shell's env var, and exe-relative
+    // discovery all live there so the stealth driver, the runtime-status payload and the Chromium
+    // installer can never again disagree about whether a bundled driver exists.
+    if let Some(dir) = bundled_driver_dir() {
         if let Some(r) = driver_from_dir(&dir) {
             return Some(r);
         }
+    }
+    // Nothing bundled resolved. Say EXACTLY what was inspected before falling through to the Python
+    // probes (which never succeed in a shipped app) and ultimately to the compile-time baked driver
+    // path — a path on the CI machine that does not exist here, so the client sits waiting on a
+    // driver that never handshakes and the whole thing surfaces as an opaque "Playwright timeout"
+    // instead of "no driver". Twice now the resolution has been debugged by hand because the daemon
+    // reported nothing; a shipped build has to be able to answer "where did you look?" from its log.
+    {
+        let exe = std::env::current_exe().ok();
+        let tried: Vec<String> = bundled_engine_driver_candidates()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        tracing::warn!(
+            current_exe = ?exe,
+            writ_bundled_driver = ?std::env::var_os(ENV_BUNDLED_DRIVER),
+            writ_patchright_driver = ?std::env::var_os(ENV_PATCHRIGHT_DRIVER),
+            home = ?dirs_home(),
+            candidates_tried = ?tried,
+            "no BUNDLED patchright driver resolved next to the executable"
+        );
     }
     // 3. A patchright driver that TRAVELS WITH the binary.
     //
@@ -129,6 +160,69 @@ pub fn find_patchright_driver() -> Option<(PathBuf, PathBuf)> {
     None
 }
 
+/// Env var an OPERATOR sets to pin a specific patchright `.../driver` directory. Highest priority.
+pub const ENV_PATCHRIGHT_DRIVER: &str = "WRIT_PATCHRIGHT_DRIVER";
+
+/// Env var the Tauri shell sets to the driver dir (or its `node` exe) when the resource shipped.
+/// Kept here rather than in `local::runtime_setup` because THIS module is feature-independent and
+/// both consumers must agree on the spelling; `runtime_setup::ENV_BUNDLED_DRIVER` aliases it.
+pub const ENV_BUNDLED_DRIVER: &str = "WRIT_BUNDLED_DRIVER";
+
+/// **THE** resolver for the patchright driver directory this app ships. Returns a directory that is
+/// already proven to hold a real driver (`node[.exe]` + `package/cli.js`), or `None`.
+///
+/// ## Why this is one function
+/// The driver had FOUR independent consumers and they did not agree:
+/// * [`find_patchright_driver`] — the stealth driver behind `PLAYWRIGHT_NODE_EXE` (had the
+/// exe-relative fallback);
+/// * `runtime_setup::detect_driver` — the `driver.bundled` field of `GET /v1/runtime/status`
+/// (env var ONLY);
+/// * `runtime_setup::resolve_install_command` — `node cli.js install chromium`, the only Chromium
+/// installer a shipped app has once the direct download is unavailable (env var ONLY);
+/// * the Tauri shell, which computes the path a fourth time from its own `resource_dir()`.
+///
+/// So on any install where the shell does not export `WRIT_BUNDLED_DRIVER` — a fresh Windows
+/// install, a portable/unpacked build, a `.deb`/AppImage, or the daemon started by hand — the
+/// stealth path recovered while the status reported `bundled: false` and the Chromium installer
+/// reported "no Chromium installer found (bundled driver missing)", with the driver sitting in the
+/// install tree the whole time. Setting the env var by hand fixed all three at once, which is
+/// exactly why it looked like an env-var bug rather than three copies of one resolver.
+///
+/// SECURITY: the `node` under the returned directory is EXECUTED. Every candidate is anchored to an
+/// operator-set env var or to the running executable's own directory — never the CWD, never remote
+/// input — and [`driver_from_dir`] validates the layout before a directory can win.
+pub fn bundled_driver_dir() -> Option<PathBuf> {
+    // Explicit env first: an operator pin outranks discovery, and the shell's value (when it is set)
+    // is the cheapest correct answer. Tolerate both shapes — the dir itself, or its `node` exe.
+    for key in [ENV_PATCHRIGHT_DRIVER, ENV_BUNDLED_DRIVER] {
+        let Some(raw) = std::env::var_os(key).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let p = PathBuf::from(raw);
+        let dir = if p.is_dir() { p } else { p.parent().map(Path::to_path_buf).unwrap_or_default() };
+        // Normalized before it escapes: `resolve_install_command` spawns `<dir>/node <dir>/package/
+        // cli.js install chromium`, so a verbatim dir here is the same EISDIR death as the driver.
+        let dir = simplified_path(&dir);
+        if driver_from_dir(&dir).is_some() {
+            return Some(dir);
+        }
+    }
+    // Then find it ourselves, relative to `current_exe` — the path that needs no cooperation from
+    // whatever launched us.
+    //
+    // MEMOIZED. This is reached from `runtime_setup::detect_driver`, which serves the POLLED
+    // `GET /v1/runtime/status`, so an un-cached answer meant re-walking the install tree on every
+    // poll — under Windows Defender, a repeated traversal of `C:\Program Files\...` is slow enough
+    // to be felt as UI latency. The install tree cannot change under a running daemon (an update
+    // replaces the files and restarts it), so resolving once per process is correct.
+    static DISCOVERED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DISCOVERED
+        .get_or_init(|| {
+            bundled_engine_driver_candidates().into_iter().find(|d| driver_from_dir(d).is_some())
+        })
+        .clone()
+}
+
 /// Directory name a PATCHRIGHT (stealth) driver shipped alongside the binary uses.
 /// Kept next to [`SIBLING_DRIVER_DIRNAME`] because the same three things must agree on it: this
 /// lookup, the release archive layout, and the container image. Deliberately a DIFFERENT directory
@@ -156,6 +250,92 @@ fn sibling_patchright_candidates() -> Vec<PathBuf> {
         out.push(home.join(SIBLING_PATCHRIGHT_DIRNAME));
     }
     out
+}
+
+/// Driver dirs shipped by the TAURI DESKTOP bundle, resolved RELATIVE TO THE DAEMON'S OWN EXE — the
+/// self-sufficient path that does NOT depend on the shell exporting `WRIT_BUNDLED_DRIVER`.
+///
+/// Tauri copies the resource `resources/engine/<triple>/driver` into the install tree next to the
+/// executable (`<install>/resources/engine/<triple>/driver` on Windows/Linux; inside
+/// `Contents/Resources/` on macOS, one level up from the sidecar in `Contents/MacOS/`). We probe both
+/// shapes under the exe's directory, matching a flat `.../engine/driver` and any per-triple
+/// `.../engine/<name>/driver`, and let [`driver_from_dir`] validate that a real `node[.exe]` +
+/// `package/cli.js` are present. Order is candidates only; the caller validates.
+fn bundled_engine_driver_candidates() -> Vec<PathBuf> {
+    match std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        Some(base) => bundled_engine_driver_candidates_in(&base),
+        None => Vec::new(),
+    }
+}
+
+/// [`bundled_engine_driver_candidates`] for an explicit exe directory (the testable core).
+///
+/// Deliberately LAYOUT-INDEPENDENT. The first cut hard-coded `resources/engine/{,<triple>/}driver`,
+/// which is what the bundle config declares — but a hard-coded guess is exactly what already failed
+/// once here, and Tauri's installed layout differs per platform (and per installer: NSIS vs MSI vs
+/// the macOS `.app`). So we do what a human does when the guess misses: walk down from the install
+/// root looking for a real driver. Bounded depth + a pruned walk keep it cheap, and
+/// [`driver_from_dir`] is still the thing that decides a hit (node[.exe] + package/cli.js present),
+/// so a same-named-but-empty directory can never win.
+fn bundled_engine_driver_candidates_in(base: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    // Fast paths first, so the common layouts cost one `is_dir` each and never touch the walk.
+    // macOS: the sidecar lives in Contents/MacOS while resources are in Contents/Resources.
+    for root in [base.to_path_buf(), base.join("..").join("Resources")] {
+        let engine = root.join("resources").join("engine");
+        if engine.is_dir() {
+            out.push(engine.join("driver"));
+            if let Ok(entries) = std::fs::read_dir(&engine) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        out.push(entry.path().join("driver"));
+                    }
+                }
+            }
+        }
+    }
+    // A known layout already holds a REAL driver ⇒ stop. The walk below is a RECOVERY path for
+    // layouts we don't know; running it anyway made the common case pay a full traversal of the
+    // install tree for nothing.
+    if out.iter().any(|d| driver_from_dir(d).is_some()) {
+        return out;
+    }
+    // Bounded discovery walk: any `*/driver` under the install root, depth-limited so a deep tree
+    // (or a symlink loop) can't turn startup into a filesystem crawl. Depth 6 (not 4): the known
+    // Tauri layout puts it at depth 4 (`resources/engine/<triple>/driver`), and guessing the
+    // installer's exact nesting is precisely what has already failed twice here — the extra levels
+    // cost one `read_dir` each on a pruned tree and remove a whole class of near-miss.
+    collect_driver_dirs(base, 6, &mut out);
+    out.dedup();
+    out
+}
+
+/// Depth-bounded scan for directories NAMED `driver` under `dir`, appending each to `out`.
+/// Skips the browser payload (`chrome-*`) — it is large, never contains the node driver, and is the
+/// one subtree that would dominate the walk.
+fn collect_driver_dirs(dir: &Path, depth_left: usize, out: &mut Vec<PathBuf>) {
+    if depth_left == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        // `file_type` here does NOT follow symlinks, so a link loop cannot trap the walk.
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("chrome-") || name == "node_modules" {
+            continue;
+        }
+        if name == "driver" {
+            out.push(p.clone());
+        }
+        collect_driver_dirs(&p, depth_left - 1, out);
+    }
 }
 
 /// Directory name a driver shipped **alongside** the binary is expected to use.
@@ -207,8 +387,81 @@ fn sibling_driver_candidates() -> Vec<PathBuf> {
     out
 }
 
+/// Strip a Windows **verbatim** (`\\?\`) prefix when it is safe to do so.
+///
+/// NODE CANNOT RUN A SCRIPT WHOSE PATH IS VERBATIM. `node \\?\C:\…\cli.js` dies before executing
+/// a single line:
+/// ```text
+/// Error: EISDIR: illegal operation on a directory, lstat 'C:'
+/// at Object.realpathSync (node:fs)
+/// at resolveMainPath (node:internal/modules/run_main)
+/// ```
+/// `resolveMainPath` → `toRealPath` → `realpathSync` walks the path component by component; against
+/// `\\?\C:\…` it ends up calling `lstat("C:")`, which is a directory reference, not a file — EISDIR,
+/// exit code 1. The driver then dies ~200 ms in, and because the only liveness check ran at 100 ms
+/// the caller saw nothing but "Playwright initialization timeout after 30 seconds".
+///
+/// Where the prefix comes from: the Tauri shell derives the resource dir from `resource_dir()` and
+/// exports it as `WRIT_BUNDLED_DRIVER`, and on Windows that value carries `\\?\`. Nothing on the
+/// Rust side minds — `exists()`, `join()` and `CreateProcess` all accept it — so it survives every
+/// check we make and only detonates inside Node.
+///
+/// Only `\\?\C:\…` and `\\?\UNC\server\share\…` are simplified (the two forms with a plain
+/// equivalent), and only when the result stays under Windows' legacy `MAX_PATH`: past that the
+/// verbatim form is load-bearing and removing it would break the path instead. `\\.\` device paths
+/// and bare `\\?\` verbatim paths are returned untouched. No-op on every other platform.
+pub fn simplified_path(p: &Path) -> PathBuf {
+    #[cfg(not(windows))]
+    {
+        p.to_path_buf()
+    }
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::path::{Component, Prefix};
+
+        let mut comps = p.components();
+        let Some(Component::Prefix(prefix)) = comps.next() else {
+            return p.to_path_buf();
+        };
+        let rest = comps.as_path();
+        let simplified = match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => {
+                let mut s = OsString::from(format!("{}:", drive as char));
+                if rest.as_os_str().is_empty() {
+                    s.push("\\");
+                } else {
+                    s.push(rest.as_os_str());
+                }
+                PathBuf::from(s)
+            }
+            Prefix::VerbatimUNC(server, share) => {
+                let mut s = OsString::from(r"\\");
+                s.push(server);
+                s.push("\\");
+                s.push(share);
+                s.push(rest.as_os_str());
+                PathBuf::from(s)
+            }
+            // Verbatim(..) / DeviceNS(..) have no plain equivalent; Disk/UNC are already plain.
+            _ => return p.to_path_buf(),
+        };
+        // Past MAX_PATH the `\\?\` prefix is what makes the path usable at all — keep it.
+        if simplified.as_os_str().len() < 260 {
+            simplified
+        } else {
+            p.to_path_buf()
+        }
+    }
+}
+
 /// Validate a patchright `driver` dir, returning `(node, cli.js)` if both exist.
+///
+/// THE choke point every driver resolution funnels through, and therefore the right place to
+/// normalize: both paths are handed to Node (one as the program, one as its main module), so a
+/// verbatim prefix here is fatal — see [`simplified_path`].
 fn driver_from_dir(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dir = simplified_path(dir);
     let node = if cfg!(windows) {
         dir.join("node.exe")
     } else {
@@ -451,6 +704,177 @@ async fn try_install_command(program: &str, args: &[&str]) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    // NOTE: `use super::*` already lives further down in this module — do not re-import it here.
+
+    /// The Tauri desktop layout `<install>/resources/engine/<triple>/driver` must resolve from the
+    /// exe directory alone — the fresh-install case where the shell never set `WRIT_BUNDLED_DRIVER`.
+    #[test]
+    fn finds_the_bundled_driver_relative_to_the_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        // Build a realistic per-triple bundle: .../resources/engine/x86_64-pc-windows-msvc/driver
+        let driver = base
+            .join("resources")
+            .join("engine")
+            .join("x86_64-pc-windows-msvc")
+            .join("driver");
+        std::fs::create_dir_all(driver.join("package")).unwrap();
+        let node_name = if cfg!(windows) { "node.exe" } else { "node" };
+        std::fs::write(driver.join(node_name), b"").unwrap();
+        std::fs::write(driver.join("package").join("cli.js"), b"").unwrap();
+
+        // The candidate list must include the real driver dir, and driver_from_dir must validate it.
+        let cands = bundled_engine_driver_candidates_in(base);
+        assert!(cands.contains(&driver), "per-triple driver not among candidates: {cands:?}");
+        let resolved = cands.iter().find_map(|d| driver_from_dir(d));
+        let (node, cli) = resolved.expect("a bundled driver should resolve");
+        assert_eq!(node, driver.join(node_name));
+        assert_eq!(cli, driver.join("package").join("cli.js"));
+
+        // Nothing to find under an empty tree → empty candidate list, no panic.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(bundled_engine_driver_candidates_in(empty.path()).is_empty());
+    }
+
+    /// The resolver must NOT depend on the exact bundle layout: a driver parked somewhere the
+    /// hard-coded `resources/engine/...` guess doesn't cover must still be found. This is the case
+    /// that made a fresh Windows install fail while a manual `WRIT_BUNDLED_DRIVER` worked.
+    #[test]
+    fn finds_the_driver_even_under_an_unexpected_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        // A layout NOT matching resources/engine/<triple>/driver.
+        let driver = base.join("engine").join("win-x64").join("driver");
+        std::fs::create_dir_all(driver.join("package")).unwrap();
+        let node_name = if cfg!(windows) { "node.exe" } else { "node" };
+        std::fs::write(driver.join(node_name), b"").unwrap();
+        std::fs::write(driver.join("package").join("cli.js"), b"").unwrap();
+
+        let resolved = bundled_engine_driver_candidates_in(base)
+            .iter()
+            .find_map(|d| driver_from_dir(d));
+        assert!(resolved.is_some(), "an off-layout driver must still resolve");
+
+        // A directory NAMED `driver` but missing node/cli.js must NOT be accepted as a hit.
+        let decoy = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(decoy.path().join("stuff").join("driver")).unwrap();
+        assert!(
+            bundled_engine_driver_candidates_in(decoy.path())
+                .iter()
+                .find_map(|d| driver_from_dir(d))
+                .is_none(),
+            "an empty `driver` dir must not resolve"
+        );
+    }
+
+    /// [`bundled_driver_dir`] is the ONE resolver three consumers share, so pin its contract:
+    /// a real layout behind the env var wins, an env var pointing at a non-driver is not a hit
+    /// (it must fall through rather than pin a directory nothing can launch), and the `node` exe
+    /// form is accepted as well as the directory form.
+    #[test]
+    fn bundled_driver_dir_validates_the_layout_behind_the_env_var() {
+        let _lock = env_lock();
+        #[cfg(feature = "local")]
+        let _g = crate::local::config::test_env_guard();
+
+        let prev_bundled = std::env::var_os(ENV_BUNDLED_DRIVER);
+        let prev_pin = std::env::var_os(ENV_PATCHRIGHT_DRIVER);
+        std::env::remove_var(ENV_PATCHRIGHT_DRIVER);
+
+        let tmp = std::env::temp_dir().join(format!("writ_bundled_driver_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let driver = tmp.join("driver");
+        std::fs::create_dir_all(driver.join("package")).unwrap();
+        let node_name = if cfg!(windows) { "node.exe" } else { "node" };
+        std::fs::write(driver.join(node_name), b"").unwrap();
+        std::fs::write(driver.join("package").join("cli.js"), b"").unwrap();
+
+        // Directory form.
+        std::env::set_var(ENV_BUNDLED_DRIVER, &driver);
+        assert_eq!(bundled_driver_dir().as_deref(), Some(driver.as_path()));
+
+        // `node` exe form — the shell may export either.
+        std::env::set_var(ENV_BUNDLED_DRIVER, driver.join(node_name));
+        assert_eq!(bundled_driver_dir().as_deref(), Some(driver.as_path()));
+
+        // An env var pointing at a directory that is NOT a driver must not be accepted. It falls
+        // through to exe-relative discovery, which finds nothing beside the test binary — the point
+        // is that a bogus env value can never "win" and mask a real driver elsewhere.
+        let bogus = tmp.join("not-a-driver");
+        std::fs::create_dir_all(&bogus).unwrap();
+        std::env::set_var(ENV_BUNDLED_DRIVER, &bogus);
+        assert_ne!(bundled_driver_dir().as_deref(), Some(bogus.as_path()));
+
+        match prev_bundled {
+            Some(v) => std::env::set_var(ENV_BUNDLED_DRIVER, v),
+            None => std::env::remove_var(ENV_BUNDLED_DRIVER),
+        }
+        if let Some(v) = prev_pin {
+            std::env::set_var(ENV_PATCHRIGHT_DRIVER, v);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A verbatim `\\?\` path handed to Node kills it before it runs a line
+    /// (`EISDIR: … lstat 'C:'` from `resolveMainPath`). Pin the simplification, and pin that the
+    /// forms with no plain equivalent are left alone.
+    #[test]
+    fn verbatim_windows_prefixes_are_simplified() {
+        // Non-verbatim paths are returned untouched on every platform.
+        let plain = PathBuf::from("relative/driver");
+        assert_eq!(simplified_path(&plain), plain);
+
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                simplified_path(Path::new(r"\\?\C:\Program Files\Writ\driver\node.exe")),
+                PathBuf::from(r"C:\Program Files\Writ\driver\node.exe")
+            );
+            assert_eq!(simplified_path(Path::new(r"\\?\C:\")), PathBuf::from(r"C:\"));
+            assert_eq!(
+                simplified_path(Path::new(r"\\?\UNC\server\share\driver")),
+                PathBuf::from(r"\\server\share\driver")
+            );
+            // Already plain → unchanged.
+            let plain_disk = PathBuf::from(r"C:\Program Files\Writ\driver");
+            assert_eq!(simplified_path(&plain_disk), plain_disk);
+            // Device namespace has no plain equivalent → untouched.
+            let device = PathBuf::from(r"\\.\pipe\something");
+            assert_eq!(simplified_path(&device), device);
+            // Past MAX_PATH the prefix is load-bearing → kept.
+            let long = PathBuf::from(format!(r"\\?\C:\{}", "a".repeat(300)));
+            assert_eq!(simplified_path(&long), long);
+        }
+    }
+
+    /// `HOME` is not set on Windows — every home-derived driver candidate resolved to `None` there.
+    /// `USERPROFILE` must stand in for it.
+    #[test]
+    fn home_falls_back_to_userprofile_when_home_is_unset() {
+        let _lock = env_lock();
+        #[cfg(feature = "local")]
+        let _g = crate::local::config::test_env_guard();
+
+        let prev_home = std::env::var_os("HOME");
+        let prev_profile = std::env::var_os("USERPROFILE");
+
+        std::env::remove_var("HOME");
+        std::env::set_var("USERPROFILE", "/writ-test/userprofile");
+        assert_eq!(dirs_home(), Some(PathBuf::from("/writ-test/userprofile")));
+
+        // HOME still wins when both are present (unix behaviour is unchanged).
+        std::env::set_var("HOME", "/writ-test/home");
+        assert_eq!(dirs_home(), Some(PathBuf::from("/writ-test/home")));
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_profile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
 
     /// Serializes every env-mutating test in this module.
     ///

@@ -138,7 +138,7 @@ struct StoredToken {
 }
 
 fn entry(account: &str) -> LocalResult<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, account)
+    crate::local::keyring_store::new_entry(KEYRING_SERVICE, account)
         .map_err(|e| LocalError::Internal(format!("keyring open: {e}")))
 }
 

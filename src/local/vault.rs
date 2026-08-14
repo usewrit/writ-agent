@@ -476,7 +476,7 @@ impl Vault {
     /// value or a clean "no entry" (both mean the keyring backend is reachable). A backend error
     /// (locked/unavailable) returns `false`. NEVER returns or logs key material.
     pub fn keyring_available() -> bool {
-        match keyring::Entry::new(KEYRING_SERVICE, &keyring_account()) {
+        match crate::local::keyring_store::new_entry(KEYRING_SERVICE, &keyring_account()) {
             Ok(entry) => match entry.get_secret() {
                 Ok(mut b) => {
                     b.zeroize();
@@ -491,7 +491,7 @@ impl Vault {
 
     // ---- backends ----
     fn keyring_get(account: &str) -> LocalResult<Option<[u8; 32]>> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, account)
+        let entry = crate::local::keyring_store::new_entry(KEYRING_SERVICE, account)
             .map_err(|e| LocalError::Internal(format!("keyring: {e}")))?;
         match entry.get_secret() {
             Ok(mut b) if b.len() == 32 => {
@@ -509,7 +509,7 @@ impl Vault {
         }
     }
     fn keyring_set(account: &str, root: &[u8; 32]) -> LocalResult<()> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, account)
+        let entry = crate::local::keyring_store::new_entry(KEYRING_SERVICE, account)
             .map_err(|e| LocalError::Internal(format!("keyring: {e}")))?;
         entry
             .set_secret(root)
@@ -522,7 +522,7 @@ impl Vault {
     /// is non-fatal. Scoped to the active profile's account — a reset of one account never touches
     /// another account's key.
     pub fn keyring_delete() -> LocalResult<bool> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &keyring_account())
+        let entry = crate::local::keyring_store::new_entry(KEYRING_SERVICE, &keyring_account())
             .map_err(|e| LocalError::Internal(format!("keyring: {e}")))?;
         match entry.delete_credential() {
             Ok(()) => Ok(true),
@@ -551,7 +551,9 @@ impl Vault {
     /// Remove the transient rotation root from the OS keyring once the rotation commits or is recovered.
     /// Best-effort: a missing entry / backend error is non-fatal. NEVER logs key material.
     pub fn keyring_delete_rotation_root() {
-        if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &rotation_keyring_account()) {
+        if let Ok(entry) =
+            crate::local::keyring_store::new_entry(KEYRING_SERVICE, &rotation_keyring_account())
+        {
             let _ = entry.delete_credential();
         }
     }

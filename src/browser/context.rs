@@ -223,10 +223,19 @@ fn pick<'a>(pool: &[&'a str], seed: usize) -> &'a str {
 /// that DO weaken a boundary (sandbox / TLS validation / same-origin policy) were split out into the
 /// opt-in [`SANDBOX_DISABLE_ARGS`] / [`IGNORE_CERT_ERRORS_ARGS`] / [`DISABLE_WEB_SECURITY_ARGS`]
 /// groups below and are OFF by default; use [`build_launch_args`] to assemble the final argv.
+/// `--disable-features` / `--enable-features` MUST APPEAR AT MOST ONCE EACH.
+///
+/// Chromium parses argv into a switch MAP keyed by switch name, so a repeated switch does not
+/// accumulate — the LAST occurrence silently replaces the earlier one. This list carried
+/// `--disable-features=IsolateOrigins,site-per-process` near the top and
+/// `--disable-features=TranslateUI` further down, so only `TranslateUI` was ever disabled and the
+/// site-isolation half — the anti-detection reason it was added — never reached the browser. It
+/// fails silently in both directions: nothing warns, and the flags LOOK present in the argv.
+/// Add new feature toggles to the single merged value below, never as another `--*-features` entry.
 pub const CHROMIUM_LAUNCH_ARGS: &[&str] = &[
     // Core anti-detection flags (matches Python recorder.py start_session)
     "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process",
+    "--disable-features=IsolateOrigins,site-per-process,TranslateUI",
     "--disable-site-isolation-trials",
     // Remove automation indicators
     "--disable-infobars",
@@ -242,8 +251,8 @@ pub const CHROMIUM_LAUNCH_ARGS: &[&str] = &[
     "--disable-translate",
     // Performance and stability
     "--disable-dev-shm-usage",
-    // Memory
-    "--disable-features=TranslateUI",
+    // Memory — `TranslateUI` is folded into the single `--disable-features` above (see the note on
+    // this list: a second `--disable-features` would REPLACE the first, not add to it).
     "--metrics-recording-only",
     "--no-first-run",
     "--safebrowsing-disable-auto-update",
@@ -455,5 +464,38 @@ mod tests {
                 + IGNORE_CERT_ERRORS_ARGS.len()
                 + DISABLE_WEB_SECURITY_ARGS.len()
         );
+    }
+
+    /// A repeated `--disable-features` / `--enable-features` does NOT accumulate in Chromium — the
+    /// last occurrence replaces the earlier one, silently. This list shipped two `--disable-features`
+    /// entries, so `IsolateOrigins,site-per-process` never took effect. Assert uniqueness across
+    /// EVERY toggle combination, since the opt-in groups append to the same argv.
+    #[test]
+    fn feature_switches_are_never_repeated() {
+        for (sandbox, certs, websec) in
+            [(false, false, false), (true, false, false), (false, true, true), (true, true, true)]
+        {
+            let args = build_launch_args(sandbox, certs, websec);
+            for switch in ["--disable-features", "--enable-features"] {
+                let hits: Vec<&String> =
+                    args.iter().filter(|a| a.starts_with(&format!("{switch}="))).collect();
+                assert!(
+                    hits.len() <= 1,
+                    "{switch} appears {} times for ({sandbox},{certs},{websec}) — Chromium keeps \
+                     only the LAST, so the others are silently dropped: {hits:?}",
+                    hits.len()
+                );
+            }
+        }
+
+        // The flags the duplicate was hiding must actually be present.
+        let base = build_launch_args(false, false, false);
+        let disable = base
+            .iter()
+            .find(|a| a.starts_with("--disable-features="))
+            .expect("a --disable-features switch");
+        for feature in ["IsolateOrigins", "site-per-process", "TranslateUI"] {
+            assert!(disable.contains(feature), "{feature} missing from {disable}");
+        }
     }
 }

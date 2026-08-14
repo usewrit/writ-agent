@@ -690,20 +690,92 @@ fn persist_channel_key(channel_key: Option<&str>) {
     }
 }
 
+/// What an [`unlink`] actually managed to remove, plus any credential the OS keyring refused to
+/// drop. Non-secret throughout — `keyring_error` carries the backend's failure text, never a value.
+#[derive(Debug, Default, Clone)]
+pub struct UnlinkOutcome {
+    /// The `wto_`/`wtr_` account-token entry was present and is now gone.
+    pub token_removed: bool,
+    /// The per-agent channel key was present and is now gone.
+    pub channel_removed: bool,
+    /// The persisted `LinkState` row was present and is now gone.
+    pub state_removed: bool,
+    /// Why the OS keyring could not be fully cleared, when it could not. `None` means nothing of
+    /// this link survives on the machine.
+    pub keyring_error: Option<String>,
+}
+
+impl UnlinkOutcome {
+    /// True when NOTHING of the link survives: no keyring credential, no link metadata.
+    pub fn fully_unlinked(&self) -> bool {
+        self.keyring_error.is_none()
+    }
+
+    /// True if anything was actually removed (i.e. the desktop had been linked).
+    pub fn removed_anything(&self) -> bool {
+        self.token_removed || self.channel_removed || self.state_removed
+    }
+}
+
 /// Unlink this desktop: clear the keyring account token, the per-agent channel key, AND the
-/// persisted `LinkState`.
+/// persisted `LinkState`. Also drops any in-flight device-flow ([`PendingLink`]).
 ///
-/// Idempotent. Returns `true` if anything was actually removed (token entry, channel key, and/or
-/// metadata row). Note: this only drops the LOCAL link; it does not revoke the token server-side (do
-/// that via the cloud account UI / a future revoke call). Also drops any in-flight device-flow
-/// ([`PendingLink`]).
-pub async fn unlink(pool: &SqlitePool) -> LocalResult<bool> {
+/// Idempotent. Note: this only drops the LOCAL link; it does not revoke the token server-side (do
+/// that via the cloud account UI / a future revoke call).
+///
+/// EVERY step runs even when an earlier one fails, and the returned [`UnlinkOutcome`] reports what
+/// survived. That matters: the keyring is the one step that can fail for reasons outside this
+/// process (a locked/ACL-gated keychain answering `errSecAuthFailed`), and short-circuiting on it
+/// used to leave the user WORSE off than not calling unlink at all — the `LinkState` row stayed, so
+/// the UI still said "linked" with a token it could no longer manage, and the desktop shell's
+/// account-exit path (which re-points the daemon away from the outgoing account's profile home)
+/// never ran, so that account's local data kept being served. Clearing the local state is exactly
+/// what unblocks both, and it cannot be conditional on the keychain cooperating.
+///
+/// The keyring failure is NOT swallowed: a surviving `wto_` pair still authenticates against the
+/// cloud ([`super::client::CloudClient::connect`] needs only the token), so the caller must surface
+/// it. The DB write is the one genuinely fatal step — if the local store cannot be updated there is
+/// no lever left, and the caller must see an error rather than a partial success.
+///
+/// Note the consequence of a surviving token, and why reporting it is not optional: boot
+/// reconciliation MATERIALIZES a `LinkState` from the keyring for an account profile that has none
+/// (`app::lifecycle::reconcile_profile_link_state`), so booting that profile again comes back
+/// linked. That is the honest reflection of a credential that genuinely still works — the fix is to
+/// remove the credential, which only the user can do once the OS has refused us.
+pub async fn unlink(pool: &SqlitePool) -> LocalResult<UnlinkOutcome> {
     clear_pending().await;
-    let token_removed = token::clear()?;
-    let channel_removed = channel::clear()?;
-    let state_removed = LinkState::clear(pool).await?;
-    tracing::info!(token_removed, channel_removed, state_removed, "cloud account unlinked (local)");
-    Ok(token_removed || channel_removed || state_removed)
+
+    // Credentials first (destroy the secret before the metadata that names it), but never let one
+    // backend failure skip the other steps.
+    let mut out = UnlinkOutcome::default();
+    let mut keyring_errors: Vec<String> = Vec::new();
+    match token::clear() {
+        Ok(removed) => out.token_removed = removed,
+        Err(e) => keyring_errors.push(format!("account token: {e}")),
+    }
+    match channel::clear() {
+        Ok(removed) => out.channel_removed = removed,
+        Err(e) => keyring_errors.push(format!("channel key: {e}")),
+    }
+    out.state_removed = LinkState::clear(pool).await?;
+
+    if !keyring_errors.is_empty() {
+        let detail = keyring_errors.join("; ");
+        // Loud: a credential for an account the user just signed out of is still on this machine.
+        tracing::error!(
+            error = %detail,
+            "unlink could not remove an OS-keyring credential — it SURVIVES on this machine"
+        );
+        out.keyring_error = Some(detail);
+    }
+    tracing::info!(
+        token_removed = out.token_removed,
+        channel_removed = out.channel_removed,
+        state_removed = out.state_removed,
+        fully_unlinked = out.fully_unlinked(),
+        "cloud account unlinked (local)"
+    );
+    Ok(out)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -165,9 +165,16 @@ impl PlaywrightRecorder {
         // person who typed the URL, and "Refused unsafe start URL" for what is
         // usually a typo'd domain sent users hunting for an engine bug instead of
         // the missing letter in the hostname.
+        // PHASE TIMING for the whole start. "Recording takes a long time to appear" is a single
+        // opaque wait made of four very different things — a DNS-backed URL guard, browser
+        // bootstrap (driver handshake + browser process), the site's own load, and stealth
+        // injection. Attribute them, or the next round of this is guesswork again.
+        let t_start = std::time::Instant::now();
+
         if let Some(reason) = crate::security::url_guard::navigation_refusal(&start_url).await {
             return Err(StartSessionError::UnsafeUrl(format!("{start_url} — {reason}")));
         }
+        let guard_ms = t_start.elapsed().as_millis();
 
         // Create a stealth browser context with a new page, on the resolved egress route.
         // `None` keeps the manager's default (direct / configured) proxy behaviour.
@@ -196,11 +203,16 @@ impl PlaywrightRecorder {
             egress_country.as_deref(),
             want_device,
         );
+        // Browser bootstrap: on the FIRST recording this also starts the Playwright driver and the
+        // browser process (the daemon warms nothing at boot — everything is deferred to first use),
+        // so this is normally the dominant term. `manager.rs` logs the driver/browser split.
+        let t_ctx = std::time::Instant::now();
         let (context, page, _fp) = self
             .browser_manager
             .create_stealth_context_with_fingerprint_proxy(Some(identity), egress_proxy)
             .await
             .map_err(|e| StartSessionError::Browser(e.to_string()))?;
+        let context_ms = t_ctx.elapsed().as_millis();
 
         // A context exists in Chromium from here on, and `BrowserContext` has no `Drop` — returning
         // `Err` below without closing it would strand the context + its renderer for the life of the
@@ -211,6 +223,7 @@ impl PlaywrightRecorder {
         let mut ctx_guard = crate::browser::context::ContextCloseGuard::new(context.clone());
 
         // Navigate to the start URL
+        let t_nav = std::time::Instant::now();
         if let Err(e) = crate::browser::navigation::goto(
             &page,
             &start_url,
@@ -224,10 +237,20 @@ impl PlaywrightRecorder {
                 "Navigation to start_url failed: {e}"
             )));
         }
+        let nav_ms = t_nav.elapsed().as_millis();
 
         // Re-inject stealth after navigation (matches Python: await inject_stealth(page))
+        let t_stealth = std::time::Instant::now();
         let stealth_js = crate::browser::stealth::STEALTH_SCRIPTS;
         let _: Result<serde_json::Value, _> = page.evaluate(stealth_js, None::<&()>).await;
+        tracing::info!(
+            guard_ms,
+            context_ms,
+            nav_ms,
+            stealth_ms = t_stealth.elapsed().as_millis(),
+            total_ms = t_start.elapsed().as_millis(),
+            "recording start: phase timings"
+        );
 
         let session_id = uuid::Uuid::new_v4().to_string();
         let mut session = RecordingSession::new(

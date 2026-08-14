@@ -546,9 +546,27 @@ pub fn cloud_login(paths: &Paths) -> LocalResult<()> {
 
 /// `writ cloud logout` — unlink this desktop (clear the keyring token + persisted link metadata)
 /// via the daemon's `/v1/cloud/unlink`. Idempotent.
+///
+/// A 200 always means the link metadata is gone; `ok:false` means the OS keyring refused to drop a
+/// credential that is STILL VALID against the cloud. That is a partial success, so it exits
+/// non-zero — a provisioning script that decommissions a machine must not read "logged out" as
+/// "no credential left behind".
 pub fn cloud_logout(paths: &Paths) -> LocalResult<()> {
     let client = connect_daemon(paths)?;
-    client.post_empty("/v1/cloud/unlink")?;
+    let body = client.post_empty("/v1/cloud/unlink")?;
+    if body["ok"] == Value::Bool(false) {
+        println!("Unlinked from Writ Cloud locally (link metadata cleared).");
+        if let Some(why) = body["keyring_error"].as_str() {
+            eprintln!("writ: the OS keyring refused to remove a stored credential: {why}");
+        }
+        eprintln!(
+            "writ: that credential is still valid. Unlock your keychain and re-run \
+             `writ cloud logout`, or delete the 'writ-cloud' item by hand."
+        );
+        return Err(LocalError::Internal(
+            "unlink incomplete: a cloud credential survives in the OS keyring".into(),
+        ));
+    }
     println!("Unlinked from Writ Cloud (local token + metadata cleared).");
     Ok(())
 }

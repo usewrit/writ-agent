@@ -847,6 +847,81 @@ impl RealEngine {
         let mut _file_guards: Vec<crate::local::storage::files::TempGuard> = Vec::new();
         let run_files = {
             let mut entries: Vec<(crate::automation::files::ResolvedFile, std::path::PathBuf)> = Vec::new();
+
+            // The caller's bindings are only HALF the story. A recorded upload step usually PINS a
+            // file (`config.file_id`, or `options.file_id` when the recorder wrote it), and the
+            // cloud resolves those server-side alongside the request map (`_resolve_run_files_map`
+            // unions step ids + slot bindings). Locally nothing did, so a pinned upload only ever
+            // worked when something happened to pass the file explicitly — true for the Run modal
+            // (it submits the pinned file as the slot's default) but NOT for a scheduled run, an
+            // automation, a monitor, or an MCP call with no `files` argument. Those failed closed
+            // with "no file resolved" on a workflow that runs fine in the cloud.
+            //
+            // Bound with NO slot, deliberately: `resolve_step_files` checks the slot first, so a
+            // run-time binding for the same step still wins and this stays a pure fallback.
+            let mut pinned: Vec<String> = Vec::new();
+            for step in &raw_steps {
+                if step.get("type").and_then(|v| v.as_str()) != Some("upload") {
+                    continue;
+                }
+                let pick = |obj: Option<&serde_json::Value>| -> Option<String> {
+                    obj.and_then(|o| o.get("file_id"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                };
+                // `config` wins over `options` — it is the explicit later edit.
+                if let Some(fid) = pick(step.get("config")).or_else(|| pick(step.get("options"))) {
+                    if !pinned.contains(&fid) {
+                        pinned.push(fid);
+                    }
+                }
+            }
+            if !pinned.is_empty() {
+                if let Ok(paths) = crate::local::config::Paths::resolve() {
+                    // A file the caller bound explicitly is materialized below; skip it here so it
+                    // isn't fetched twice (and so its slots aren't dropped).
+                    let bound: std::collections::BTreeSet<String> = req
+                        .inputs
+                        .get("files")
+                        .and_then(|v| v.as_object())
+                        .map(|o| {
+                            o.iter()
+                                .map(|(k, v)| {
+                                    v.get("file_id")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or(k)
+                                        .to_string()
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for file_id in pinned.into_iter().filter(|f| !bound.contains(f)) {
+                        match crate::local::storage::files::materialize_for_run(db, vault, &paths, &file_id).await {
+                            Ok((path, guard)) => {
+                                let meta = crate::local::store::stored_files::get_active(db, &file_id).await.ok().flatten();
+                                entries.push((
+                                    crate::automation::files::ResolvedFile {
+                                        file_id: file_id.clone(),
+                                        url: String::new(),
+                                        filename: meta.as_ref().map(|m| m.filename.clone()),
+                                        content_type: meta.as_ref().map(|m| m.content_type.clone()),
+                                        size: meta.as_ref().map(|m| m.size_bytes as u64),
+                                        slots: Vec::new(),
+                                    },
+                                    path,
+                                ));
+                                _file_guards.push(guard);
+                            }
+                            Err(e) => tracing::warn!(
+                                file_id = %file_id, error = %e,
+                                "could not materialize the file pinned on an upload step — that step will fail closed"
+                            ),
+                        }
+                    }
+                }
+            }
+
             if let (Some(files_obj), Some(paths)) = (
                 req.inputs.get("files").and_then(|v| v.as_object()),
                 crate::local::config::Paths::resolve().ok(),

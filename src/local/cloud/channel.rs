@@ -67,7 +67,7 @@ impl ChannelKey {
 }
 
 fn entry_for(account: &str) -> LocalResult<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, account)
+    crate::local::keyring_store::new_entry(KEYRING_SERVICE, account)
         .map_err(|e| LocalError::Internal(format!("keyring open: {e}")))
 }
 
@@ -119,14 +119,29 @@ pub fn set(key: &str) -> LocalResult<()> {
 /// Delete the channel key from the keyring. Idempotent: a missing entry is a no-op. Clears BOTH the
 /// per-profile slot and the legacy fixed slot so an unlink leaves nothing behind.
 /// Returns `true` if any entry was actually removed.
+///
+/// BOTH slots are always attempted — a failure on one must not skip the other, or an unlink that
+/// trips on the per-profile slot would silently leave a usable legacy key behind. The error (first
+/// one seen) is still returned, so the caller learns a key survived.
 pub fn clear() -> LocalResult<bool> {
     let mut removed = false;
+    let mut failure: Option<LocalError> = None;
     for account in [keyring_account(), LEGACY_KEYRING_ACCOUNT.to_string()] {
-        match entry_for(&account)?.delete_credential() {
-            Ok(()) => removed = true,
-            Err(keyring::Error::NoEntry) => {}
-            Err(e) => return Err(LocalError::Internal(format!("keyring delete: {e}"))),
+        let deleted = entry_for(&account).and_then(|e| match e.delete_credential() {
+            Ok(()) => Ok(true),
+            Err(keyring::Error::NoEntry) => Ok(false),
+            Err(e) => Err(LocalError::Internal(format!("keyring delete: {e}"))),
+        });
+        match deleted {
+            Ok(true) => removed = true,
+            Ok(false) => {}
+            Err(e) => {
+                failure.get_or_insert(e);
+            }
         }
+    }
+    if let Some(e) = failure {
+        return Err(e);
     }
     if removed {
         tracing::debug!("cloud channel key cleared");

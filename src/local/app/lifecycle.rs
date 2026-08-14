@@ -940,10 +940,10 @@ mod tests {
     /// marketplace unseal fails). Reproduces the case where `writ.db` was recovered from a
     /// `writ.db.corrupt-*` sibling but the OS keychain wasn't. Boot reconciliation must clear the ghost.
     ///
-    /// Uses a random profile name that has never been linked, so `token::load_account` returns
-    /// `Ok(None)` — the ghost signal. Guarded so a CI env whose keyring returns `Err` (locked/absent)
-    /// skips instead of failing (mirrors `manager_refuses_when_linked_but_no_channel_key` in
-    /// `agent::manager`).
+    /// Uses a profile name that has never been linked, so `token::load_account` returns `Ok(None)`
+    /// — the ghost signal. Deterministic: unit tests resolve keyring entries through the in-memory
+    /// store in [`crate::local::keyring_store`], so this asserts the precondition instead of
+    /// silently skipping when a real keychain is locked/absent/contended.
     #[cfg(feature = "cloud")]
     #[tokio::test]
     async fn reconcile_clears_ghost_link_state_on_account_profile() {
@@ -958,12 +958,10 @@ mod tests {
 
         // A profile name that has never been linked — no keyring entry for it.
         let profile = format!("acct_ghost_reconcile_{}", std::process::id());
-        // Only run the assertion if the keyring is available AND reports "no entry" cleanly.
-        // Otherwise skip (CI without keyring / locked keychain).
-        match token::load_account(&profile) {
-            Ok(None) => {}
-            _ => return,
-        }
+        assert!(
+            matches!(token::load_account(&profile), Ok(None)),
+            "precondition: a never-linked profile has no keyring token"
+        );
 
         LinkState {
             account_id: "acct_ghost".into(),

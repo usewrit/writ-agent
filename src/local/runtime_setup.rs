@@ -36,9 +36,13 @@ use serde::Serialize;
 /// the app bundle. Presence + an existing path ⇒ `chromium.source = "bundled"`.
 pub const ENV_BUNDLED_CHROMIUM: &str = "WRIT_BUNDLED_CHROMIUM";
 /// Env var the Tauri shell sets to the bundled patchright-driver dir/exe when that resource exists.
-/// Presence + an existing path ⇒ `driver.bundled = true`. The driver is always shipped — never
-/// offered for install.
-pub const ENV_BUNDLED_DRIVER: &str = "WRIT_BUNDLED_DRIVER";
+/// An ALIAS of the canonical spelling in `browser::install`, which owns driver resolution for both
+/// the feature-gated local surface and the plain agent — one source of truth for the name.
+///
+/// ⚠️ Presence of this var is NOT the contract any more: the driver also resolves relative to the
+/// daemon's own executable (`install::bundled_driver_dir`), so an install where the shell never
+/// exported it still reports `driver.bundled = true` and can still install Chromium.
+pub const ENV_BUNDLED_DRIVER: &str = crate::browser::install::ENV_BUNDLED_DRIVER;
 
 // ---------------------------------------------------------------------------------------------
 // Detection — the GET /v1/runtime/status payload.
@@ -144,10 +148,15 @@ pub fn detect_chromium() -> ChromiumStatus {
     ChromiumStatus { available: false, source: ChromiumSource::None, path: None, version: None }
 }
 
-/// Detect the bundled patchright driver per the fixed contract: `WRIT_BUNDLED_DRIVER` set + exists.
-/// Never resolves a "system" driver — the bundled driver is the only one this reports for setup.
+/// Detect the bundled patchright driver. Never resolves a "system" driver — the bundled driver is
+/// the only one this reports for setup.
+///
+/// Resolution is [`crate::browser::install::bundled_driver_dir`], NOT the env var alone: the driver
+/// ships inside the install tree and the daemon can find it there without the shell's cooperation.
+/// Reading only `WRIT_BUNDLED_DRIVER` made this report `bundled: false` on installs whose driver was
+/// present and working, which sent the onboarding runtime step chasing a driver it already had.
 pub fn detect_driver() -> DriverStatus {
-    match existing_env_path(ENV_BUNDLED_DRIVER) {
+    match crate::browser::install::bundled_driver_dir() {
         Some(p) => DriverStatus {
             bundled: true,
             version: driver_version(&p),
@@ -188,11 +197,77 @@ fn chromium_version_cached(exe: &Path) -> Option<String> {
     v
 }
 
+/// The browser's version string (e.g. "Chromium 124.0.6367.60"), for the runtime-status payload.
+///
+/// NEVER EXECUTE THE BROWSER TO ASK ITS VERSION ON WINDOWS. `chrome.exe --version` does not print
+/// a version there — it **LAUNCHES THE BROWSER**. Chromium implements `--version` as a POSIX-style
+/// stdout switch; the Windows build has no console attached and treats the invocation as a normal
+/// start, so the flag is ignored and a real window appears. On Windows the version lives in the
+/// file's VERSIONINFO resource, which is what every other Windows tool reads.
+///
+/// That is not a theoretical concern: this function is reached from `detect_chromium()` →
+/// `GET /v1/runtime/status`, which the desktop app calls on STARTUP (the onboarding runtime step).
+/// The result was a headed browser opening every time the app launched — the downloaded Chromium
+/// when present, otherwise the user's installed Chrome, exactly the order `detect_chromium` resolves.
+/// The daemon alone never did it, because nothing else calls that endpoint. No headless flag was
+/// involved anywhere, which is why it survived the headless-binary fix.
+fn probe_chromium_version(exe: &Path) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_file_version(exe)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        probe_chromium_version_by_exec(exe)
+    }
+}
+
+/// Read a PE file's product/file version from its VERSIONINFO resource — the Windows way to ask a
+/// binary its version WITHOUT running it. Uses PowerShell's `FileVersionInfo` (always present, no
+/// new crate dependency) on a detached thread with a bounded wait, exactly like the exec probe it
+/// replaces. Returns "Chromium <version>"-shaped text so the payload reads the same on every OS.
+#[cfg(target_os = "windows")]
+fn windows_file_version(exe: &Path) -> Option<String> {
+    let path = exe.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // -NoProfile: don't execute the user's profile script. CREATE_NO_WINDOW so the helper
+        // itself never flashes a console — the whole point here is "no window".
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "$i=[System.Diagnostics.FileVersionInfo]::GetVersionInfo('{}'); \
+                 Write-Output ($i.ProductName + ' ' + $i.ProductVersion)",
+                path.display().to_string().replace('\'', "''")
+            ),
+        ]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let _ = tx.send(cmd.output());
+    });
+    let out = rx.recv_timeout(Duration::from_secs(5)).ok()?.ok()?;
+    let line = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").trim().to_string();
+    if line.is_empty() || !line.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(line)
+}
+
 /// Run `<exe> --version` on a detached thread with a bounded wait, returning the trimmed first output
 /// line (e.g. "Chromium 124.0.6367.60"). Best-effort — a spawn error, non-zero exit, timeout, or empty
 /// output all yield `None`. Never blocks the caller longer than the timeout; a genuinely hung binary
 /// leaves its worker thread detached (harmless for a diagnostic probe).
-fn probe_chromium_version(exe: &Path) -> Option<String> {
+///
+/// POSIX only — see [`probe_chromium_version`] for why this must never run on Windows.
+#[cfg(not(target_os = "windows"))]
+fn probe_chromium_version_by_exec(exe: &Path) -> Option<String> {
     let exe = exe.to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -262,33 +337,61 @@ fn chromium_cache_roots() -> Vec<PathBuf> {
 /// The platform's relative path from a `chromium-*` browser dir to the actual launchable executable.
 /// Best-effort: we return the FIRST candidate that exists. Mirrors Playwright's on-disk layout.
 fn chromium_exe_candidates(browser_dir: &Path) -> Vec<PathBuf> {
+    chromium_exe_candidates_for(browser_dir, false)
+}
+
+/// Candidate binaries inside one browser dir, ORDERED by the mode we are about to launch in.
+///
+/// Since Playwright 1.57 headed and headless are two DIFFERENT binaries — the driver ships
+/// `chromium` and `chromium-headless-shell` as separate browsers (see `browsers.json`) and picks
+/// between them itself. It can only do that when it chooses the executable; the moment we pass an
+/// explicit `executablePath` it launches exactly what we hand it. We were always handing over the
+/// full browser (`chrome.exe` / `Chromium.app`), so a headless request launched the HEADED binary
+/// and a window appeared on screen — most visibly on Windows, where the bundle ships `chrome.exe`
+/// and there is no `.app` indirection to hide it. The headless shell was already sitting in this
+/// list as an unreachable second choice.
+///
+/// So: when `headless`, prefer the headless shell and fall back to the full browser (a bundle that
+/// ships only the full browser still works — Chromium honours `--headless=new`); when headed, keep
+/// the full browser first, since the shell cannot render a window at all.
+fn chromium_exe_candidates_for(browser_dir: &Path, headless: bool) -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
-    {
+    let (headed, shell) = (
         vec![
-            browser_dir
-                .join("chrome-mac/Chromium.app/Contents/MacOS/Chromium"),
-            browser_dir
-                .join("chrome-mac/Chromium.app/Contents/MacOS/Chrome"),
-        ]
-    }
+            browser_dir.join("chrome-mac/Chromium.app/Contents/MacOS/Chromium"),
+            browser_dir.join("chrome-mac/Chromium.app/Contents/MacOS/Chrome"),
+        ],
+        vec![
+            browser_dir.join("chrome-headless-shell-mac/chrome-headless-shell"),
+            browser_dir.join("chrome-mac/headless_shell"),
+        ],
+    );
     #[cfg(target_os = "windows")]
-    {
+    let (headed, shell) = (
+        vec![browser_dir.join("chrome-win/chrome.exe")],
         vec![
-            browser_dir.join("chrome-win/chrome.exe"),
+            browser_dir.join("chrome-headless-shell-win/chrome-headless-shell.exe"),
             browser_dir.join("chrome-win/headless_shell.exe"),
-        ]
-    }
+        ],
+    );
     #[cfg(all(unix, not(target_os = "macos")))]
-    {
+    let (headed, shell) = (
+        vec![browser_dir.join("chrome-linux/chrome")],
         vec![
-            browser_dir.join("chrome-linux/chrome"),
+            browser_dir.join("chrome-headless-shell-linux/chrome-headless-shell"),
             browser_dir.join("chrome-linux/headless_shell"),
-        ]
-    }
+        ],
+    );
     #[cfg(not(any(unix, windows)))]
-    {
+    let (headed, shell): (Vec<PathBuf>, Vec<PathBuf>) = {
         let _ = browser_dir;
-        Vec::new()
+        (Vec::new(), Vec::new())
+    };
+
+    if headless {
+        shell.into_iter().chain(headed).collect()
+    } else {
+        headed.into_iter().chain(shell).collect()
     }
 }
 
@@ -312,12 +415,23 @@ fn chromium_exe_candidates(browser_dir: &Path) -> Vec<PathBuf> {
 /// executable — every caller then falls back exactly as it did before, so a malformed bundle
 /// degrades to `system`/`none` rather than launching something unexpected.
 pub fn bundled_chromium_exe() -> Option<PathBuf> {
+    bundled_chromium_exe_for(false)
+}
+
+/// [`bundled_chromium_exe`] for a specific launch mode — see `chromium_exe_candidates_for`.
+/// The LAUNCHER must use this: picking the headed binary for a headless run is what put a
+/// browser window on screen.
+pub fn bundled_chromium_exe_for(headless: bool) -> Option<PathBuf> {
     let Some(root) = existing_env_path(ENV_BUNDLED_CHROMIUM) else {
         // Nothing exported by the shell — fall back to a Chromium we downloaded ourselves. This is
         // what makes the first-run download actually take effect: without it the browser installs,
         // `detect_chromium` reports it, and the launcher still runs something else entirely.
         return crate::browser::chromium_download::installed_exe();
     };
+    // The shell derives this from Tauri's `resource_dir()`, which on Windows carries a verbatim
+    // `\\?\` prefix. This path is handed to Playwright as `executablePath` and spawned BY NODE, so
+    // it must be plain for the same reason the driver path must be — see `install::simplified_path`.
+    let root = crate::browser::install::simplified_path(&root);
 
     // (1) already a binary.
     if root.is_file() {
@@ -325,7 +439,7 @@ pub fn bundled_chromium_exe() -> Option<PathBuf> {
     }
 
     // (2) a single browser dir.
-    for cand in chromium_exe_candidates(&root) {
+    for cand in chromium_exe_candidates_for(&root, headless) {
         if cand.exists() {
             return Some(cand);
         }
@@ -351,7 +465,7 @@ pub fn bundled_chromium_exe() -> Option<PathBuf> {
         .collect();
     children.sort();
     for child in children {
-        for cand in chromium_exe_candidates(&child) {
+        for cand in chromium_exe_candidates_for(&child, headless) {
             if cand.exists() {
                 return Some(cand);
             }
@@ -379,6 +493,8 @@ pub fn resolve_system_chromium() -> Option<PathBuf> {
             if !is_chromium_dir || !entry.path().is_dir() {
                 continue;
             }
+            // Detection, not launch: any recognisable binary answers "is a Chromium present?",
+            // so keep the default (headed-first) ordering. The LAUNCHER picks by mode.
             for cand in chromium_exe_candidates(&entry.path()) {
                 if cand.exists() {
                     return Some(cand);
@@ -626,31 +742,12 @@ const CHROMIUM_PIN_PLACEHOLDER: &str =
 /// artifact keys (`macos-aarch64` | `macos-x86_64` | `windows-x86_64` | `linux-x86_64`). `None` on a
 /// target we have no pins for — which the caller treats as fail-closed (no pin ⇒ refuse).
 fn current_platform_key() -> Option<&'static str> {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        Some("macos-aarch64")
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        Some("macos-x86_64")
-    }
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    {
-        Some("windows-x86_64")
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        Some("linux-x86_64")
-    }
-    #[cfg(not(any(
-        all(target_os = "macos", target_arch = "aarch64"),
-        all(target_os = "macos", target_arch = "x86_64"),
-        all(target_os = "windows", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "x86_64"),
-    )))]
-    {
-        None
-    }
+    // Delegates to the ONE mapping, which lives beside `HOST_BUILD` in `chromium_download`. This
+    // used to be an independent `cfg!` ladder and it had gone stale: it was missing
+    // `windows-aarch64`, so on ARM64 Windows a Chromium downloaded successfully and was then refused
+    // by this fail-closed gate with "no Chromium pin for this platform" — permanently, for a pin
+    // that was present in `chromium-pins.json` the whole time. Never re-inline this list.
+    crate::browser::chromium_download::platform_pin_key()
 }
 
 /// Extract the patchright/playwright Chromium REVISION from a resolved executable path — the `NNNN`
@@ -769,13 +866,12 @@ struct InstallCommand {
 /// installable is found (no bundled driver AND no dev `patchright`/`playwright` on PATH).
 fn resolve_install_command() -> Option<InstallCommand> {
     // 1. Bundled patchright driver: <driver>/node <driver>/package/cli.js install chromium.
-    if let Some(driver_dir) = existing_env_path(ENV_BUNDLED_DRIVER) {
-        // `WRIT_BUNDLED_DRIVER` may point at the driver DIR or directly at the node exe; handle both.
-        let driver_dir = if driver_dir.is_dir() {
-            driver_dir
-        } else {
-            driver_dir.parent().map(Path::to_path_buf).unwrap_or(driver_dir)
-        };
+    //
+    // Resolved by `install::bundled_driver_dir` (env var OR exe-relative discovery), which already
+    // normalises the dir-vs-node-exe shape. It previously read `WRIT_BUNDLED_DRIVER` directly, so an
+    // install where the shell never exported that var reported "no Chromium installer found (bundled
+    // driver missing)" while the driver sat in the install tree beside the daemon.
+    if let Some(driver_dir) = crate::browser::install::bundled_driver_dir() {
         let node = driver_dir.join(if cfg!(windows) { "node.exe" } else { "node" });
         let cli = driver_dir.join("package").join("cli.js");
         if node.exists() && cli.exists() {
@@ -794,7 +890,7 @@ fn resolve_install_command() -> Option<InstallCommand> {
         // (spawn → stream → verify) is layout-independent; only THIS resolver needs the exact path.
         tracing::warn!(
             dir = %driver_dir.display(),
-            "WRIT_BUNDLED_DRIVER set but node/cli.js not found in the expected layout"
+            "bundled driver dir resolved but node/cli.js not found in the expected layout"
         );
     }
 
@@ -926,6 +1022,36 @@ pub(crate) fn reset_install_progress_for_test() {
 mod tests {
     use super::*;
 
+    /// Since Playwright 1.57 headed and headless are DIFFERENT binaries, and an explicit
+    /// `executablePath` takes the choice away from the driver. Launching headless must therefore
+    /// ask for the headless shell FIRST — handing over the full browser is what put a visible
+    /// window on screen (most obviously on Windows, which ships a bare `chrome.exe`).
+    #[test]
+    fn headless_prefers_the_shell_and_headed_prefers_the_full_browser() {
+        let dir = Path::new("/tmp/browsers/chromium-1234");
+        let headless = chromium_exe_candidates_for(dir, true);
+        let headed = chromium_exe_candidates_for(dir, false);
+
+        let is_shell = |p: &PathBuf| {
+            let s = p.to_string_lossy().to_lowercase();
+            s.contains("headless-shell") || s.contains("headless_shell")
+        };
+
+        assert!(is_shell(&headless[0]), "headless must try the shell first: {headless:?}");
+        assert!(!is_shell(&headed[0]), "headed must try the full browser first: {headed:?}");
+
+        // Neither mode DROPS a candidate — a bundle shipping only one of the two still resolves
+        // (Chromium honours --headless=new, and the shell simply cannot draw a window).
+        assert_eq!(
+            headless.len(),
+            headed.len(),
+            "both orderings must offer the same set, only reordered"
+        );
+        for cand in &headed {
+            assert!(headless.contains(cand), "{cand:?} missing from the headless ordering");
+        }
+    }
+
     /// `WRIT_BUNDLED_CHROMIUM` pointing at an existing path ⇒ `source = bundled` + `available`.
     #[test]
     fn bundled_chromium_detected_when_env_set_to_existing_path() {
@@ -1029,17 +1155,32 @@ mod tests {
         }
     }
 
-    /// `driver.bundled` mirrors `WRIT_BUNDLED_DRIVER` (set+exists ⇒ true; unset ⇒ false).
+    /// `driver.bundled` reflects a REAL driver layout, not merely a set env var.
+    ///
+    /// The old contract was "`WRIT_BUNDLED_DRIVER` set + path exists ⇒ bundled", which reported
+    /// `bundled: true` for any directory at all — including an empty one that could never launch —
+    /// and `bundled: false` on a shipped install whose driver was present but whose launcher never
+    /// exported the var. Both halves are asserted here.
     #[test]
-    fn driver_bundled_reflects_env() {
+    fn driver_bundled_requires_a_real_driver_layout() {
         let _g = crate::local::config::test_env_guard();
         std::env::remove_var(ENV_BUNDLED_DRIVER);
-        assert!(!detect_driver().bundled, "unset ⇒ not bundled");
 
+        // An EMPTY dir is not a driver, however the env var is set.
+        let empty = tempfile::tempdir().unwrap();
+        std::env::set_var(ENV_BUNDLED_DRIVER, empty.path());
+        assert!(!detect_driver().bundled, "empty dir ⇒ not bundled");
+
+        // A real layout (node[.exe] + package/cli.js) is.
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("package")).unwrap();
+        std::fs::write(dir.path().join("package").join("cli.js"), "").unwrap();
+        // Create BOTH names so the assertion holds on Windows and unix alike.
+        std::fs::write(dir.path().join("node"), "").unwrap();
+        std::fs::write(dir.path().join("node.exe"), "").unwrap();
         std::env::set_var(ENV_BUNDLED_DRIVER, dir.path());
         let d = detect_driver();
-        assert!(d.bundled, "set+exists ⇒ bundled");
+        assert!(d.bundled, "real driver layout ⇒ bundled");
         assert_eq!(d.path.as_deref(), Some(dir.path().to_string_lossy().as_ref()));
 
         std::env::remove_var(ENV_BUNDLED_DRIVER);
