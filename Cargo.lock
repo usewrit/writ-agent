@@ -5923,7 +5923,7 @@ dependencies = [
 
 [[package]]
 name = "writ-agent"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "age",
  "anyhow",
@@ -5954,6 +5954,7 @@ dependencies = [
  "keyring",
  "lazy_static",
  "libsqlite3-sys",
+ "md-5",
  "opener",
  "playwright-rs",
  "pulldown-cmark",

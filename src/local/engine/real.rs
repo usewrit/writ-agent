@@ -1068,7 +1068,10 @@ impl RealEngine {
         // so a browser sign-in's session (cookies + bearer/api-key headers) can be harvested and reused
         // over the HTTP lane on the NEXT run — the browser cost is then paid only when the session goes
         // stale. Attached only when persistence is on (cheap no-op listener otherwise).
-        let captured_headers = if wf.session_persistence != 0 {
+        // Persona runs capture too: the harvested session is written back onto the
+        // PERSONA after a successful run (cloud parity), which is what lets a login
+        // workflow establish the session an authenticated crawl replays.
+        let captured_headers = if wf.session_persistence != 0 || resolved_persona.is_some() {
             Some(crate::automation::session_state::attach_auth_header_capture(&context).await)
         } else {
             None
@@ -1759,6 +1762,26 @@ impl RealEngine {
                 .await;
                 state.fingerprint = serde_json::to_value(&fp_used).ok();
                 super::http::persist_browser_session(db, vault, wf.id, &state).await;
+            }
+        }
+
+        // PERSONA WRITE-BACK. On a successful run that resolved a persona, harvest the
+        // live session (cookies + storage + captured auth headers) onto the PERSONA row
+        // — not just workflow_sessions. This is the capture half of persona sign-in:
+        // without it a login workflow can run perfectly and the persona still ends up
+        // sessionless, so an authenticated crawl can never start. Done while the
+        // context is still open; best-effort (never fails the run).
+        if step_failure.is_none() {
+            if let Some(pid) = resolved_persona.as_ref().map(|p| p.persona_id) {
+                if let Some(cap) = &captured_headers {
+                    let headers = cap.lock().map(|m| m.clone()).unwrap_or_default();
+                    let mut state = crate::automation::session_state::extract_session_state(
+                        &page, &context, &headers,
+                    )
+                    .await;
+                    state.fingerprint = serde_json::to_value(&fp_used).ok();
+                    super::persona::save_session_state(db, vault, pid, &state).await;
+                }
             }
         }
 

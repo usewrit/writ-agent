@@ -1,6 +1,6 @@
 [package]
 name = "writ-agent"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 rust-version = "1.88"
 description = "Writ Agent — run browser automation on your machine"
@@ -89,6 +89,10 @@ playwright-rs = { version = "0.13", default-features = true }
 jsonwebtoken = "9"
 hmac = "0.12"
 sha2 = "0.10"
+# Crawl document capture: md5 is the storage-ETag-verified dedupe key the backend
+# checks at artifact-finalize (single-part PUT ETag == MD5). Already in the lock
+# as a transitive dep; pinned direct here for crawl_shard::capture.
+md-5 = "0.10"
 # Unpacking the first-run Chromium download (browser/chromium_download.rs). `deflate` only — the
 # Chromium snapshot archives use it, and the extra codecs would pull in more of the supply chain
 # than a zip reader needs to justify.

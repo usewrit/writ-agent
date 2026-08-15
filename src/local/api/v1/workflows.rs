@@ -306,7 +306,12 @@ async fn list(
     State(st): State<AppState>,
     Query(q): Query<ListQuery>,
 ) -> LocalResult<Json<Value>> {
-    let rows = workflows::list(&st.db, q.active_only, q.limit).await?;
+    let mut rows = workflows::list(&st.db, q.active_only, q.limit).await?;
+    // Cloud parity (automation.py list_workflows): crawl workflows are Dragnet
+    // machinery, not user workflows — they live on /crawls, and surfacing them here
+    // would offer them everywhere a workflow can be picked (run modals, the persona
+    // login-workflow dropdown) where running one is never what the user means.
+    rows.retain(|wf| wf.workflow_type != "crawl");
     let items = rows.iter().map(|wf| redact(wf, &st.vault)).collect::<LocalResult<Vec<_>>>()?;
     Ok(Json(json!({ "data": items, "count": items.len() })))
 }

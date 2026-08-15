@@ -18,6 +18,7 @@
 //! fails it rather than stranding it "crawling" forever.
 
 pub mod body_limit;
+pub mod capture;
 pub mod doc_extract;
 pub mod extract;
 pub mod robots;
@@ -661,7 +662,12 @@ impl ShardResult {
 /// Build a minimal per-shard [`CrawlConfig`]. Scope/robots/depth/budget are the COORDINATOR's job
 /// (the URLs arrive pre-admitted), so those fields are inert here — only the extraction spec,
 /// politeness delay, browser availability, and auth cookies matter for fetching the batch.
-fn build_shard_config(spec: &ShardExtract, auth: CrawlAuth, browser_available: bool) -> CrawlConfig {
+fn build_shard_config(
+    spec: &ShardExtract,
+    auth: CrawlAuth,
+    browser_available: bool,
+    artifact: Option<crate::automation::files::ArtifactContext>,
+) -> CrawlConfig {
     CrawlConfig {
         seed_host: String::new(),
         seed_reg: String::new(),
@@ -682,6 +688,7 @@ fn build_shard_config(spec: &ShardExtract, auth: CrawlAuth, browser_available: b
         auth,
         // Shard runs ship page thumbnails; the coordinator offloads them to storage.
         want_thumbnails: true,
+        artifact,
     }
 }
 
@@ -694,9 +701,10 @@ pub(crate) async fn run_crawl_shard(
     spec: ShardExtract,
     auth: CrawlAuth,
     progress: Option<ProgressSink>,
+    artifact: Option<crate::automation::files::ArtifactContext>,
 ) -> ShardResult {
     let browser_available = browser.is_some();
-    let cfg = Arc::new(build_shard_config(&spec, auth, browser_available));
+    let cfg = Arc::new(build_shard_config(&spec, auth, browser_available, artifact));
     let client = build_http_client();
 
     let total = items.len() as u64;
@@ -774,7 +782,7 @@ pub(crate) async fn run_crawl_shard(
         let url = out.url;
         let depth = out.depth;
         match out.outcome {
-            PageOutcome::Extracted { title, rows, links, favicon, content_kind, lane, screenshot } => {
+            PageOutcome::Extracted { title, rows, links, favicon, content_kind, lane, screenshot, file } => {
                 match lane {
                     "browser" => n_browser += 1,
                     "doc" => n_doc += 1,
@@ -803,6 +811,12 @@ pub(crate) async fn run_crawl_shard(
                 }
                 if let (Some(obj), Some(b64)) = (page.as_object_mut(), shot_b64.as_ref()) {
                     obj.insert("screenshot_b64".into(), json!(b64));
+                }
+                // Captured-document stamp (doc lane only). The rows already carry their copy
+                // (stamped where the capture ran, so a document's few rows show the file in the
+                // dataset too — unlike thumbnails, this is a ~100-byte handle, not a JPEG).
+                if let (Some(obj), Some(f)) = (page.as_object_mut(), file.as_ref()) {
+                    obj.insert("file".into(), f.clone());
                 }
                 pages.push(page);
                 // The thumbnail is stamped on the PAGE only, never on every row. A schema page can
@@ -892,6 +906,9 @@ pub async fn run_shard_from_message(
     task_id: &str,
     config: &Value,
     progress: Option<ProgressSink>,
+    // Artifact-callback context for document capture; `None` ⇒ extract-only
+    // (self-host fleet — the coordinator has no artifact endpoints).
+    artifact: Option<crate::automation::files::ArtifactContext>,
 ) -> Value {
     let tc = config
         .get("trigger_context")
@@ -971,7 +988,7 @@ pub async fn run_shard_from_message(
         );
     }
     let spec = ShardExtract { mode, schema, delay_ms, render_mode, ocr_mode, content };
-    let result = run_crawl_shard(browser, items, spec, auth, progress).await;
+    let result = run_crawl_shard(browser, items, spec, auth, progress, artifact).await;
 
     json!({
         "type": "task_result",
@@ -1141,6 +1158,12 @@ struct CrawlConfig {
     /// they ship it as `screenshot_b64` for the coordinator to move into storage. The local
     /// in-process crawler leaves it false so its SQLite rows stay lean.
     want_thumbnails: bool,
+    /// Artifact-callback context for DOCUMENT CAPTURE (§4.4, crawl dialect): when set, every
+    /// PDF/office-doc/image/CSV the shard reaches is ALSO stored as a tenant file via
+    /// artifact-init/finalize (dedupe'd server-side per source_url), and the page/rows carry a
+    /// `file` stamp the backend verifies at completion. `None` ⇒ extract-only (local crawler,
+    /// self-host fleet without the artifact endpoints).
+    artifact: Option<crate::automation::files::ArtifactContext>,
 }
 
 // Read only by the `local`-gated whole-crawl control loop (it needs the SQLite store), but the
@@ -1189,6 +1212,11 @@ enum PageOutcome {
         /// shard runner base64s it onto the wire as `screenshot_b64`; the coordinator moves it into
         /// storage and rewrites it to a served path, so it never persists inline.
         screenshot: Option<Vec<u8>>,
+        /// Captured-document stamp `{file_id, filename, size, content_type, version}` when the
+        /// page was a document the shard stored via the artifact lane (doc lane + capture set
+        /// only). Stamped onto the page meta AND its rows; the coordinator verifies it against
+        /// the StoredFile rows actually finalized for the crawl before persisting.
+        file: Option<Value>,
     },
     /// HTTP came back but the content is a thin JS shell / an error status — retry with a browser.
     /// `thin_html` carries the HTTP body (if any) so a failed browser attempt can still degrade to it.
@@ -1264,10 +1292,9 @@ async fn fetch_resolve(
 
 /// Load the persona's saved session for a LOCAL crawl and shape it for both fetch lanes.
 ///
-/// `Err(message)` is a user-facing refusal: the persona vanished, or it has no usable session left.
-/// The session itself is only ever produced by an interactive sign-in (persona linking / a prior
-/// run) — a crawl replays one, it never logs in — so "expired" genuinely means the user has to
-/// re-link before pages behind the login are reachable.
+/// `Err(message)` is a user-facing refusal: the persona vanished, it could not sign in, or it has
+/// no usable session left. A persona WITH a login workflow (0025) signs itself in here first —
+/// single-flight per persona — so "expired" is only terminal for a persona that cannot self-login.
 #[cfg(feature = "local")]
 async fn resolve_local_crawl_auth(
     state: &AppState,
@@ -1275,6 +1302,20 @@ async fn resolve_local_crawl_auth(
     seed_url: &str,
 ) -> Result<CrawlAuth, String> {
     use crate::local::engine::persona::resolve_persona;
+
+    // LOGIN-BEFORE-CRAWL, now self-healing: a persona with a LOGIN WORKFLOW (0025)
+    // signs itself in, so a missing/expired session is a recoverable condition, not a
+    // dead end. ensure_fresh_session is single-flight per persona, so a re-kicked
+    // seeder can't stack concurrent logins against the account. No login workflow →
+    // the old actionable refusal, now saying what to DO about it.
+    let login = crate::local::persona_login::ensure_fresh_session(state, persona_id, false).await;
+    if !login.ok {
+        return Err(login.error.unwrap_or_else(|| {
+            "This crawl's persona could not sign in. Record or attach a login workflow \
+             for it, then start the crawl."
+                .to_string()
+        }));
+    }
 
     let resolved = resolve_persona(&state.db, &state.vault, persona_id)
         .await
@@ -1287,7 +1328,8 @@ async fn resolve_local_crawl_auth(
 
     let Some(session) = resolved.session_state.as_ref() else {
         return Err("This crawl's persona has no saved login session yet. Sign in once with \
-                    the persona so pages behind the login are reachable, then start the crawl."
+                    the persona (or attach a login workflow so it can sign itself in), then \
+                    start the crawl."
             .to_string());
     };
     // Serialize through the wire shape so the local and coordinator paths parse ONE format —
@@ -1833,6 +1875,7 @@ async fn resolve_outcome(
                                 content_kind,
                                 lane: "ocr",
                                 screenshot: thumb,
+                                file: None,
                             };
                         }
                     }
@@ -1849,6 +1892,7 @@ async fn resolve_outcome(
                 content_kind: "html".into(),
                 lane: "browser",
                 screenshot: thumb,
+                file: None,
             };
         }
     }
@@ -1884,6 +1928,7 @@ async fn resolve_outcome(
             lane: "http",
             // No render happened, so there is no thumbnail (the favicon covers the HTTP lane).
             screenshot: None,
+            file: None,
         };
     }
     PageOutcome::Failed { reason: "no content (HTTP failed, browser unavailable)".into() }
@@ -1974,11 +2019,34 @@ async fn fetch_and_extract(client: reqwest::Client, cfg: Arc<CrawlConfig>, item:
             match doc_extract::extract(&bytes, &fetched.content_type, &fetched.final_url, &cfg.ocr_mode).await {
                 Some(doc) => {
                     let now = now_iso();
-                    let (title, rows, content_kind, lane) =
+                    let (title, mut rows, content_kind, lane) =
                         rows_from_doc(&doc, &fetched.final_url, item.depth, &now, &cfg.extract_mode);
+                    // Store the ORIGINAL document as a tenant file (additive; the
+                    // extracted rows above stay the crawl's primary product).
+                    // Dedupe'd server-side per source_url, so an unchanged document
+                    // on a re-crawl uploads nothing. The stamp is verified against
+                    // the DB at completion — a page can never claim a file the
+                    // backend didn't finalize for this crawl.
+                    let mut file: Option<Value> = None;
+                    if let Some(artifact) = cfg.artifact.as_ref() {
+                        if capture::is_capturable(&fetched.content_type, &fetched.final_url) {
+                            file = capture::capture_document(
+                                artifact, &fetched.final_url, &bytes, &fetched.content_type,
+                            )
+                            .await;
+                            if let Some(f) = file.as_ref() {
+                                for r in rows.iter_mut() {
+                                    if let Some(obj) = r.as_object_mut() {
+                                        obj.insert("file".into(), f.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
                     PageOutcome::Extracted {
                         title, rows, links: Vec::new(), favicon: None, content_kind, lane,
                         screenshot: None,
+                        file,
                     }
                 }
                 None => PageOutcome::Failed {
@@ -2059,6 +2127,7 @@ async fn fetch_and_extract(client: reqwest::Client, cfg: Arc<CrawlConfig>, item:
             content_kind: "html".into(), lane: "http",
             // HTTP lane: nothing was rendered, so there is no thumbnail.
             screenshot: None,
+            file: None,
         }
     };
     WorkerOut { url: item.url, depth: item.depth, outcome }
@@ -2664,6 +2733,9 @@ fn build_config(crawl: &CrawlJob, browser_available: bool, auth: CrawlAuth) -> C
         // No page thumbnails locally: there is no coordinator to offload them to, so they would
         // land as base64 inside the local SQLite rows.
         want_thumbnails: false,
+        // No document capture locally: the artifact lane is a cloud-backend endpoint; local
+        // crawls keep documents extract-only.
+        artifact: None,
     }
 }
 
@@ -2846,6 +2918,7 @@ mod tests {
             browser_available: false,
             auth: CrawlAuth::default(),
             want_thumbnails: false,
+            artifact: None,
         }
     }
 
@@ -3081,7 +3154,7 @@ mod tests {
             "trigger_context": {"_crawl_id": 7, "_crawl_shard": [], "_crawl_extract": {"mode": "markdown"}}
         });
         // No browser needed for an empty shard (no URLs → no JS fallback).
-        let frame = run_shard_from_message(None, "42", &config, None).await;
+        let frame = run_shard_from_message(None, "42", &config, None, None).await;
         assert_eq!(frame["type"], json!("task_result"));
         assert_eq!(frame["task_id"], json!("42"));
         assert_eq!(frame["success"], json!(true));
@@ -3289,6 +3362,7 @@ mod tests {
             &ShardExtract { mode: "schema".into(), schema: Some(json!({"row_selector": ".x"})), delay_ms: 500, render_mode: "auto".into(), ocr_mode: "auto".into(), content: None },
             CrawlAuth::default(),
             false,
+            None,
         );
         assert_eq!(cfg.extract_mode, "schema");
         assert_eq!(cfg.delay_ms, 500);

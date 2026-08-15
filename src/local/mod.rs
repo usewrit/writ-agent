@@ -49,6 +49,7 @@ pub mod mcp;
 pub mod ai;
 pub mod auth;
 pub mod authenticator_import;
+pub mod persona_login;
 pub mod runtime_token;
 pub mod ws_ticket;
 pub mod tls;

@@ -482,6 +482,16 @@ impl SaaSBridge {
         if !has_files {
             return None;
         }
+        self.artifact_context_core(task_id).await
+    }
+
+    /// The auth/base-url core of [`build_artifact_context`], without the file-bearing
+    /// gate. Crawl shards call this directly: their capture target is any DOCUMENT the
+    /// shard discovers, which no `config.files` map announces up front.
+    async fn artifact_context_core(
+        &self,
+        task_id: &str,
+    ) -> Option<crate::automation::files::ArtifactContext> {
         // Backend tasks are integer-keyed; a non-numeric id (e.g. scheduled-monitor
         // `sched-...`) has no backend task to attach captures to.
         if task_id.parse::<i64>().is_err() {
@@ -975,13 +985,18 @@ impl SaaSBridge {
                     let outgoing = self.outgoing_tx.clone();
                     let browser = self.recorder.browser_manager.clone();
                     let tid = task_id.clone();
+                    // Document capture (§4.4, crawl dialect): the same artifact context a
+                    // wait_for_download step uses lets the shard store every discovered
+                    // PDF/office-doc/image as a tenant file on top of the doc-extract rows.
+                    // None (no token / non-backend id) ⇒ capture silently off.
+                    let artifact_ctx = self.artifact_context_core(&tid).await;
                     tokio::spawn(async move {
                         // Live page tally while the batch runs — same contract the fleet bridge
                         // sends, so the cloud backend credits crawl progress identically whichever
                         // agent (this one, or the Python fleet agent) is running the shard.
                         let progress = spawn_crawl_progress_forwarder(outgoing.clone(), tid.clone());
                         let frame = crate::crawl_shard::run_shard_from_message(
-                            Some(browser), &tid, &cfg, Some(progress),
+                            Some(browser), &tid, &cfg, Some(progress), artifact_ctx,
                         )
                         .await;
                         let _ = outgoing.send(BridgeOutgoing::Json(frame));

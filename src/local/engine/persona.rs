@@ -324,6 +324,56 @@ pub fn resolve_from_row(vault: &Vault, row: &Persona) -> LocalResult<ResolvedPer
     })
 }
 
+/// Seal a freshly-harvested [`SessionState`] onto the persona row — the WRITE-BACK half
+/// of the sign-in loop (cloud parity with `_process_task_completion`'s `_persona_id`
+/// save). Until 0025 this path did not exist locally at all: a successful run harvested
+/// its session only into `workflow_sessions` (workflow-keyed, for the HTTP lane), so a
+/// persona could never acquire a session and an authenticated crawl could never start.
+///
+/// The expiry stored is the EARLIEST expiring cookie (epoch seconds → RFC3339), matching
+/// how the freshness probe (`persona_login::session_is_fresh`) and the cloud read it.
+/// Session-cookies (`expires < 0`) don't bound it. Best-effort: a failure here must
+/// never fail the run that produced the session.
+pub(crate) async fn save_session_state(
+    db: &sqlx::SqlitePool,
+    vault: &Vault,
+    persona_id: i64,
+    state: &crate::models::session::SessionState,
+) {
+    let bytes = match serde_json::to_vec(state) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(persona_id, error = %e, "could not serialize persona session — not persisting");
+            return;
+        }
+    };
+    let sealed = match vault.seal_field(&bytes, &persona_aad(AAD_SESSION_STATE, persona_id)) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(persona_id, error = %e, "could not seal persona session — not persisting");
+            return;
+        }
+    };
+    let earliest_expiry: Option<String> = state
+        .cookies
+        .iter()
+        .filter_map(|c| c.get("expires").and_then(|v| v.as_f64()))
+        .filter(|e| *e > 0.0)
+        .fold(None::<f64>, |acc, e| Some(acc.map_or(e, |a| a.min(e))))
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs as i64, 0))
+        .map(|t| t.to_rfc3339());
+    if let Err(e) = crate::local::store::personas::save_session(
+        db,
+        persona_id,
+        &sealed,
+        earliest_expiry.as_deref(),
+    )
+    .await
+    {
+        tracing::warn!(persona_id, error = %e, "could not persist persona session");
+    }
+}
+
 /// Mint the CURRENT RFC-6238 TOTP code for a persona, re-reading the sealed seed at call time.
 ///
 /// A TOTP code is only valid for one ~30s window, but a run can take much longer than that to walk

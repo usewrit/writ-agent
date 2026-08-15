@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-08-15
+
+### Added
+
+- **A persona can sign itself in.** A persona's warm session could previously only arrive by capture
+  from something that had already signed in — and locally that capture never happened: a successful
+  run harvested its session under the workflow, never onto the persona. So a persona created from
+  credentials alone never had a session, and every authenticated local crawl using it was refused
+  with no route out of the error. A persona can now name the workflow that performs its login
+  (migration `0025`); running that workflow with the persona resolved folds in its credentials and
+  2FA, and the harvested session is written back onto the persona. Sign-in happens on demand and
+  automatically when a crawl finds the session stale, and the last failure is recorded so the reason
+  is visible without digging through run history. Deleting the login workflow leaves the identity
+  intact — it only leaves the persona unable to re-login until another workflow is attached.
+- **Concurrent sign-in attempts collapse to one.** When several callers want the same persona signed
+  in at once — a crawl seeder retrying, someone pressing "sign in" repeatedly — one performs the
+  login and the rest wait on its result. N simultaneous logins against a single account is the
+  pattern that trips a site's abuse defences and gets the account locked.
+- **Documents found while crawling are stored, not just parsed.** A discovered document's raw bytes
+  are captured as a tenant file alongside the extracted text, deduplicated by content so an unchanged
+  document is linked rather than re-uploaded. Capture is additive by design: with no artifact
+  endpoint available, no token, or any error on the way, the page still succeeds — the extracted text
+  is the crawl's product and must never fail because the original could not be stored.
+
 ## [1.0.4] - 2026-08-13
 
 ### Fixed

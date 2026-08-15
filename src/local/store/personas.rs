@@ -69,6 +69,14 @@ pub struct Persona {
     pub updated_at: Option<String>,
     #[serde(default)]
     pub last_used_at: Option<String>,
+    /// Workflow that SIGNS THIS PERSONA IN (0025). Running it with the persona resolved
+    /// establishes/refreshes `session_state_encrypted`; NULL = the persona cannot
+    /// self-login and its session can only ever be captured elsewhere.
+    #[serde(default)]
+    pub login_workflow_id: Option<i64>,
+    /// Why the most recent sign-in attempt failed (cleared on success).
+    #[serde(default)]
+    pub last_login_error: Option<String>,
 }
 
 impl std::fmt::Debug for Persona {
@@ -134,6 +142,8 @@ pub struct NewPersona {
     pub earliest_cookie_expiry: Option<String>,
     #[serde(default)]
     pub expires_at: Option<String>,
+    #[serde(default)]
+    pub login_workflow_id: Option<i64>,
 }
 
 impl std::fmt::Debug for NewPersona {
@@ -223,12 +233,14 @@ pub async fn insert(pool: &SqlitePool, p: &NewPersona) -> LocalResult<Persona> {
             name, description, target_domain, login_username, credentials_encrypted,
             twofa_method, totp_seed_encrypted, totp_digits, totp_period_seconds, totp_algorithm,
             email_otp_mode, relay_address, otp_extract_config, fingerprint,
-            proxy_config_encrypted, session_state_encrypted, earliest_cookie_expiry, expires_at
+            proxy_config_encrypted, session_state_encrypted, earliest_cookie_expiry, expires_at,
+            login_workflow_id
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5,
             COALESCE(?6, 'none'), ?7, COALESCE(?8, 6), COALESCE(?9, 30), COALESCE(?10, 'SHA1'),
             ?11, ?12, ?13, ?14,
-            ?15, ?16, ?17, ?18
+            ?15, ?16, ?17, ?18,
+            ?19
         )
         RETURNING *
         "#,
@@ -251,6 +263,7 @@ pub async fn insert(pool: &SqlitePool, p: &NewPersona) -> LocalResult<Persona> {
     .bind(&p.session_state_encrypted)
     .bind(&p.earliest_cookie_expiry)
     .bind(&p.expires_at)
+    .bind(p.login_workflow_id)
     .fetch_one(pool)
     .await?;
     tracing::info!(persona_id = row.id, name = %row.name, "persona inserted");
@@ -374,6 +387,100 @@ pub async fn mark_login(pool: &SqlitePool, id: i64, status: &str) -> LocalResult
     .bind(status)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Point the persona at (or detach from) its LOGIN WORKFLOW — the workflow that signs
+/// it in. A dedicated setter (not `PersonaUpdate`) because the COALESCE-based update
+/// cannot write NULL, and detaching IS writing NULL.
+pub async fn set_login_workflow(
+    pool: &SqlitePool,
+    id: i64,
+    workflow_id: Option<i64>,
+) -> LocalResult<Option<Persona>> {
+    let row = sqlx::query_as::<_, Persona>(
+        r#"
+        UPDATE personas SET
+            login_workflow_id = ?2,
+            updated_at        = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?1
+        RETURNING *
+        "#,
+    )
+    .bind(id)
+    .bind(workflow_id)
+    .fetch_optional(pool)
+    .await?;
+    if row.is_some() {
+        tracing::info!(persona_id = id, login_workflow_id = ?workflow_id, "persona login workflow set");
+    }
+    Ok(row)
+}
+
+/// Record the outcome of a sign-in attempt: `error = None` marks success (clears the
+/// stored error, stamps `last_login_at`, `validation_status = 'valid'`); `Some(msg)`
+/// stores why it failed so the UI can explain without digging through run history.
+pub async fn record_login_result(pool: &SqlitePool, id: i64, error: Option<&str>) -> LocalResult<()> {
+    match error {
+        None => {
+            sqlx::query(
+                r#"
+                UPDATE personas SET
+                    last_login_error  = NULL,
+                    validation_status = 'valid',
+                    last_login_at     = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    updated_at        = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(id)
+            .execute(pool)
+            .await?;
+        }
+        Some(msg) => {
+            sqlx::query(
+                r#"
+                UPDATE personas SET
+                    last_login_error = ?2,
+                    updated_at       = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE id = ?1
+                "#,
+            )
+            .bind(id)
+            .bind(msg)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Store a freshly-harvested (already SEALED) warm session on the persona, with its
+/// optional expiry. The write-back half of the sign-in loop: the engine seals the
+/// session it extracted after a successful persona run and lands it here.
+pub async fn save_session(
+    pool: &SqlitePool,
+    id: i64,
+    sealed_blob: &str,
+    expires_at: Option<&str>,
+) -> LocalResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE personas SET
+            session_state_encrypted = ?2,
+            expires_at              = ?3,
+            validation_status       = 'valid',
+            last_login_at           = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+            updated_at              = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?1
+        "#,
+    )
+    .bind(id)
+    .bind(sealed_blob)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    tracing::info!(persona_id = id, "persona warm session saved");
     Ok(())
 }
 

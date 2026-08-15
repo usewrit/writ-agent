@@ -58,6 +58,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/personas/import/authenticator/commit", post(import_commit))
         .route("/v1/personas/:id", get(get_one).patch(update_one).delete(remove))
         .route("/v1/personas/:id/test-2fa", post(test_twofa))
+        .route("/v1/personas/:id/sign-in", post(sign_in))
         .route("/v1/personas/:id/runs", get(persona_runs))
 }
 
@@ -134,6 +135,10 @@ struct PersonaWrite {
     proxy_lawful_use_ack: Option<bool>,
     #[serde(default)]
     is_active: Option<bool>,
+    /// Workflow that SIGNS THIS PERSONA IN. Double-option: absent = untouched,
+    /// explicit null = DETACH (the persona can no longer self-login).
+    #[serde(default, deserialize_with = "double_option")]
+    login_workflow_id: Option<Option<i64>>,
 }
 
 impl PersonaWrite {
@@ -305,7 +310,7 @@ fn linked_secrets(vault: &Vault, p: &Persona) -> Map<String, Value> {
 /// Shape one persona row into the cloud `PersonaResponse` wire form the desktop UI reads. Secrets
 /// collapse to `has_*` booleans + `linked_secrets` names; cloud-only columns (mailbox, relay
 /// minting, preferred agent) are `null` locally. NEVER includes a `*_encrypted` column.
-fn shape(vault: &Vault, p: &Persona, linked_workflows: &[Value]) -> Value {
+fn shape(vault: &Vault, p: &Persona, linked_workflows: &[Value], login_workflow_name: Option<&str>) -> Value {
     // A vault-linked username is stored as a `{{vault:...}}` template — never surface the raw ref
     // (linked_secrets carries the link instead).
     let display_username = p
@@ -342,7 +347,45 @@ fn shape(vault: &Vault, p: &Persona, linked_workflows: &[Value]) -> Value {
         "updated_at": p.updated_at,
         "linked_workflows": linked_workflows,
         "linked_secrets": linked_secrets(vault, p),
+        "login_workflow_id": p.login_workflow_id,
+        "login_workflow_name": login_workflow_name,
+        "last_login_error": p.last_login_error.as_deref().filter(|s| !s.is_empty()),
+        // True when the persona can sign ITSELF in — the UI gates its "needs setup"
+        // state on this, not on has_warm_session (a point-in-time fact).
+        "can_self_login": p.login_workflow_id.is_some(),
     })
+}
+
+/// Batch `{workflow_id -> name}` for the personas' LOGIN workflows (display only).
+async fn login_workflow_names(
+    db: &sqlx::SqlitePool,
+    rows: &[Persona],
+) -> LocalResult<HashMap<i64, String>> {
+    let mut map = HashMap::new();
+    for wid in rows.iter().filter_map(|p| p.login_workflow_id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = map.entry(wid) {
+            if let Some(wf) = workflows::get_by_id(db, wid).await? {
+                e.insert(wf.name);
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// The login workflow must exist and must not be crawl machinery: a crawl workflow is
+/// not a recorded sign-in, and a persona whose "login" is a crawl would re-enter the
+/// very path that asked for the login.
+async fn assert_login_workflow_valid(db: &sqlx::SqlitePool, workflow_id: i64) -> LocalResult<()> {
+    let wf = workflows::get_by_id(db, workflow_id)
+        .await?
+        .ok_or_else(|| LocalError::NotFound(format!("login workflow {workflow_id}")))?;
+    if wf.workflow_type == "crawl" {
+        return Err(LocalError::BadRequest(
+            "A crawl workflow can't be used as a login workflow. Record or pick the              workflow that signs the account in."
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Batch `{persona_id -> [{id, name}]}` for every workflow with a default persona (one query).
@@ -386,10 +429,14 @@ async fn list(State(st): State<AppState>, Query(q): Query<ListQuery>) -> LocalRe
         }
     }
     let links = workflow_links(&st.db).await?;
+    let login_names = login_workflow_names(&st.db, &rows).await?;
     let empty: Vec<Value> = Vec::new();
     let items: Vec<Value> = rows
         .iter()
-        .map(|p| shape(&st.vault, p, links.get(&p.id).unwrap_or(&empty)))
+        .map(|p| {
+            let lw = p.login_workflow_id.and_then(|w| login_names.get(&w)).map(String::as_str);
+            shape(&st.vault, p, links.get(&p.id).unwrap_or(&empty), lw)
+        })
         .collect();
     Ok(Json(json!({ "data": items, "count": items.len() })))
 }
@@ -419,6 +466,13 @@ async fn create(State(st): State<AppState>, Json(body): Json<PersonaWrite>) -> L
     if personas::get_by_name(&st.db, &name).await?.is_some() {
         return Err(LocalError::BadRequest(format!("Persona '{name}' already exists")));
     }
+    let login_workflow_id = match &body.login_workflow_id {
+        Some(Some(wid)) => {
+            assert_login_workflow_valid(&st.db, *wid).await?;
+            Some(*wid)
+        }
+        _ => None,
+    };
 
     let new = NewPersona {
         name,
@@ -433,6 +487,7 @@ async fn create(State(st): State<AppState>, Json(body): Json<PersonaWrite>) -> L
         relay_address: body.relay_address.clone(),
         otp_extract_config: otp_extract.filter(|s| !s.is_empty()),
         fingerprint: fingerprint.filter(|s| !s.is_empty()),
+        login_workflow_id,
         ..Default::default()
     };
     let row = personas::insert(&st.db, &new).await?;
@@ -454,7 +509,9 @@ async fn create(State(st): State<AppState>, Json(body): Json<PersonaWrite>) -> L
         }
     };
 
-    Ok(Json(shape(&st.vault, &row, &[])))
+    let login_names = login_workflow_names(&st.db, std::slice::from_ref(&row)).await?;
+    let lw = row.login_workflow_id.and_then(|w| login_names.get(&w)).map(String::as_str);
+    Ok(Json(shape(&st.vault, &row, &[], lw)))
 }
 
 /// `GET /v1/personas/:id` — one persona (shaped) or 404.
@@ -463,8 +520,10 @@ async fn get_one(State(st): State<AppState>, Path(id): Path<i64>) -> LocalResult
         .await?
         .ok_or_else(|| LocalError::NotFound(format!("persona {id}")))?;
     let links = workflow_links(&st.db).await?;
+    let login_names = login_workflow_names(&st.db, std::slice::from_ref(&p)).await?;
+    let lw = p.login_workflow_id.and_then(|w| login_names.get(&w)).map(String::as_str);
     let empty: Vec<Value> = Vec::new();
-    Ok(Json(shape(&st.vault, &p, links.get(&p.id).unwrap_or(&empty))))
+    Ok(Json(shape(&st.vault, &p, links.get(&p.id).unwrap_or(&empty), lw)))
 }
 
 /// `PATCH /v1/personas/:id` — partial update. Cloud semantics: simple fields patch individually;
@@ -507,9 +566,27 @@ async fn update_one(
     let row = personas::update(&st.db, id, &patch)
         .await?
         .ok_or_else(|| LocalError::NotFound(format!("persona {id}")))?;
+
+    // Login workflow: absent = untouched; explicit null = DETACH; a value must
+    // exist and not be crawl machinery. A dedicated setter because the
+    // COALESCE-based update above cannot write NULL.
+    let row = match &body.login_workflow_id {
+        None => row,
+        Some(next) => {
+            if let Some(wid) = next {
+                assert_login_workflow_valid(&st.db, *wid).await?;
+            }
+            personas::set_login_workflow(&st.db, id, *next)
+                .await?
+                .ok_or_else(|| LocalError::NotFound(format!("persona {id}")))?
+        }
+    };
+
     let links = workflow_links(&st.db).await?;
+    let login_names = login_workflow_names(&st.db, std::slice::from_ref(&row)).await?;
+    let lw = row.login_workflow_id.and_then(|w| login_names.get(&w)).map(String::as_str);
     let empty: Vec<Value> = Vec::new();
-    Ok(Json(shape(&st.vault, &row, links.get(&row.id).unwrap_or(&empty))))
+    Ok(Json(shape(&st.vault, &row, links.get(&row.id).unwrap_or(&empty), lw)))
 }
 
 /// `DELETE /v1/personas/:id` — hard-delete. 404 if absent.
@@ -519,6 +596,50 @@ async fn remove(State(st): State<AppState>, Path(id): Path<i64>) -> LocalResult<
         return Err(LocalError::NotFound(format!("persona {id}")));
     }
     Ok(Json(json!({ "id": id, "deleted": true })))
+}
+
+// ---------------------------------------------------------------------------
+// Sign-in — run the persona's login workflow to establish its warm session
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct SignInBody {
+    /// Re-run the login even when the current session still looks usable ("Sign in
+    /// now": a session that merely LOOKS live but the site has invalidated is the
+    /// exact case the button exists for).
+    #[serde(default)]
+    force: bool,
+}
+
+/// `POST /v1/personas/:id/sign-in` — run this persona's login workflow to establish
+/// (or refresh) its warm session. Cloud wire parity (`PersonaSignInResponse`).
+///
+/// Login FAILURES resolve `ok:false` with a human-actionable `error` (the UI renders
+/// it inline next to the button); only an unknown persona is a real 404.
+async fn sign_in(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    body: Option<Json<SignInBody>>,
+) -> LocalResult<Json<Value>> {
+    guard_unlocked()?;
+    personas::get_by_id(&st.db, id)
+        .await?
+        .ok_or_else(|| LocalError::NotFound(format!("persona {id}")))?;
+
+    let force = body.map(|Json(b)| b.force).unwrap_or(false);
+    let outcome = crate::local::persona_login::ensure_fresh_session(&st, id, force).await;
+
+    // Re-read: the sign-in wrote the captured session / last_login_* from the engine
+    // side, so the pre-dispatch row is stale by construction.
+    let p = personas::get_by_id(&st.db, id)
+        .await?
+        .ok_or_else(|| LocalError::NotFound(format!("persona {id}")))?;
+    Ok(Json(json!({
+        "ok": outcome.ok,
+        "error": outcome.error,
+        "has_warm_session": has(&p.session_state_encrypted),
+        "session_expires_at": p.expires_at,
+    })))
 }
 
 // ---------------------------------------------------------------------------
@@ -751,7 +872,7 @@ async fn import_commit(State(st): State<AppState>, Json(body): Json<ImportCommit
             .map(|blob| PersonaUpdate { totp_seed_encrypted: Some(blob), ..Default::default() });
         match sealed {
             Ok(patch) => match personas::update(&st.db, row.id, &patch).await {
-                Ok(Some(updated)) => created.push(shape(&st.vault, &updated, &[])),
+                Ok(Some(updated)) => created.push(shape(&st.vault, &updated, &[], None)),
                 Ok(None) | Err(_) => {
                     let _ = personas::delete(&st.db, row.id).await;
                     skipped.push(json!({ "idx": sel.idx, "reason": "could not store the seed" }));
@@ -1095,4 +1216,99 @@ mod tests {
         assert_eq!(names.len(), 2, "domain-less personas + suffix matches remain");
         assert!(names.contains(&"any") && names.contains(&"shop"));
     }
+
+    /// The persona-login surface: attach/detach via PATCH (double-option), refusal to
+    /// attach a crawl workflow, response wire fields, and the sign-in preconditions
+    /// (no login workflow → actionable ok:false, never a 500).
+    #[tokio::test]
+    async fn login_workflow_attach_detach_and_signin_preconditions() {
+        let (st, _vault) = fixture().await;
+
+        // A real (non-crawl) workflow to attach, and a crawl workflow that must be refused.
+        let wf = workflows::insert(
+            &st.db,
+            &workflows::NewWorkflow {
+                name: "Acme login".into(),
+                workflow_type: Some("recorded".into()),
+                steps: Some("[]".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let crawl_wf = workflows::insert(
+            &st.db,
+            &workflows::NewWorkflow {
+                name: "Dragnet: acme.test".into(),
+                workflow_type: Some("crawl".into()),
+                steps: Some("[]".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Create WITH a login workflow.
+        let created = create(
+            State(st.clone()),
+            write_body(json!({ "name": "Acme", "login_workflow_id": wf.id })),
+        )
+        .await
+        .unwrap();
+        let id = created.0["id"].as_i64().unwrap();
+        assert_eq!(created.0["login_workflow_id"].as_i64(), Some(wf.id));
+        assert_eq!(created.0["login_workflow_name"].as_str(), Some("Acme login"));
+        assert_eq!(created.0["can_self_login"], Value::Bool(true));
+
+        // A crawl workflow is refused as a login workflow.
+        let err = update_one(
+            State(st.clone()),
+            Path(id),
+            write_body(json!({ "login_workflow_id": crawl_wf.id })),
+        )
+        .await
+        .expect_err("crawl workflow must be refused");
+        assert!(format!("{err:?}").contains("crawl workflow"), "{err:?}");
+
+        // Explicit null DETACHES; an unrelated PATCH leaves the link alone.
+        let untouched = update_one(
+            State(st.clone()),
+            Path(id),
+            write_body(json!({ "description": "still attached" })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(untouched.0["login_workflow_id"].as_i64(), Some(wf.id));
+        let detached = update_one(
+            State(st.clone()),
+            Path(id),
+            write_body(json!({ "login_workflow_id": null })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(detached.0["login_workflow_id"], Value::Null);
+        assert_eq!(detached.0["can_self_login"], Value::Bool(false));
+
+        // Sign-in with NO login workflow: ok:false with an actionable error — a login
+        // outcome, not an HTTP error.
+        let res = sign_in(State(st.clone()), Path(id), Some(Json(SignInBody { force: false })))
+            .await
+            .unwrap();
+        assert_eq!(res.0["ok"], Value::Bool(false));
+        assert!(res.0["error"].as_str().unwrap().contains("login workflow"));
+
+        // Deleting the login workflow leaves the persona (SET NULL), not a broken row.
+        let reattached = update_one(
+            State(st.clone()),
+            Path(id),
+            write_body(json!({ "login_workflow_id": wf.id })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reattached.0["login_workflow_id"].as_i64(), Some(wf.id));
+        workflows::delete(&st.db, wf.id).await.unwrap();
+        let after = get_one(State(st.clone()), Path(id)).await.unwrap();
+        assert_eq!(after.0["login_workflow_id"], Value::Null, "FK is SET NULL");
+    }
 }
+

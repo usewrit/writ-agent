@@ -1961,8 +1961,12 @@ impl FleetBridge {
                             // minute of work; without this the coordinator's crawl counters cannot
                             // move until it ends, and the run reads as frozen on its first page.
                             let progress = spawn_crawl_progress_forwarder(out.clone(), task_id.clone());
+                            // No artifact context: the self-host coordinator this bridge serves has
+                            // no artifact-init/finalize endpoints, so document capture is off and
+                            // the shard is extract-only (the documented no-op, like doc-extract
+                            // without DOC_EXTRACT_URL).
                             let frame = crate::crawl_shard::run_shard_from_message(
-                                browser, &task_id, &config, Some(progress),
+                                browser, &task_id, &config, Some(progress), None,
                             ).await;
                             claim.settle(&out, frame);
                         });

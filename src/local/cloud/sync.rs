@@ -1552,6 +1552,10 @@ pub(crate) fn new_persona_from_cloud(c: &Value) -> personas::NewPersona {
         session_state_encrypted: None,
         earliest_cookie_expiry: None,
         expires_at: None,
+        // Cloud workflow ids are a different id-space than local rows — a synced
+        // persona can never carry the cloud's login_workflow_id verbatim. The user
+        // attaches a LOCAL login workflow after import.
+        login_workflow_id: None,
     }
 }
 
