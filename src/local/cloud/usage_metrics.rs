@@ -1,12 +1,19 @@
 //! Opt-in ANONYMIZED desktop usage metrics — the "how is the product actually used?" signal.
 //!
-//! This is the only product-analytics path in the desktop app, and it is **OFF by default**. It runs
+//! This is the only product-analytics path in the desktop app. It is **ON by default** and runs
 //! only when BOTH hold:
 //!
-//!   1. the user opted in (`[app].telemetry_opt_in` in `~/.writ/config.toml`, flipped by
-//!      Settings → General → "Diagnostics & telemetry" via `PUT /v1/settings/telemetry`), AND
-//!   2. the desktop is LINKED to a Writ Cloud account (there is no unauthenticated ingest — an
-//!      unlinked install has nowhere to send and never tries).
+//!   1. `[app].telemetry_opt_in` is true (the default; turn OFF any time via Settings → General →
+//!      "Diagnostics & telemetry" or `writ telemetry off` — an explicit `false` in
+//!      `~/.writ/config.toml` is always honored, and installs that opted out before the default
+//!      flipped stay opted out because the file carries their explicit value), AND
+//!   2. the desktop is LINKED to a coordinator (there is no unauthenticated ingest — an unlinked
+//!      install has nowhere to send and never tries).
+//!
+//! SELF-HOST SANITY: reports POST through [`CloudClient`] to whichever coordinator this install is
+//! linked to — a self-hosted link reports to YOUR OWN server's ingest, never to usewrit.app. The
+//! default-on therefore never phones home across deployments: cloud-linked installs report to Writ
+//! Cloud, self-hosted installs to themselves, unlinked installs to nobody.
 //!
 //! ## What is sent — and what is structurally impossible to send
 //!

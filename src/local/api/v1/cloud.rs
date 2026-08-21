@@ -97,6 +97,9 @@ pub fn router() -> Router<AppState> {
         //     so the Connect surfaces can print the real cloud run URL ---
         .route("/v1/cloud/reflect/local-workflows", get(reflect_local_workflows))
         // --- Cloud ACCOUNT api keys (`wt_`): mint / list / revoke without leaving the desktop ---
+        // --- Cloud RECORDING venue: one-shot gateway ticket + create-in-cloud save ---
+        .route("/v1/cloud/reflect/record-ticket", post(reflect_record_ticket))
+        .route("/v1/cloud/reflect/workflows/create", post(reflect_workflow_create))
         .route("/v1/cloud/reflect/api-keys", get(reflect_api_keys).post(reflect_api_key_create))
         .route("/v1/cloud/reflect/api-keys/catalog", get(reflect_api_key_catalog))
         .route("/v1/cloud/reflect/api-keys/:key_id/delete", post(reflect_api_key_delete))
@@ -885,6 +888,23 @@ async fn reflect_api_key_create(
     Json(body): Json<Value>,
 ) -> LocalResult<Json<Value>> {
     Ok(Json(reflect::create_cloud_api_key(&st.db, &body).await?))
+}
+
+/// `POST /v1/cloud/reflect/record-ticket` — mint a one-shot cloud recording-WS ticket
+/// (`{ticket, expires_in, record_ws_url}`) so the webview can dial the ws-gateway directly for a
+/// cloud-venue recording. The `wto_` stays daemon-side; only the single-use ticket crosses over.
+async fn reflect_record_ticket(State(st): State<AppState>) -> LocalResult<Json<Value>> {
+    Ok(Json(reflect::mint_record_ticket(&st.db).await?))
+}
+
+/// `POST /v1/cloud/reflect/workflows/create` — create a workflow ON the linked cloud account (the
+/// wizard's cloud-venue save; body = the cloud `WorkflowCreate`, forwarded verbatim). The cloud
+/// re-enforces plan limits; its refusal comes back as this route's error.
+async fn reflect_workflow_create(
+    State(st): State<AppState>,
+    Json(body): Json<Value>,
+) -> LocalResult<Json<Value>> {
+    Ok(Json(reflect::create_cloud_workflow(&st.db, &body).await?))
 }
 
 /// `POST /v1/cloud/reflect/api-keys/{key_id}/delete` — revoke an account key. POST rather than

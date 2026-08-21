@@ -380,6 +380,10 @@ impl BrowserManager {
                     // registry tracks LIVE contexts and cannot grow without bound on a
                     // long-lived agent.
                     super::stealth::forget_device(&guid);
+                    // Same lifecycle as the device script: the counter is armed per LANE
+                    // (only where workflow steps run), so this is a no-op for contexts
+                    // that never armed one.
+                    crate::automation::inflight::forget(&guid);
                     return;
                 }
             }

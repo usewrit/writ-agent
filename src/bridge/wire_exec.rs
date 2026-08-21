@@ -651,6 +651,32 @@ pub(crate) async fn handle_execute_workflow(
     // closes below go through the SAME guard (idempotent) so there is exactly one close per context.
     let mut ctx_guard = crate::browser::context::ContextCloseGuard::new(context.clone());
 
+    // Count document/XHR/fetch traffic on this context so a step can wait for the request
+    // IT started instead of a fixed pause — the difference between reading the page a
+    // click produced and the one it left, and between banking a signed-in jar and the
+    // anonymous one. Armed per lane (not at context creation) because a crawl shard makes
+    // thousands of requests it never needs to wait on. Forgotten by the slot watcher.
+    crate::automation::inflight::attach(&context).await;
+
+    // OPT-IN full-body capture (the coordinator's live optimizer sets `config.capture_network`).
+    // OFF by default so an ordinary run pays no body-download cost. The calls are sanitized —
+    // held credentials revealed as {{placeholders}}, unheld secrets redacted — before they
+    // leave this process; the plaintext of a login POST must never reach the coordinator.
+    let capture_network = config
+        .get("capture_network")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let net_capture: Option<Arc<tokio::sync::Mutex<crate::automation::network_capture::NetworkCapture>>> =
+        if capture_network {
+            let cap = Arc::new(tokio::sync::Mutex::new(
+                crate::automation::network_capture::NetworkCapture::new(),
+            ));
+            crate::ai::api_discovery_mode::attach_network_capture(&context, cap.clone()).await;
+            Some(cap)
+        } else {
+            None
+        };
+
     // Capture auth-related request headers (Bearer / X-Auth / API keys) during the
     // flow, so token-based auth is persisted too. Safe here because this function
     // owns the page/context locally (no DashMap lock held across awaits).
@@ -908,6 +934,35 @@ pub(crate) async fn handle_execute_workflow(
 
     let success = last_error.is_none();
 
+    // SETTLE FIRST — the login cookie is set by the RESPONSE to the last action, not
+    // by the action itself. A recorded sign-in ends at the submit click, so reading the
+    // jar the instant that click returns banks the PRE-login, ANONYMOUS session while
+    // the POST is still in flight. The run then reports a perfectly good `auth_session`
+    // that is actually signed OUT — and on sites that give anonymous visitors an
+    // HttpOnly session cookie it even passes the auth-material check. Bounded and
+    // best-effort: never stall or fail a run that already succeeded.
+    if success {
+        // `wait_for_load_state` alone cannot do this: it answers for the CURRENT
+        // document, and a submit whose POST has not landed yet leaves the browser on
+        // the already-loaded sign-in page — so the wait returns at once and we harvest
+        // the anonymous jar anyway. Drain what the last action put in flight first,
+        // then let the document that lands finish.
+        crate::automation::inflight::settle_after_action(
+            &active_page,
+            std::time::Duration::from_millis(1_000),
+            std::time::Duration::from_secs(9),
+        )
+        .await;
+        let _ = crate::browser::navigation::wait_for_load_state(
+            &active_page, "load", std::time::Duration::from_secs(8),
+        )
+        .await;
+        let _ = crate::browser::navigation::wait_for_load_state(
+            &active_page, "networkidle", std::time::Duration::from_secs(4),
+        )
+        .await;
+    }
+
     // Extract the session state (cookies + localStorage + sessionStorage) BEFORE
     // closing the context, and return it as `auth_session` so the backend can persist
     // the auth for the next run. Without this, any login during the flow is lost
@@ -953,6 +1008,27 @@ pub(crate) async fn handle_execute_workflow(
         "steps_completed": steps_completed,
         "auth_session": auth_session,
     });
+    // Attach the sanitized trace + where the run ended, which is what the live optimizer
+    // folds DOM steps into. Sanitization is not optional: `sanitize_network_calls` reveals
+    // held credentials as {{placeholders}} and redacts everything else, so no plaintext
+    // password or live token rides this frame.
+    let mut result_msg = result_msg;
+    if let Some(cap) = net_capture.as_ref() {
+        let calls = {
+            let guard = cap.lock().await;
+            crate::automation::network_capture::sanitize_network_calls(
+                guard.get_all_calls(),
+                &credentials,
+            )
+        };
+        if let Some(obj) = result_msg
+            .get_mut("result_data")
+            .and_then(|d| d.as_object_mut())
+        {
+            obj.insert("network_calls".into(), serde_json::Value::Array(calls));
+            obj.insert("final_url".into(), serde_json::Value::String(active_page.url().to_string()));
+        }
+    }
     send(result_msg);
 
     // Scheduled monitoring workflow: also emit a scheduled_workflow_complete frame

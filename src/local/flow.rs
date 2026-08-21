@@ -94,10 +94,19 @@ struct FlowCtx<'a> {
     /// The automation's own linked workflow — the fallback target for a `workflow` action whose
     /// config omits an explicit `workflow_id`.
     auto_workflow_id: Option<i64>,
+    /// The firing automation's id — keys per-action state such as the ai_session
+    /// wake cooldown.
+    automation_id: i64,
     base_inputs: &'a Value,
     source: RunSource,
     lane: Lane,
 }
+
+/// Last goal-wake per (automation, block) — the per-action `cooldown_minutes`
+/// guard for `ai_session` actions (the cloud/self-host coordinators enforce the
+/// same config key server-side). In-process only: a daemon restart clears it,
+/// which errs on the side of letting the wake happen.
+static WAKE_COOLDOWNS: OnceLock<Mutex<HashMap<(i64, String), DateTime<Utc>>>> = OnceLock::new();
 
 /// Fire an automation: open an execution row, walk its block tree (or fall back to the linked
 /// workflow), and finalize. Returns the completed execution row, or `None` when a root-event
@@ -171,6 +180,7 @@ pub async fn run_automation(
             engine,
             by_parent: &by_parent,
             auto_workflow_id: auto.workflow_id,
+            automation_id: auto.id,
             base_inputs: &trigger.base_inputs,
             source: trigger.source,
             lane: trigger.lane,
@@ -732,8 +742,22 @@ async fn run_ai_session_action(
     block: &FlowBlock,
     scope: &Map<String, Value>,
 ) -> (Value, Map<String, Value>) {
+    // Render {{placeholders}} in the config's string fields against the flow
+    // scope (parity with cloud/self-host, where goal/user_context/entry_url are
+    // templated) so a monitor-woken goal can reference {{diff_snippet}},
+    // {{selector_name}}, upstream {{result.*}} values, etc.
+    let mut rendered_config = block.config.clone();
+    if let Some(obj) = rendered_config.as_object_mut() {
+        for key in ["goal", "user_context", "entry_url"] {
+            if let Some(s) = obj.get(key).and_then(Value::as_str) {
+                let rendered = render_template(s, scope);
+                obj.insert(key.to_string(), Value::String(rendered));
+            }
+        }
+    }
+
     // Resolve the session parameters (stored row or inline config).
-    let spec = match resolve_ai_session_spec(ctx.db, &block.config).await {
+    let mut spec = match resolve_ai_session_spec(ctx.db, &rendered_config).await {
         Ok(s) => s,
         Err(reason) => {
             return (
@@ -742,6 +766,24 @@ async fn run_ai_session_action(
             );
         }
     };
+
+    // Wake note (parity with cloud/self-host): an event-woken agent must know
+    // what fired it — the event name, the changed selector and the diff — or it
+    // starts blind on the page.
+    if scope.contains_key("event") || scope.contains_key("diff_snippet") {
+        let mut note = String::from("\n\n[Automation wake]");
+        if let Some(evt) = scope.get("event").and_then(Value::as_str) {
+            note.push_str(&format!("\nYou were started automatically on event: {evt}."));
+        }
+        if let Some(sel) = scope.get("selector_name").and_then(Value::as_str) {
+            note.push_str(&format!("\nWatched element: {sel}"));
+        }
+        if let Some(diff) = scope.get("diff_snippet").and_then(Value::as_str) {
+            let excerpt: String = diff.chars().take(1200).collect();
+            note.push_str(&format!("\nWhat changed (diff snippet):\n{excerpt}"));
+        }
+        spec.goal.push_str(&note);
+    }
 
     // AI provider — needs the engine's vault to decrypt the saved key. Missing ⇒ skip (not a fail).
     let Some(vault) = ctx.engine.vault() else {
@@ -806,6 +848,38 @@ async fn run_ai_session_action(
             }),
         None => None,
     };
+
+    // Per-action cooldown (config.cooldown_minutes): a flapping monitor must not
+    // re-wake the agent — and spend AI tokens — on every detected change. Checked
+    // AFTER the provider/browser gates so an unrunnable skip never consumes the
+    // window; the stamp lands before the run so failures still count.
+    if let Some(cd_min) = block
+        .config
+        .get("cooldown_minutes")
+        .and_then(Value::as_f64)
+        .filter(|m| *m > 0.0)
+    {
+        let key = (ctx.automation_id, block.id.clone());
+        let now = Utc::now();
+        let mut map = WAKE_COOLDOWNS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("wake cooldown lock");
+        if let Some(last) = map.get(&key) {
+            let elapsed_min = (now - *last).num_seconds() as f64 / 60.0;
+            if elapsed_min < cd_min {
+                return (
+                    json!({
+                        "action": "ai_session",
+                        "skipped": true,
+                        "reason": format!("cooldown active ({elapsed_min:.1}/{cd_min} min)"),
+                    }),
+                    scope.clone(),
+                );
+            }
+        }
+        map.insert(key, now);
+    }
 
     match run_ai_session_loop(&browser, &ai_cfg, ctx.db, &spec, resolved_persona.as_ref()).await {
         Ok(res) => {

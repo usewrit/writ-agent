@@ -32,14 +32,16 @@ use crate::local::store::{
 use crate::local::store::crawl_jobs;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::tool_executor::CallError;
 
 /// Every static tool name — reserved in the workflow-derived catalog so a workflow named e.g.
 /// "writ build" can never shadow a static tool (it falls back to `workflow_<id>`).
-pub const NAMES: [&str; 31] = [
+pub const NAMES: [&str; 32] = [
     "writ_browser_use",
+    "writ_personas",
     "writ_build",
     "writ_record_website",
     "writ_website_to_api",
@@ -105,6 +107,36 @@ pub fn entries() -> Vec<Value> {
              key or cloud link is needed. Prefer replaying an existing saved workflow \
              (writ_list_workflows → writ_run_workflow) when one already does the task.",
             browser_use_schema(),
+        ),
+        tool(
+            "writ_personas",
+            "See and operate the saved sign-in identities (personas) on this device so tasks \
+             behind a login run unattended. A persona holds a site's username plus credentials \
+             sealed on-device (never readable here), optional 2FA whose codes are minted by the \
+             daemon, and a warm signed-in session. USE one by passing `persona` (its id or name) \
+             to writ_crawl_site, writ_run_workflow or writ_install_api — the build tools also \
+             offer the saved personas interactively when a flow needs a login. BEFORE asking the \
+             user for credentials for a site, call action='list' (filter by domain) — an existing \
+             persona already answers a login-gated task. action='get' inspects one persona \
+             (include_runs adds its recent runs); action='sign_in' runs its login workflow NOW to \
+             establish or refresh the warm session (force=true re-logs-in even when the session \
+             still looks usable); action='record_login' launches a local AI session that signs in \
+             as the persona once and RECORDS the flow as its login workflow, after which it can \
+             always sign itself back in. This tool can NOT create, edit or delete personas, and \
+             no credential or one-time code ever passes through it — the user manages those in \
+             the Writ app on the Personas page; send them there when no persona fits.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "get", "sign_in", "record_login"], "description": "What to do (default list)." },
+                    "persona_id": { "type": ["integer", "string"], "description": "Which persona (id, or its exact name) — required for get / sign_in / record_login." },
+                    "domain": { "type": "string", "description": "list: only personas usable on this host (suffix match), e.g. 'github.com'." },
+                    "include_runs": { "type": "boolean", "description": "get: include the persona's recent runs (which workflows acted as it, and whether they succeeded)." },
+                    "force": { "type": "boolean", "description": "sign_in: re-run the login even when the current session still looks usable." },
+                    "login_url": { "type": "string", "description": "record_login: exact sign-in page URL when known; defaults to the persona's domain root (the AI finds the form from there)." }
+                },
+                "required": ["action"]
+            }),
         ),
         tool(
             "writ_build",
@@ -382,12 +414,15 @@ pub fn entries() -> Vec<Value> {
             "Run a saved workflow by name or id and return its extracted data. Deterministic replay \
              — zero AI tokens. Use for workflows just created by writ_build (their dedicated tools \
              appear on the next tools/list). Pass max_age when a recent answer is good enough: the \
-             previous result comes back instead of driving the browser again.",
+             previous result comes back instead of driving the browser again. Pass persona (a saved \
+             identity from writ_personas) to run the workflow signed in as that identity instead of \
+             its default.",
             json!({
                 "type": "object",
                 "properties": {
                     "workflow": { "description": "Workflow name or id", "type": ["string", "integer"] },
                     "inputs": { "type": "object", "description": "Values for the workflow's {{input.*}} placeholders" },
+                    "persona": { "description": "Run AS this saved identity (id or name; see writ_personas) — signs in with the persona's session. Omit to use the workflow's default persona, if it has one.", "type": ["string", "integer"] },
                     "max_age": { "type": "integer", "minimum": 0, "description": "Reuse a previous result if it is younger than this many seconds, instead of running the workflow again. 0 (the default) always runs fresh. Much faster and cheaper when a recent answer will do." },
                 },
                 "required": ["workflow"],
@@ -520,11 +555,14 @@ pub fn entries() -> Vec<Value> {
         ),
         tool(
             "writ_wire_monitor",
-            "Automatically wire a monitor's change_detected event through Writ Automations. action=notify sends desktop/in-app alerts; action=workflow runs a saved Writ workflow; action=webhook POSTs to a supplied HTTP(S) endpoint (for example a user-run local bridge that queues Claude Code). MCP cannot wake a disconnected AI process directly.",
+            "Automatically wire a monitor's change_detected event through Writ Automations. action=notify sends desktop/in-app alerts; action=workflow runs a saved Writ workflow; action=ai_task WAKES WRIT'S LOCAL AI AGENT with a task prompt — on each detected change it opens the monitored page with the change context (diff, changed selector) and works the prompt autonomously (needs an AI provider or the cloud AI gateway in Settings → AI); action=webhook POSTs to a supplied HTTP(S) endpoint (for example a user-run local bridge that queues an external AI process).",
             json!({"type":"object","properties":{
-                "monitor_id":{"type":"integer"},"action":{"type":"string","enum":["notify","workflow","webhook"]},
+                "monitor_id":{"type":"integer"},"action":{"type":"string","enum":["notify","workflow","ai_task","webhook"]},
                 "workflow":{"type":["string","integer"],"description":"Required for action=workflow"},
                 "webhook_url":{"type":"string","description":"Required for action=webhook"},
+                "prompt":{"type":"string","description":"Required for action=ai_task: what the agent should do when the monitor fires. Supports {{placeholders}} like {{diff_snippet}} and {{selector_name}}"},
+                "entry_url":{"type":"string","description":"action=ai_task: page the agent starts on (defaults to the monitored URL)"},
+                "max_steps":{"type":"integer","description":"action=ai_task: cap on agent steps per wake (default 20, max 100)"},
                 "title":{"type":"string"},"message":{"type":"string"},"name":{"type":"string"}
             },"required":["monitor_id","action"]}),
         ),
@@ -543,6 +581,8 @@ pub fn entries() -> Vec<Value> {
                 "monitor_id":{"type":"integer","description":"Monitor id (from writ_create_monitor) for when=change_detected"},
                 "run_workflow":{"type":["string","integer"],"description":"Workflow to RUN when the event fires (name or id)"},
                 "notify":{"type":"string","description":"Send a desktop/in-app notification with this message when the event fires"},
+                "ai_prompt":{"type":"string","description":"Wake Writ's local AI agent with this task when the event fires (needs an AI provider or the cloud AI gateway in Settings → AI). Supports {{placeholders}}"},
+                "ai_entry_url":{"type":"string","description":"Page the woken agent starts on (with ai_prompt; defaults to the monitored URL for when=change_detected)"},
                 "title":{"type":"string","description":"Notification title (with notify)"},
                 "enabled":{"type":"boolean","description":"Start enabled (default true)"}
             },"required":["name"]}),
@@ -664,6 +704,7 @@ fn website_build_schema(goal_description: &str) -> Value {
 /// `CallError::BadArgument` (JSON-RPC invalid-params).
 pub async fn call(state: &AppState, name: &str, args: &Value) -> Option<Result<Value, CallError>> {
     let r = match name {
+        "writ_personas" => personas_tool(state, args).await,
         "writ_browser_use" => connected_browser_start(state, args, false, true).await,
         "writ_build" => connected_browser_start(state, args, false, false).await,
         "writ_record_website" => connected_browser_start(state, args, false, false).await,
@@ -721,11 +762,122 @@ struct ConnectedBrowserSession {
     fill_data: HashMap<String, String>,
     secret_refs: HashMap<String, String>,
     functions: Vec<Value>,
+    /// Wall-clock ms of the last tool call against this session, for the idle reaper.
+    ///
+    /// SHARED (`Arc`) rather than a plain field because the act path works on a
+    /// `.cloned()` session and re-inserts it when it is done. With a plain i64 that
+    /// write-back would restore the timestamp captured at entry, silently undoing
+    /// any touch that happened during the call. An Arc cell is written through by
+    /// every clone, so the map always holds the newest value.
+    last_used_ms: Arc<AtomicI64>,
 }
 
 fn connected_sessions() -> &'static Mutex<HashMap<String, ConnectedBrowserSession>> {
     static SESSIONS: OnceLock<Mutex<HashMap<String, ConnectedBrowserSession>>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Whether a session last touched at `last_used_ms` is idle past `idle_ms` as of `now_ms`.
+///
+/// `saturating_sub` matters: these are wall-clock stamps, so an NTP step backwards
+/// (or a `now_ms()` that fell back to 0) can put `last_used` in the future.
+/// Saturating yields 0 there, i.e. "not idle" — a clock adjustment must never reap
+/// a session out from under a client that is actively driving it.
+fn is_idle_past(last_used_ms: i64, now_ms: i64, idle_ms: i64) -> bool {
+    now_ms.saturating_sub(last_used_ms) > idle_ms
+}
+
+/// Mark a connected session as used right now, so the reapers measure idleness
+/// rather than age. Every MCP tool that touches a live session calls this.
+///
+/// Stamps BOTH clocks, because two independent reapers watch this browser and each
+/// reads its own:
+///
+///  * `last_used_ms` here, for the MCP reaper (5-minute TTL); and
+///  * `RecordingSession::last_activity`, for `PlaywrightRecorder::start_cleanup_loop`
+///    (30-minute TTL). That field is otherwise only stamped by
+///    `action_handler::handle_action`, which the MCP act path never calls — so
+///    without this an MCP session looks frozen at its open time, and a session a
+///    model drove continuously for half an hour would be torn down mid-task.
+fn touch_connected_session(state: &AppState, sid: &str) {
+    if let Some(sess) = connected_sessions().lock().unwrap().get(sid) {
+        sess.last_used_ms.store(now_ms(), Ordering::Relaxed);
+    }
+    if let Some(recorder) = state.recorder.as_ref() {
+        if let Some(mut s) = recorder.get_session_mut(sid) {
+            s.last_activity = std::time::Instant::now();
+        }
+    }
+}
+
+/// Start the idle reaper for MCP-opened browser sessions (idempotent — only the
+/// first call spawns it).
+///
+/// Without this an MCP session lived until the app quit. `PlaywrightRecorder`'s own
+/// `start_cleanup_loop` does not cover them: it measures `RecordingSession::last_activity`,
+/// which only `action_handler::handle_action` stamps, and the MCP act path never goes
+/// through it — so to that loop an MCP session looks frozen at its open time.
+///
+/// This reaper owns BOTH halves of the teardown: the `connected_sessions()` entry
+/// (which holds the recorded steps and held fill values) and the underlying recorder
+/// session (which holds the real Chromium context). Dropping only the first would
+/// leak the browser, which is the whole point of reaping.
+pub fn start_connected_session_reaper(
+    recorder: Arc<crate::recorder::core::PlaywrightRecorder>,
+) {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return; // already running
+    }
+    tokio::spawn(async move {
+        let idle_ms = crate::config::constants::MCP_SESSION_IDLE_TIMEOUT.as_millis() as i64;
+        loop {
+            tokio::time::sleep(crate::config::constants::MCP_REAPER_INTERVAL).await;
+            let now = now_ms();
+            // Collect under the lock, close outside it: `end_session` is async and the
+            // registry guard is a std Mutex, which must never be held across an await.
+            let stale: Vec<String> = connected_sessions()
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, s)| {
+                    is_idle_past(s.last_used_ms.load(Ordering::Relaxed), now, idle_ms)
+                })
+                .map(|(sid, _)| sid.clone())
+                .collect();
+            for sid in stale {
+                // Re-check under the lock: a call may have landed between the scan and
+                // here, which would make this session live again.
+                let claimed = {
+                    let mut map = connected_sessions().lock().unwrap();
+                    match map.get(&sid) {
+                        Some(s)
+                            if is_idle_past(
+                                s.last_used_ms.load(Ordering::Relaxed), now_ms(), idle_ms,
+                            ) =>
+                        {
+                            map.remove(&sid).is_some()
+                        }
+                        _ => false,
+                    }
+                };
+                if claimed {
+                    tracing::warn!(
+                        session_id = %sid,
+                        "Reaping abandoned MCP browser session (idle past TTL)"
+                    );
+                    let _ = recorder.end_session(&sid).await;
+                }
+            }
+        }
+    });
 }
 
 /// OWN-LIBRARY-FIRST proposal for the build tools: before marketplace suggestions — and long
@@ -841,6 +993,194 @@ fn goal_terms(goal: &str) -> Vec<String> {
     out
 }
 
+// ── writ_personas — saved sign-in identities, read + operate, never create ───
+
+/// The MCP-facing projection of one shaped persona row: the cross-edition field
+/// set the cloud and self-host connectors return, minus anything an agent has no
+/// read use for (mailbox/relay plumbing, fingerprint, timestamps of record).
+/// Secrets are already absent at the source — `shape()` emits `has_*` booleans.
+fn persona_mcp_view(row: &Value) -> Value {
+    const ALWAYS: [&str; 7] = [
+        "id", "name", "is_active", "twofa_method", "has_password", "has_warm_session",
+        "can_self_login",
+    ];
+    const OPTIONAL: [&str; 14] = [
+        "description", "target_domain", "login_username", "email_otp_mode",
+        "validation_status", "has_totp_seed", "session_expires_at", "login_workflow_id",
+        "login_workflow_name", "last_login_at", "last_login_error", "last_used_at",
+        "has_proxy", "linked_workflows",
+    ];
+    let mut out = serde_json::Map::new();
+    for k in ALWAYS {
+        out.insert(k.into(), row.get(k).cloned().unwrap_or(Value::Null));
+    }
+    for k in OPTIONAL {
+        match row.get(k) {
+            None | Some(Value::Null) => {}
+            Some(v) if v.as_array().is_some_and(Vec::is_empty) => {}
+            Some(v) => {
+                out.insert(k.into(), v.clone());
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// What to do next — the part a connected model gets wrong without guidance:
+/// personas are USED via the `persona` argument on the run/crawl/install tools,
+/// and they are CREATED only in the Writ app (credentials must never transit MCP).
+fn personas_usage_note(rows: &[Value]) -> String {
+    if rows.is_empty() {
+        return "No personas saved. A persona is a saved sign-in identity (username + \
+                credentials sealed on-device, optional 2FA) that lets runs act behind a \
+                login. Creating one requires credentials, which never pass through this \
+                connection — ask the user to add it in the Writ app on the Personas \
+                page, then use it here by id or name."
+            .into();
+    }
+    let stale: Vec<i64> = rows
+        .iter()
+        .filter(|r| {
+            r.get("is_active").and_then(Value::as_bool).unwrap_or(false)
+                && !r.get("has_warm_session").and_then(Value::as_bool).unwrap_or(false)
+        })
+        .filter_map(|r| r.get("id").and_then(Value::as_i64))
+        .collect();
+    let mut note = String::from(
+        "Use a persona by passing `persona` (its id or name) to writ_crawl_site, \
+         writ_run_workflow or writ_install_api — the run then acts signed in as that \
+         identity, with any 2FA code minted by the daemon. ",
+    );
+    if !stale.is_empty() {
+        note.push_str(&format!(
+            "Personas {stale:?} have no warm session right now: action='sign_in' \
+             refreshes one that can_self_login; otherwise action='record_login' has \
+             the AI record its sign-in once. "
+        ));
+    }
+    note.push_str(
+        "Credentials are managed only in the Writ app (Personas page) — this tool \
+         cannot create, edit or delete a persona.",
+    );
+    note
+}
+
+/// `writ_personas` — list/get/sign_in/record_login over the LOCAL persona store,
+/// riding the same cores as the `/v1/personas` REST surface. Deliberately no
+/// create/update/delete: those carry credentials, and no secret may transit the
+/// MCP surface in either direction (the same line `tool_executor` draws for the
+/// vault). `sign_in`/`record_login` escalate to the `run` capability there.
+async fn personas_tool(state: &AppState, args: &Value) -> Result<Value, CallError> {
+    use crate::local::api::v1::personas as api;
+
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("list")
+        .trim()
+        .to_lowercase();
+
+    // Domain outcomes (unknown persona, vault locked, no AI provider, login
+    // already recording) come back in-band so the model can relay and repair;
+    // only store/engine failures stay protocol errors.
+    fn relay(e: LocalError) -> Result<Value, CallError> {
+        match e {
+            LocalError::BadRequest(m) | LocalError::NotFound(m) => Ok(err_result(m)),
+            other => Err(other.into()),
+        }
+    }
+
+    if action == "list" {
+        let domain = args.get("domain").and_then(Value::as_str);
+        let rows = match api::list_shaped(state, domain, 100).await {
+            Ok(rows) => rows,
+            Err(e) => return relay(e),
+        };
+        let out: Vec<Value> = rows.iter().map(persona_mcp_view).collect();
+        let note = personas_usage_note(&out);
+        return Ok(text_result(&json!({
+            "personas": out,
+            "total": out.len(),
+            "next": note,
+        })));
+    }
+
+    let pid = match args.get("persona_id") {
+        Some(v) if !v.is_null() => resolve_persona(state, v).await?,
+        _ => {
+            return Ok(err_result(format!(
+                "action '{action}' needs persona_id (an id or exact name) — find it \
+                 with writ_personas action='list'."
+            )))
+        }
+    };
+
+    match action.as_str() {
+        "get" => {
+            let mut row = match api::get_shaped(state, pid).await {
+                Ok(row) => persona_mcp_view(&row),
+                Err(e) => return relay(e),
+            };
+            if args.get("include_runs").and_then(Value::as_bool) == Some(true) {
+                let runs = match api::runs_shaped(state, pid, 10).await {
+                    Ok(runs) => runs,
+                    Err(e) => return relay(e),
+                };
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("recent_runs".into(), Value::Array(runs));
+                }
+            }
+            Ok(text_result(&row))
+        }
+        "sign_in" => {
+            let force = args.get("force").and_then(Value::as_bool) == Some(true);
+            let mut res = match api::sign_in_core(state, pid, force).await {
+                Ok(res) => res,
+                Err(e) => return relay(e),
+            };
+            if res.get("ok").and_then(Value::as_bool) != Some(true) {
+                if let Some(obj) = res.as_object_mut() {
+                    obj.insert(
+                        "next".into(),
+                        json!(
+                            "The persona is not signed in. If it cannot self-login (no \
+                             login workflow), run writ_personas action='record_login' so \
+                             the AI records the sign-in once; if the error points at \
+                             wrong credentials, the user must fix them in the Writ app \
+                             (Personas page)."
+                        ),
+                    );
+                }
+            }
+            Ok(text_result(&res))
+        }
+        "record_login" => {
+            let login_url = args.get("login_url").and_then(Value::as_str);
+            let mut res = match api::record_login_core(state, pid, login_url).await {
+                Ok(res) => res,
+                Err(e) => return relay(e),
+            };
+            if let Some(obj) = res.as_object_mut() {
+                obj.insert(
+                    "next".into(),
+                    json!(
+                        "A local AI session is signing in as this persona and recording \
+                         the flow (credentials stay masked; it never needs you). Poll \
+                         writ_personas action='get' for this persona: when \
+                         can_self_login turns true the recording became its login \
+                         workflow — then action='sign_in' establishes the warm session. \
+                         A last_login_error instead means the attempt failed."
+                    ),
+                );
+            }
+            Ok(text_result(&res))
+        }
+        other => Ok(err_result(format!(
+            "unknown action '{other}'. Use one of: list, get, sign_in, record_login."
+        ))),
+    }
+}
+
 async fn connected_browser_start(
     state: &AppState,
     args: &Value,
@@ -953,6 +1293,7 @@ async fn connected_browser_start(
         fill_data: HashMap::new(),
         secret_refs: HashMap::new(),
         functions: Vec::new(),
+        last_used_ms: Arc::new(AtomicI64::new(now_ms())),
     };
     connected_sessions()
         .lock()
@@ -1003,6 +1344,7 @@ async fn connected_browser_context(state: &AppState, args: &Value) -> Result<Val
     let sid = require_str(args, "session_id")?;
     let session = connected_sessions().lock().unwrap().get(&sid).cloned()
         .ok_or_else(|| CallError::BadArgument(format!("no connected browser session '{sid}'")))?;
+    touch_connected_session(state, &sid);
     let section = args.get("section").and_then(Value::as_str).unwrap_or("page");
     if section == "page" {
         let recorder = state.recorder.as_ref()
@@ -1046,6 +1388,7 @@ async fn connected_browser_network(state: &AppState, args: &Value) -> Result<Val
     let fill_data = connected_sessions().lock().unwrap().get(&sid)
         .map(|s| s.fill_data.clone())
         .ok_or_else(|| CallError::BadArgument(format!("no connected browser session '{sid}'")))?;
+    touch_connected_session(state, &sid);
     let recorder = state.recorder.as_ref()
         .ok_or_else(|| CallError::BadArgument("Writ's local browser is not ready".into()))?;
     let capture = recorder.get_session_mut(&sid).map(|s| s.network_capture.clone())
@@ -1115,6 +1458,7 @@ async fn connected_browser_act(state: &AppState, args: &Value) -> Result<Value, 
         .get(&sid)
         .cloned()
         .ok_or_else(|| CallError::BadArgument(format!("no connected browser session '{sid}'")))?;
+    touch_connected_session(state, &sid);
     if let Some(values) = args.get("inputs").and_then(Value::as_object) {
         for (key, value) in values {
             if let Some(value) = value.as_str() {
@@ -1444,6 +1788,7 @@ async fn connected_browser_save(state: &AppState, args: &Value) -> Result<Value,
         .get(&sid)
         .cloned()
         .ok_or_else(|| CallError::BadArgument(format!("no connected browser session '{sid}'")))?;
+    touch_connected_session(state, &sid);
     if let Some(name) = args
         .get("name")
         .and_then(Value::as_str)
@@ -2106,17 +2451,17 @@ async fn run_workflow(state: &AppState, args: &Value) -> Result<Value, CallError
             "'inputs' must be a JSON object".into(),
         ));
     }
-    // `max_age` is a top-level control on this tool but the runner reads it alongside the inputs (it
-    // is the shared entry point for the derived per-workflow tools, which take it top-level). Carry it
-    // through; the runner strips it before the values reach the workflow.
-    if let (Some(obj), Some(requested)) = (
-        inputs.as_object_mut(),
-        args.get(super::tool_executor::FRESHNESS_ARG),
-    ) {
-        obj.insert(
-            super::tool_executor::FRESHNESS_ARG.to_string(),
-            requested.clone(),
-        );
+    // `max_age` and `persona` are top-level controls on this tool but the runner reads them alongside
+    // the inputs (it is the shared entry point for the derived per-workflow tools, which take these
+    // inline). Carry them through; the runner strips each before the values reach the workflow —
+    // `persona` becomes the run-as identity, not an `{{input.persona}}` value.
+    if let Some(obj) = inputs.as_object_mut() {
+        if let Some(requested) = args.get(super::tool_executor::FRESHNESS_ARG) {
+            obj.insert(super::tool_executor::FRESHNESS_ARG.to_string(), requested.clone());
+        }
+        if let Some(persona) = args.get("persona").filter(|v| !v.is_null()) {
+            obj.insert("persona".to_string(), persona.clone());
+        }
     }
     super::tool_executor::run_workflow_tool(state, wf.id, inputs).await
 }
@@ -2548,7 +2893,7 @@ async fn create_monitor(state: &AppState, args: &Value) -> Result<Value, CallErr
 
 async fn wire_monitor(state: &AppState, args: &Value) -> Result<Value, CallError> {
     let target_id = require_i64(args, "monitor_id")?;
-    targets::get_by_id(&state.db, target_id).await?
+    let target = targets::get_by_id(&state.db, target_id).await?
         .ok_or_else(|| CallError::BadArgument(format!("monitor {target_id} does not exist")))?;
     let action = require_str(args, "action")?;
     let title = args.get("title").and_then(Value::as_str).unwrap_or("Writ detected a change");
@@ -2577,7 +2922,28 @@ async fn wire_monitor(state: &AppState, args: &Value) -> Result<Value, CallError
                 json!({"type":"workflow","workflow_id":wf.id}),
             )
         }
-        _ => return Err(CallError::BadArgument("action must be notify, workflow, or webhook".into())),
+        "ai_task" => {
+            // Wake the LOCAL AI agent: the flow runtime's ai_session lane
+            // (flow.rs::run_ai_session_action) renders the goal's
+            // {{placeholders}} against the change scope and appends the wake
+            // note, then drives the autonomous loop on the engine browser.
+            // entry_url is baked at wiring time — the change scope carries no
+            // URL, and the monitored page is the natural place to start.
+            let prompt = require_str(args, "prompt")?;
+            let entry_url = args.get("entry_url").and_then(Value::as_str)
+                .map(str::trim).filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| target.url.clone());
+            let mut cfg = json!({"goal": prompt, "entry_url": entry_url});
+            if let Some(ms) = args.get("max_steps").and_then(Value::as_u64) {
+                cfg["max_steps"] = json!(ms.clamp(1, 100));
+            }
+            (
+                json!({"id":"act","type":"action","blockType":"ai_session","parentId":"evt","config": cfg.clone()}),
+                json!({"type":"ai_session","goal": cfg["goal"], "entry_url": cfg["entry_url"]}),
+            )
+        }
+        _ => return Err(CallError::BadArgument("action must be notify, workflow, ai_task, or webhook".into())),
     };
     let name = args.get("name").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
         .unwrap_or("Monitor change automation");
@@ -2589,7 +2955,11 @@ async fn wire_monitor(state: &AppState, args: &Value) -> Result<Value, CallError
     }).await?;
     Ok(text_result(&json!({
         "status":"wired","monitor_id":target_id,"automation_id":row.id,"action":action,
-        "note":if action == "webhook" { "The webhook endpoint is responsible for launching or queueing Claude Code; Writ does not execute arbitrary shell commands." } else { "Automation is enabled and uses Writ's existing change_detected runtime." }
+        "note": match action.as_str() {
+            "webhook" => "The webhook endpoint is responsible for launching or queueing an external AI process; Writ does not execute arbitrary shell commands.",
+            "ai_task" => "On each detected change the local AI agent opens the monitored page with the change context and works the prompt. It needs an AI provider or the cloud AI gateway configured (Settings → AI).",
+            _ => "Automation is enabled and uses Writ's existing change_detected runtime.",
+        }
     })))
 }
 
@@ -2627,6 +2997,7 @@ async fn create_automation(state: &AppState, args: &Value) -> Result<Value, Call
     let mut event_cfg = serde_json::Map::new();
     let mut new_workflow_id: Option<i64> = None;
     let mut new_target_id: Option<i64> = None;
+    let mut monitor_url: Option<String> = None;
     if event == "change_detected" {
         let mid = args
             .get("monitor_id")
@@ -2640,9 +3011,10 @@ async fn create_automation(state: &AppState, args: &Value) -> Result<Value, Call
                         .into(),
                 )
             })?;
-        targets::get_by_id(&state.db, mid)
+        let target = targets::get_by_id(&state.db, mid)
             .await?
             .ok_or_else(|| CallError::BadArgument(format!("monitor {mid} does not exist")))?;
+        monitor_url = Some(target.url);
         event_cfg.insert("target_id".into(), json!(mid));
         new_target_id = Some(mid);
     } else {
@@ -2675,15 +3047,46 @@ async fn create_automation(state: &AppState, args: &Value) -> Result<Value, Call
     if let Some(msg) = args.get("notify").and_then(Value::as_str) {
         let title = args.get("title").and_then(Value::as_str).unwrap_or("Writ automation");
         let id = format!("act{n}");
+        n += 1;
         blocks.push(json!({
-            "id": id, "type": "action", "blockType": "notification", "parentId": parent.clone(),
+            "id": id.clone(), "type": "action", "blockType": "notification", "parentId": parent.clone(),
             "config": {"channels": ["desktop", "in_app"], "title": title, "template": msg},
         }));
         legacy.push(json!({"type": "notify", "channels": ["desktop", "in_app"], "title": title, "template": msg}));
+        parent = id;
+    }
+    if let Some(prompt) = args
+        .get("ai_prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // Wake the local AI agent on the event. The flow runtime renders the
+        // goal's {{placeholders}} against the event scope and appends the wake
+        // note (flow.rs::run_ai_session_action). entry_url falls back to the
+        // monitored page for change_detected wirings.
+        let entry_url = args
+            .get("ai_entry_url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or(monitor_url);
+        let id = format!("act{n}");
+        let mut cfg = serde_json::Map::new();
+        cfg.insert("goal".into(), json!(prompt));
+        if let Some(u) = entry_url {
+            cfg.insert("entry_url".into(), json!(u));
+        }
+        blocks.push(json!({
+            "id": id, "type": "action", "blockType": "ai_session", "parentId": parent.clone(),
+            "config": Value::Object(cfg),
+        }));
+        legacy.push(json!({"type": "ai_session", "goal": prompt}));
     }
     if legacy.is_empty() {
         return Err(CallError::BadArgument(
-            "give the automation something to do: pass 'run_workflow' and/or 'notify'".into(),
+            "give the automation something to do: pass 'run_workflow', 'notify', and/or 'ai_prompt'".into(),
         ));
     }
 
@@ -4053,7 +4456,7 @@ fn crawl_view(job: &crawl_jobs::CrawlJob) -> Value {
 }
 
 /// Resolve a persona reference (id or name) to its id, for a login-gated crawl.
-async fn resolve_persona(state: &AppState, v: &Value) -> Result<i64, CallError> {
+pub(crate) async fn resolve_persona(state: &AppState, v: &Value) -> Result<i64, CallError> {
     if let Some(id) = v
         .as_i64()
         .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
@@ -4428,6 +4831,63 @@ mod tests {
     use crate::local::{db, engine, vault};
     use std::sync::Arc;
 
+    /// A session goes stale only once it has been quiet LONGER than the window —
+    /// exactly at the boundary it is still live.
+    #[test]
+    fn idle_predicate_is_exclusive_at_the_boundary() {
+        let idle_ms = 300_000; // MCP_SESSION_IDLE_TIMEOUT
+        assert!(!is_idle_past(0, idle_ms, idle_ms), "exactly at the TTL is still live");
+        assert!(is_idle_past(0, idle_ms + 1, idle_ms), "one ms past the TTL is stale");
+        assert!(!is_idle_past(0, idle_ms - 1, idle_ms));
+    }
+
+    /// A backwards clock step must never reap a live session.
+    ///
+    /// `now_ms` is wall-clock, so an NTP correction (or a `now_ms()` that fell back
+    /// to 0 on a SystemTime error) can place `last_used` in the future. Saturating
+    /// arithmetic has to read that as "not idle" — the alternative is a huge unsigned
+    /// wrap that reaps every browser the moment the clock is adjusted.
+    #[test]
+    fn idle_predicate_survives_a_backwards_clock_step() {
+        let idle_ms = 300_000;
+        // last_used is an hour in the FUTURE relative to now.
+        assert!(!is_idle_past(3_600_000, 0, idle_ms));
+        // and the degenerate now_ms() == 0 fallback.
+        assert!(!is_idle_past(1_000, 0, idle_ms));
+    }
+
+    /// The act path drives a `.cloned()` session and writes it back when it is done.
+    /// The idle stamp must survive that round trip, or every long action would
+    /// restore the timestamp captured at entry and the session would look idle
+    /// while it was in fact being driven.
+    #[test]
+    fn touching_a_session_survives_the_act_path_write_back() {
+        let sid = "sess_touch_writeback";
+        let session = ConnectedBrowserSession {
+            goal: "g".into(),
+            name: "n".into(),
+            entry_url: "https://example.com".into(),
+            api: false,
+            use_mode: true,
+            steps: Vec::new(),
+            fill_data: HashMap::new(),
+            secret_refs: HashMap::new(),
+            functions: Vec::new(),
+            last_used_ms: Arc::new(AtomicI64::new(1_000)),
+        };
+        connected_sessions().lock().unwrap().insert(sid.into(), session.clone());
+
+        // What `connected_browser_act` does: stamp, work on the clone, insert it back.
+        session.last_used_ms.store(50_000, Ordering::Relaxed);
+        connected_sessions().lock().unwrap().insert(sid.into(), session.clone());
+
+        let stored = connected_sessions().lock().unwrap()
+            .get(sid).unwrap().last_used_ms.load(Ordering::Relaxed);
+        assert_eq!(stored, 50_000, "write-back must not restore the entry timestamp");
+
+        connected_sessions().lock().unwrap().remove(sid);
+    }
+
     async fn state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
         let paths = crate::local::config::Paths::at(dir.keep());
@@ -4463,6 +4923,69 @@ mod tests {
             assert!(!t["description"].as_str().unwrap().is_empty());
             assert_eq!(t["inputSchema"]["type"], "object");
         }
+    }
+
+    #[test]
+    fn persona_tool_is_advertised_read_only_of_lifecycle() {
+        let listed = entries();
+        let p = listed
+            .iter()
+            .find(|v| v["name"] == "writ_personas")
+            .expect("writ_personas listed");
+        // Its whole action vocabulary is read + operate — no create/update/delete.
+        let actions = p["inputSchema"]["properties"]["action"]["enum"].clone();
+        assert_eq!(actions, json!(["list", "get", "sign_in", "record_login"]));
+        assert_eq!(p["inputSchema"]["required"], json!(["action"]));
+        // No credential-shaped input is even declarable here.
+        let props = p["inputSchema"]["properties"].as_object().unwrap();
+        for forbidden in ["password", "totp_seed", "extra_login_fields", "proxy_password"] {
+            assert!(!props.contains_key(forbidden), "must not accept {forbidden}");
+        }
+    }
+
+    #[test]
+    fn persona_projection_carries_no_secret_or_relay_material() {
+        // Even if the shaped REST row grew a raw secret column, the fixed-field MCP view drops it
+        // (unknown keys never pass), and the mailbox/relay plumbing an agent can't use stays out.
+        let row = json!({
+            "id": 7, "name": "Grafikart", "is_active": true, "twofa_method": "totp",
+            "has_password": true, "has_warm_session": true, "can_self_login": true,
+            "target_domain": "grafikart.fr", "login_workflow_name": "Grafikart login",
+            "linked_workflows": [], "relay_address": "otp@relay", "connected_mailbox": "a@b.c",
+            "password": "hunter2", "totp_seed": "JBSWY3DP", "session_state": "{...}",
+        });
+        let view = persona_mcp_view(&row);
+        let dumped = view.to_string();
+        assert!(!dumped.contains("hunter2"));
+        assert!(!dumped.contains("JBSWY3DP"));
+        assert!(view.get("relay_address").is_none());
+        assert!(view.get("connected_mailbox").is_none());
+        // Empty arrays are dropped; the readiness fields a model decides on are kept.
+        assert!(view.get("linked_workflows").is_none());
+        assert_eq!(view["id"], json!(7));
+        assert_eq!(view["can_self_login"], json!(true));
+        assert_eq!(view["target_domain"], json!("grafikart.fr"));
+    }
+
+    #[tokio::test]
+    async fn persona_list_tool_is_empty_and_guides_to_the_app_on_a_fresh_store() {
+        let st = state().await;
+        let out = personas_tool(&st, &json!({ "action": "list" })).await.unwrap();
+        assert_eq!(out["isError"], json!(false));
+        let body: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["total"], json!(0));
+        assert!(body["next"].as_str().unwrap().contains("Writ app"));
+    }
+
+    #[tokio::test]
+    async fn persona_get_needs_an_identifier_and_reports_unknown_in_band() {
+        let st = state().await;
+        // Missing persona_id → in-band guidance, not a protocol error.
+        let missing = personas_tool(&st, &json!({ "action": "get" })).await.unwrap();
+        assert_eq!(missing["isError"], json!(true));
+        // A persona_id that doesn't resolve is a BadArgument (invalid-params) from resolve_persona.
+        let unknown = personas_tool(&st, &json!({ "action": "get", "persona_id": 987654 })).await;
+        assert!(matches!(unknown, Err(CallError::BadArgument(_))));
     }
 
     #[test]
@@ -4944,6 +5467,7 @@ mod tests {
                     } else {
                         Vec::new()
                     },
+                    last_used_ms: Arc::new(AtomicI64::new(now_ms())),
                 },
             );
             let r = call(&st, "writ_browser_save", &json!({"session_id": sid}))
@@ -5075,6 +5599,8 @@ mod tests {
             relogin_max_retries: 0,
             http_capable: -1,
             auth_config: None,
+            recorded_session_encrypted: None,
+            recorded_session_captured_at: None,
             default_persona_id: None,
             estimated_duration_ms: None,
             usage_count: 0,

@@ -395,8 +395,22 @@ async fn open(msg: &Value, browser: Option<&Arc<BrowserManager>>, ai: bool) -> V
     if let Err(e) = browser.ensure_warm_browser().await {
         return ack(reply_type, &session_id, &request_id, false, Some(format!("warm browser unavailable: {e}")));
     }
-    let (context, page) = match browser.create_stealth_context().await {
-        Ok(cp) => cp,
+    // PERSONA FINGERPRINT: present the SAME device/UA the warm session was captured
+    // under, or a UA-bound login is signed out the moment its cookies arrive under a
+    // fresh random identity. Parity with the streaming lane and the Python recorder;
+    // None (cold session) keeps a random fingerprint. Extracted BEFORE context creation
+    // because the fingerprint fixes the context's UA/locale/timezone at open.
+    let restored_fp: Option<crate::browser::context::Fingerprint> = msg["config"]
+        .get("session_state")
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<crate::models::session::SessionState>(v.clone()).ok())
+        .and_then(|s| s.fingerprint)
+        .and_then(|v| serde_json::from_value(v).ok());
+    let (context, page) = match browser
+        .create_stealth_context_with_fingerprint(restored_fp)
+        .await
+    {
+        Ok((ctx, page, _fp)) => (ctx, page),
         Err(e) => return ack(reply_type, &session_id, &request_id, false, Some(format!("could not open session context: {e}"))),
     };
 
@@ -407,6 +421,32 @@ async fn open(msg: &Value, browser: Option<&Arc<BrowserManager>>, ai: bool) -> V
             &page, &url, "domcontentloaded", std::time::Duration::from_secs(30),
         )
         .await;
+    }
+
+    // PERSONA WARM SESSION. The backend resolves the attached persona's saved auth and ships it as
+    // `config.session_state`; restoring it here is what makes an authenticated browse ARRIVE signed in
+    // rather than at the site's login wall. Parity with the Python agent, which passes the same blob to
+    // `recorder.start_session`. Best-effort: a session that fails to restore leaves a working cold
+    // browser. `inject_session_state` domain-gates the cookies against the entry url and reloads after
+    // writing DOM storage, so a token-auth SPA boots with its token already present.
+    if let Some(raw) = msg["config"].get("session_state").filter(|v| !v.is_null()) {
+        match serde_json::from_value::<crate::models::session::SessionState>(raw.clone()) {
+            Ok(state) => {
+                if let Err(e) = crate::automation::session_state::inject_session_state(
+                    &page, &context, &state,
+                    if url.is_empty() { None } else { Some(url.as_str()) },
+                    30_000,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, session_id = %session_id,
+                        "persona session restore failed; continuing signed out");
+                } else {
+                    tracing::info!(session_id = %session_id, "restored persona warm session");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "config.session_state is not a SessionState"),
+        }
     }
 
     sessions().insert(

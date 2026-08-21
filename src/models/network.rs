@@ -98,14 +98,28 @@ pub const SKIP_SCHEMES: &[&str] = &["chrome-extension://", "moz-extension://"];
 
 pub const MAX_BODY_SIZE: usize = 10_240;
 
-/// Auth-related header name patterns for format_for_prompt display
+/// Header NAME patterns that mark a header as carrying auth material.
+///
+/// WIDE BY DESIGN, and the Python agent's list verbatim (`_AUTH_HEADER_PATTERNS` in
+/// automation_engine.py) — these two must stay twins, because both decide what may leave
+/// the agent. Over-redacting a benign header costs nothing; letting one unheld token
+/// through (X-Session-Token, X-Access-Token, X-Amz-Security-Token, …) is a leak. Held
+/// credentials are revealed as `{{placeholders}}` BEFORE this check, so a real credential
+/// still round-trips and the optimizer can still see how the endpoint authenticates.
 pub const AUTH_HEADER_PATTERNS: &[&str] = &[
     "authorization",
-    "x-auth",
-    "x-api-key",
-    "x-token",
-    "x-csrf",
+    "auth",
+    "api-key",
+    "apikey",
+    "token",
+    "bearer",
+    "session",
+    "csrf",
+    "xsrf",
     "cookie",
+    "x-amz-security",
+    "credential",
+    "secret",
 ];
 
 pub fn should_skip_url(url: &str) -> bool {

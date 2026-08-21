@@ -531,6 +531,13 @@ impl<S: RecordSink> SessionDriver<S> {
                         "rawReplayCount": result.raw_replay_count,
                         "network_calls": network_calls,
                         "network_calls_count": result.network_calls.len(),
+                        // Recording browser's auth state — the wizard posts it
+                        // back with the save so replays seed from it (same key
+                        // the cloud recorder emits).
+                        "auth_session": result.auth_session
+                            .as_ref()
+                            .and_then(|s| serde_json::to_value(s).ok())
+                            .unwrap_or(Value::Null),
                     }))
                     .await;
             }

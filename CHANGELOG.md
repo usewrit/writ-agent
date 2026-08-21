@@ -6,6 +6,61 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] - 2026-08-20
+
+### Added
+
+- **A connected model can work as one of your saved identities.** The MCP surface gained
+  `writ_personas`, so a model can see which identities you have saved and name one when it scrapes,
+  crawls or opens a browser. The identity's warm session is restored into the page before the first
+  step runs, which is what lets a model read a page that only a signed-in user can see.
+- **Data arrives as a preview and fills in when you look closer.** A single row of crawled markdown
+  can run to tens of kilobytes, and all of it was being shipped just to draw a table. Long text cells
+  now arrive cut to a preview and marked as cut, and the full record is fetched on demand when you
+  expand, copy, export or send it — an export never contains a truncated value.
+
+### Changed
+
+- **Anonymous usage telemetry is now on by default.** It is counts and durations only — never page
+  content, never URLs — and it goes to the coordinator this agent is linked to, over the link you
+  already configured. An agent linked to your own self-hosted coordinator reports to your own server;
+  an agent linked to nothing has nowhere to send and never tries. Turn it off with
+  `writ telemetry off`, look at a day's report first with `writ telemetry preview`, or set
+  `telemetry_opt_in = false`. An explicit `false` is always honored, so an install that had already
+  opted out stays opted out.
+- **An abandoned browser is reclaimed in minutes rather than never.** Only the CLI entry point ever
+  started the session reaper, so in the desktop app nothing reclaimed recording sessions at all: a
+  client that dropped without closing left its Chromium context alive until the process exited. The
+  reaper now runs wherever the daemon does, and MCP-opened browsers get a much shorter window of
+  their own — a model that has gone quiet for five minutes has been abandoned, while a person
+  recording a workflow legitimately pauses to think, so the two no longer share a timeout.
+- **Opening a workflow's data no longer costs its whole history.** Every data view parsed the full
+  window of stored runs before it could show a single page. Reads are now served from a summary and
+  only the rows on the page are loaded.
+
+### Fixed
+
+- **Crawling a signed-in page returned a list of empty headings.** On an account screen, a dashboard
+  or a settings panel the form *is* the content, but a field's value is an attribute rather than
+  text, so the article extractor dropped it — on a real profile page it kept 53 of 591 visible words.
+  When an extracted body comes back starved while the page clearly has text, the visible form fields
+  are now recovered as `label: value` lines. Password-type fields are skipped entirely — neither
+  their value nor their presence is emitted — and every value is length-capped.
+- **A restored identity kept its cookies but arrived with a fresh browser fingerprint.** A saved
+  session was replayed under a newly minted user agent, so a site that binds its session to the
+  browser signed the identity straight back out. The saved fingerprint now travels with the session
+  everywhere it is restored, and an identity's saved headers are replayed too — scoped to the domain
+  they were captured from, so they never leak to a third-party host.
+- **Optimizing a workflow captured the sign-in page but not the sign-in.** The capture answered for
+  the page it was already on, so the submit that actually authenticates was missed and the resulting
+  API workflow signed in to nothing. Optimization now waits on requests still in flight, and replays
+  from cold when the workflow signs in for real.
+
+### Security
+
+- Updated `h2` past a denial-of-service advisory affecting HTTP/2 request handling
+  ([GHSA-q83h-524g-xf6h](https://github.com/hyperium/hyper/security/advisories/GHSA-q83h-524g-xf6h)).
+
 ## [1.0.5] - 2026-08-15
 
 ### Added

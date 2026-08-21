@@ -1472,6 +1472,9 @@ pub(crate) fn new_workflow_from_cloud(c: &Value) -> workflows::NewWorkflow {
         schedule_days: json_text(c.get("schedule_days")),
         schedule_tz: str_opt(c.get("schedule_tz")),
         auth_config: json_text(c.get("auth_config")),
+        // NEVER import auth material from the cloud: the recorded replay seed (0026) — like the
+        // credential values above — is device-local; a synced workflow re-pins only from a local save.
+        recorded_session: None,
         // NEVER from sync: proxy rows are minted only by the marketplace install path.
         marketplace_slug: None,
     }
@@ -1798,6 +1801,8 @@ mod tests {
             relogin_max_retries: 1,
             http_capable: -1,
             auth_config: None,
+            recorded_session_encrypted: None,
+            recorded_session_captured_at: None,
             default_persona_id: None,
             estimated_duration_ms: None,
             usage_count: 0,

@@ -174,7 +174,7 @@ pub async fn list_by_workflow(
 ) -> LocalResult<Vec<Run>> {
     let limit = limit.clamp(1, 1000);
     let rows = sqlx::query_as::<_, Run>(&format!(
-        "SELECT {SELECT_COLS} FROM runs WHERE workflow_id = ?1 
+        "SELECT {SELECT_COLS} FROM runs WHERE workflow_id = ?1
          ORDER BY created_at DESC, id DESC LIMIT ?2"
     ))
     .bind(workflow_id)
@@ -182,6 +182,88 @@ pub async fn list_by_workflow(
     .fetch_all(pool)
     .await?;
     Ok(rows)
+}
+
+/// One data-scan-window run WITHOUT its payload: id, recency (the `run_at`
+/// source — completed falling back to created) and the `result_data` TEXT
+/// length. The bounded data fastpath pages over these and loads only the few
+/// full rows a page actually needs.
+#[derive(Debug, Clone)]
+pub struct DataStub {
+    pub id: i64,
+    /// COALESCE(completed_at, created_at) — exactly `to_run_input`'s `run_at`.
+    pub at: Option<String>,
+    /// LENGTH(result_data) — a payload-size budget/change signal, never a row count.
+    pub size: i64,
+}
+
+/// The extracted-data scan window as stubs: the newest `cap` runs of the
+/// workflow (the SAME `created_at DESC, id DESC` window `list_by_workflow`
+/// serves), narrowed to the successful runs whose payload mentions
+/// `extracted_data` — the scan's cheap prefilter. The authoritative
+/// non-null/bearing decision stays with the per-run digest (which parses the
+/// payload once and is cached), so a prefilter false-positive only costs one
+/// digest, never a wrong row. Returns `(stubs, raw_window_count)` — the raw
+/// count (pre-filter, capped) is the scan's truncation signal.
+pub async fn data_window_stubs(
+    pool: &SqlitePool,
+    workflow_id: i64,
+    cap: i64,
+) -> LocalResult<(Vec<DataStub>, i64)> {
+    let cap = cap.clamp(1, 1000);
+    let raw_n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (SELECT id FROM runs WHERE workflow_id = ?1
+         ORDER BY created_at DESC, id DESC LIMIT ?2)",
+    )
+    .bind(workflow_id)
+    .bind(cap)
+    .fetch_one(pool)
+    .await?;
+    let rows = sqlx::query(
+        "SELECT id, COALESCE(completed_at, created_at) AS at,
+                LENGTH(COALESCE(result_data, '')) AS size
+         FROM (SELECT id, completed_at, created_at, success, result_data FROM runs
+               WHERE workflow_id = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2)
+         WHERE success = 1 AND result_data LIKE '%extracted_data%'
+         ORDER BY created_at DESC, id DESC",
+    )
+    .bind(workflow_id)
+    .bind(cap)
+    .fetch_all(pool)
+    .await?;
+    let stubs = rows
+        .into_iter()
+        .map(|r| {
+            Ok(DataStub {
+                id: r.try_get("id")?,
+                at: r.try_get("at")?,
+                size: r.try_get("size")?,
+            })
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    Ok((stubs, raw_n))
+}
+
+/// Full rows for `ids`, returned in the given order (absent ids are skipped —
+/// a run deleted between a stub pass and this load is simply gone). Chunked
+/// well under SQLite's bind-variable limit.
+pub async fn get_by_ids(pool: &SqlitePool, ids: &[i64]) -> LocalResult<Vec<Run>> {
+    let mut by_id: std::collections::HashMap<i64, Run> = std::collections::HashMap::new();
+    for chunk in ids.chunks(200) {
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {SELECT_COLS} FROM runs WHERE id IN ({placeholders})");
+        let mut q = sqlx::query_as::<_, Run>(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        for run in q.fetch_all(pool).await? {
+            by_id.insert(run.id, run);
+        }
+    }
+    Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
 /// Full-text search over runs' extracted_data via the FTS5 index (migration 0022). Returns the

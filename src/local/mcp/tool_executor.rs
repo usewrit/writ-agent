@@ -69,6 +69,11 @@ const STATIC_TOOL_PREFIX: &str = "writ_";
 /// no MCP tool for the vault, key issuance, LAN exposure, cloud link, or backup).
 const TOOL_SCOPES: &[(&str, Scope)] = &[
     // ── reads ────────────────────────────────────────────────────────────────
+    // Read for list/get; the operating actions (sign_in / record_login) drive a
+    // real login run, so they escalate to Run via `arg_escalated_scope`. The tool
+    // has no create/update/delete at all — persona lifecycle stays with the vault
+    // on the "not reachable from this surface" side of the line above.
+    ("writ_personas", Scope::Read),
     ("writ_list_workflows", Scope::Read),
     ("writ_workflow_data", Scope::Read),
     ("writ_workflow_runs", Scope::Read),
@@ -118,12 +123,18 @@ fn tool_min_scope(name: &str) -> Option<Scope> {
 }
 
 /// Tools whose required scope depends on their ARGUMENTS, not just their name.
+/// Returns the escalated scope plus a short description of the escalating
+/// operation, for the refusal message.
 ///
 /// `writ_crawl_site` is `Run` — starting a crawl is execution. But `save_as` makes it also CREATE a
 /// saved crawl, and creating one over REST (`POST /v1/crawl/definitions`) requires `Admin`. Without
 /// this escalation the MCP surface would be strictly more permissive than the REST surface for the
 /// same action, which is exactly the kind of gap a scoped key is supposed to close.
-fn arg_escalated_scope(name: &str, arguments: &Value) -> Option<Scope> {
+///
+/// `writ_personas` is `Read` — listing/inspecting identities reports what exists. But
+/// `sign_in` runs the persona's login workflow and `record_login` launches an AI session
+/// that drives a real browser: both are execution, so they need what a run costs.
+fn arg_escalated_scope(name: &str, arguments: &Value) -> Option<(Scope, &'static str)> {
     if name == "writ_crawl_site"
         && arguments
             .get("save_as")
@@ -131,7 +142,15 @@ fn arg_escalated_scope(name: &str, arguments: &Value) -> Option<Scope> {
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
     {
-        return Some(Scope::Admin);
+        return Some((Scope::Admin, "saving a crawl with `save_as` (it creates a reusable, API-callable crawl); omit `save_as` to just run it"));
+    }
+    if name == "writ_personas"
+        && matches!(
+            arguments.get("action").and_then(Value::as_str).map(str::trim),
+            Some("sign_in") | Some("record_login")
+        )
+    {
+        return Some((Scope::Run, "signing a persona in (it runs a real login in a browser)"));
     }
     None
 }
@@ -146,18 +165,19 @@ fn arg_escalated_scope(name: &str, arguments: &Value) -> Option<Scope> {
 /// `arguments` participates because a few tools' authority depends on what they are asked to DO, not
 /// only which tool it is — see [`arg_escalated_scope`].
 fn authorize_tool(caller: &Caller, name: &str, arguments: &Value) -> Result<(), CallError> {
-    if let Some(escalated) = arg_escalated_scope(name, arguments) {
+    if let Some((escalated, operation)) = arg_escalated_scope(name, arguments) {
         if !caller.grants(escalated) {
             tracing::warn!(
                 tool = %name,
                 caller = caller.describe(),
                 required = escalated.as_str(),
-                "mcp: tools/call refused — saving a crawl needs a broader capability than running one"
+                "mcp: tools/call refused — this argument combination needs a broader capability"
             );
             return Err(CallError::Forbidden(format!(
-                "Not authorized: saving a crawl with `save_as` requires the '{}' capability (it \
-                 creates a reusable, API-callable crawl), but this connection was granted '{}'. Omit \
-                 `save_as` to just run the crawl, or reconnect with an '{}'-scoped API key.",
+                "Not authorized: {} requires the '{}' capability, but this connection was granted \
+                 '{}'. Reconnect with an '{}'-scoped API key, or stay within this tool's \
+                 lower-capability operations.",
+                operation,
                 escalated.as_str(),
                 caller.describe(),
                 escalated.as_str(),
@@ -270,12 +290,27 @@ pub(crate) async fn run_workflow_tool(
     // are empty): required input slots, secret slots with the local vault keys offered as PICKABLE
     // options, persona slots with the local personas offered — the user picks or supplies values,
     // and the choices persist as install bindings the engine applies on every run (schedules too).
+    // Run-AS-persona override (parity with cloud/self-host writ_run_workflow and the crawl tools):
+    // an explicit `persona` (id or name) runs this workflow signed in as that saved identity instead
+    // of the workflow's default. Resolved + STRIPPED only on the non-marketplace path — a marketplace
+    // proxy row binds its persona through the install manifest (`marketplace_gate` reads `persona`
+    // from inputs itself), so we must not consume it out from under that flow. Because `persona` is
+    // still in `inputs` when `freshness_key` was computed above, an as-persona run is already keyed
+    // apart from an anonymous one — a cached logged-out answer can never satisfy a persona run.
+    let mut persona_override: Option<i64> = None;
     if let Some(wf) = workflows::get_by_id(&state.db, workflow_id).await? {
         if wf.marketplace_slug.as_deref().is_some_and(|s| !s.is_empty()) {
             if let Some(prompt) = marketplace_gate(state, &wf, &mut inputs).await? {
                 return Ok(prompt);
             }
         } else {
+            let persona_arg = inputs
+                .as_object_mut()
+                .and_then(|o| o.remove("persona"))
+                .filter(|v| !v.is_null());
+            if let Some(v) = persona_arg {
+                persona_override = Some(super::static_tools::resolve_persona(state, &v).await?);
+            }
             if let Some(prompt) = missing_input_result(&wf, &inputs) {
                 return Ok(prompt);
             }
@@ -289,7 +324,7 @@ pub(crate) async fn run_workflow_tool(
         source: RunSource::Mcp,
         lane: Lane::Interactive,
         dry_run: false,
-        persona_id: None,
+        persona_id: persona_override,
         allow_local_secret_refs: true,
     };
 
@@ -725,6 +760,36 @@ mod tests {
             &json!({ "url": "u", "save_as": "docs" })
         )
         .is_ok());
+    }
+
+    /// Personas: list/get are reads; sign_in/record_login run a real login and escalate to `run`.
+    /// There is no create/update/delete action, so no path reaches `admin` — persona lifecycle is
+    /// off this surface entirely (credentials never transit MCP).
+    #[test]
+    fn persona_tool_reads_freely_but_operating_needs_run() {
+        let read = scoped("read");
+        // Inspecting identities is a read.
+        assert!(authorize_tool(&read, "writ_personas", &json!({ "action": "list" })).is_ok());
+        assert!(authorize_tool(&read, "writ_personas", &json!({ "action": "get", "persona_id": 7 })).is_ok());
+        // Default action (list) is also a read.
+        assert!(authorize_tool(&read, "writ_personas", &no_args()).is_ok());
+
+        // Signing in runs a browser login — refused for a read-only key, with an actionable message.
+        let err = authorize_tool(&read, "writ_personas", &json!({ "action": "sign_in", "persona_id": 7 }))
+            .expect_err("sign_in must require run");
+        match err {
+            CallError::Forbidden(msg) => assert!(msg.contains("run"), "names the needed scope: {msg}"),
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+        assert!(
+            authorize_tool(&read, "writ_personas", &json!({ "action": "record_login", "persona_id": 7 })).is_err(),
+            "record_login must require run"
+        );
+
+        // A `run` key may operate.
+        let run = scoped("run");
+        assert!(authorize_tool(&run, "writ_personas", &json!({ "action": "sign_in", "persona_id": 7 })).is_ok());
+        assert!(authorize_tool(&run, "writ_personas", &json!({ "action": "record_login", "persona_id": 7 })).is_ok());
     }
 
     /// Reading saved crawls is a read; running one is execution.

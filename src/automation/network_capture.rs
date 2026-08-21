@@ -321,6 +321,83 @@ impl NetworkCapture {
     }
 }
 
+/// Reveal held credentials as `{{placeholders}}` and redact unheld secrets before captured
+/// calls leave the agent for the backend.
+///
+/// SECURITY REQUIREMENT: the backend must NEVER receive a plaintext login POST body,
+/// password, or live token. Twin of the Python agent's `_sanitize_network_calls`, and the
+/// only sanctioned way to serialize a capture off-box:
+/// - `request_body`: held-credential values become `{{key}}` (raw and percent-encoded).
+/// - request/response headers: a held credential becomes `{{key}}`; an auth-relevant header
+///   whose value is NOT held becomes `(secret not shown)`; everything else passes through.
+/// - `raw_headers` is ephemeral and never serialized (`#[serde(skip)]`), but it IS the
+///   source read here, since the stored `request_headers` are already redacted and a held
+///   credential could no longer be recognized in them.
+pub fn sanitize_network_calls(
+    calls: &[NetworkCall],
+    creds: &HashMap<String, String>,
+) -> Vec<serde_json::Value> {
+    const NOT_SHOWN: &str = "(secret not shown)";
+
+    fn clean(
+        source: &HashMap<String, String>,
+        creds: &HashMap<String, String>,
+        not_shown: &str,
+    ) -> HashMap<String, String> {
+        source
+            .iter()
+            .map(|(name, val)| {
+                let shown = match reveal_held_credentials(val, creds) {
+                    Some(revealed) => revealed,
+                    None => {
+                        let lower = name.to_lowercase();
+                        if crate::models::network::AUTH_HEADER_PATTERNS
+                            .iter()
+                            .any(|p| lower.contains(p))
+                            || val == crate::models::network::REDACTED_HEADER_VALUE
+                        {
+                            not_shown.to_string()
+                        } else {
+                            val.clone()
+                        }
+                    }
+                };
+                (name.clone(), shown)
+            })
+            .collect()
+    }
+
+    calls
+        .iter()
+        .map(|call| {
+            let mut c = call.clone();
+            if let Some(body) = c.request_body.as_deref() {
+                if let Some(revealed) = reveal_held_credentials(body, creds) {
+                    c.request_body = Some(revealed);
+                }
+            }
+            // Prefer the RAW headers: the stored ones are already value-redacted, so a held
+            // credential in them could never be matched back to its placeholder.
+            let req_source = c
+                .raw_headers
+                .as_ref()
+                .map(crate::models::network::filter_headers)
+                .or_else(|| c.request_headers.clone());
+            if let Some(src) = req_source {
+                c.request_headers = Some(clean(&src, creds, NOT_SHOWN));
+            }
+            if let Some(resp) = c.response_headers.clone() {
+                c.response_headers = Some(clean(&resp, creds, NOT_SHOWN));
+            }
+            // Belt and braces: `raw_headers` is `#[serde(skip)]`, and it is dropped here too
+            // so no future serializer can reintroduce it.
+            c.raw_headers = None;
+            serde_json::to_value(&c).unwrap_or(serde_json::Value::Null)
+        })
+        .filter(|v| !v.is_null())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +519,46 @@ mod tests {
         assert!(out.contains("X-API-Key: {{login_token}}"), "custom auth header revealed: {out}");
         assert!(out.contains("Content-Type: application/json"), "content-type shown: {out}");
         assert!(!out.contains(key), "raw key must never appear: {out}");
+    }
+
+    #[test]
+    fn sanitize_never_lets_a_plaintext_credential_leave() {
+        let mut creds = HashMap::new();
+        creds.insert("password".to_string(), "Sup3rSecret!".to_string());
+        creds.insert("username".to_string(), "someone@example.com".to_string());
+
+        let mut raw = HashMap::new();
+        raw.insert("Authorization".to_string(), "Bearer Sup3rSecret!".to_string());
+        raw.insert("X-Session-Token".to_string(), "minted-token-we-do-not-hold".to_string());
+        raw.insert("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string());
+
+        let call = NetworkCall {
+            method: "POST".into(),
+            url: "https://example.com/login".into(),
+            request_headers: None,
+            // Percent-encoded, as a real form post carries it.
+            request_body: Some("email=someone%40example.com&password=Sup3rSecret%21".into()),
+            request_content_type: Some("application/x-www-form-urlencoded".into()),
+            resource_type: "document".into(),
+            step: 1,
+            triggered_by: None,
+            timestamp: 0.0,
+            response_status: Some(302),
+            response_headers: None,
+            response_body: None,
+            response_content_type: None,
+            raw_headers: Some(raw),
+        };
+
+        let out = sanitize_network_calls(&[call], &creds);
+        let text = serde_json::to_string(&out).unwrap();
+        assert!(!text.contains("Sup3rSecret"), "plaintext password left the agent: {text}");
+        assert!(!text.contains("someone%40example.com"), "encoded username leaked: {text}");
+        assert!(!text.contains("minted-token-we-do-not-hold"), "unheld token leaked: {text}");
+        // The optimizer still learns HOW the endpoint authenticates.
+        assert!(text.contains("{{password}}"), "held credential not revealed: {text}");
+        assert!(text.contains("{{username}}"), "held credential not revealed: {text}");
+        assert!(text.contains("(secret not shown)"), "unheld secret not redacted: {text}");
+        assert!(text.contains("application/x-www-form-urlencoded"), "content-type kept: {text}");
     }
 }

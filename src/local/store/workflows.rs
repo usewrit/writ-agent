@@ -61,6 +61,16 @@ pub fn credentials_aad(workflow_id: i64) -> String {
     format!("workflows|credentials_encrypted|{workflow_id}")
 }
 
+/// AAD that binds a workflow's sealed `recorded_session_encrypted` (`WF1:`) blob — the RECORDING
+/// browser's auth state pinned at save time (0026) — to its row. Same single-source-of-truth
+/// contract as [`credentials_aad`]: the API create/update handlers seal with it, the engine's
+/// run-time session resolver (`engine::http::load_session`) opens with it, and the after-run
+/// refresh re-seals with it, so the sites can never drift. Binding the row id prevents ciphertext
+/// relocation across workflows.
+pub fn recorded_session_aad(workflow_id: i64) -> String {
+    format!("workflows|recorded_session_encrypted|{workflow_id}")
+}
+
 /// A full `workflows` row.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize, serde::Deserialize)]
 pub struct Workflow {
@@ -135,6 +145,20 @@ pub struct Workflow {
     #[serde(default)]
     #[sqlx(default)]
     pub auth_config: Option<String>,
+    /// Sealed Layer-B `WF1:` blob of the RECORDING browser's auth state (cookies / storage /
+    /// fingerprint), pinned at save time (0026) as the replay seed for runs with no persona.
+    /// `skip_serializing` is load-bearing: this struct serializes straight into API responses, and
+    /// the sealed blob must never leave the store — the API exposes only `has_recorded_session` +
+    /// the freshness stamp below. NEVER logged. `#[sqlx(default)]` keeps `SELECT *` paths (tests)
+    /// working across the additive migration.
+    #[serde(default, skip_serializing)]
+    #[sqlx(default)]
+    pub recorded_session_encrypted: Option<String>,
+    /// When the recorded seed was captured / last refreshed (RFC3339), duplicated OUTSIDE the
+    /// sealed blob so the UI can render freshness without a decrypt. NULL = nothing pinned.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub recorded_session_captured_at: Option<String>,
     #[serde(default)]
     pub default_persona_id: Option<i64>,
     #[serde(default)]
@@ -312,6 +336,13 @@ pub struct NewWorkflow {
     /// the sign-in. JSON stored as TEXT.
     #[serde(default, deserialize_with = "de_json_text_opt")]
     pub auth_config: Option<String>,
+    /// The RECORDING browser's auth-session JSON (a `SessionState`-shaped object) the wizard posts
+    /// at save (0026). NOT an insert column: the create handler seals it POST-insert so the Vault
+    /// AAD can bind the new row id ([`recorded_session_aad`]). PLAINTEXT auth material —
+    /// `skip_serializing` so a serialized `NewWorkflow` (sync/bridge tooling) can never echo it;
+    /// never logged.
+    #[serde(default, skip_serializing)]
+    pub recorded_session: Option<serde_json::Value>,
     /// Marketplace-proxy marker (0017). Set ONLY by the marketplace install path — the create/update
     /// REST handlers never pass it through (a caller can't fabricate a proxy row).
     #[serde(skip)]
@@ -398,6 +429,14 @@ pub struct WorkflowUpdate {
     /// AI auto-repair opt-in (0020). Accepts a JSON bool or int; `de_bool_int_opt` maps it to 0/1.
     #[serde(default, deserialize_with = "de_bool_int_opt")]
     pub ai_repair_enabled: Option<i64>,
+    /// Re-pin the recorded replay seed (0026): a `SessionState`-shaped auth-session object, sealed
+    /// by the API layer — NOT a store column (the UPDATE below never touches the sealed blob).
+    /// PLAINTEXT auth material — `skip_serializing`, never logged.
+    #[serde(default, skip_serializing)]
+    pub recorded_session: Option<serde_json::Value>,
+    /// Drop the recorded replay seed (0026). Handled in the API layer, not the store UPDATE.
+    #[serde(default)]
+    pub clear_recorded_session: Option<bool>,
 }
 
 // The two `last_run_*` entries are CORRELATED SUBQUERIES (the desktop workflows table stores no
@@ -409,7 +448,7 @@ const SELECT_COLS: &str = "id, name, description, workflow_type, steps, raw_repl
     schedule_enabled, schedule_interval_ms, schedule_kind, schedule_time, schedule_days, schedule_tz,
     last_scheduled_at, next_scheduled_at,
     session_persistence, session_ttl_seconds, login_url_patterns, relogin_max_retries,
-    http_capable, auth_config,
+    http_capable, auth_config, recorded_session_encrypted, recorded_session_captured_at,
     default_persona_id, estimated_duration_ms, usage_count, total_run_count, total_failure_count,
     consecutive_failures, last_run_at,
     (SELECT r.status FROM runs r WHERE r.workflow_id = workflows.id ORDER BY r.id DESC LIMIT 1) AS last_run_status,
@@ -691,6 +730,42 @@ pub async fn set_http_capable(pool: &SqlitePool, id: i64, value: i64) -> LocalRe
     Ok(())
 }
 
+/// Pin/refresh the RECORDING browser's sealed auth-session seed (0026). `sealed` is the Vault
+/// Layer-B `WF1:` blob (AAD [`recorded_session_aad`]); `captured_at` is RFC3339, duplicated outside
+/// the blob so freshness renders without a decrypt. Does NOT bump `updated_at`: the after-run
+/// refresh re-seals on every successful seeded run, and that is runtime bookkeeping, not a user
+/// edit (same reasoning as [`set_http_capable`]).
+pub async fn set_recorded_session(
+    pool: &SqlitePool,
+    id: i64,
+    sealed: &str,
+    captured_at: &str,
+) -> LocalResult<()> {
+    sqlx::query(
+        "UPDATE workflows SET recorded_session_encrypted = ?2, recorded_session_captured_at = ?3
+         WHERE id = ?1",
+    )
+    .bind(id)
+    .bind(sealed)
+    .bind(captured_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Drop the recorded auth-session seed (0026): the next persona-less run starts from the persisted
+/// workflow session if one exists, else cold.
+pub async fn clear_recorded_session(pool: &SqlitePool, id: i64) -> LocalResult<()> {
+    sqlx::query(
+        "UPDATE workflows SET recorded_session_encrypted = NULL, recorded_session_captured_at = NULL
+         WHERE id = ?1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Stamp scheduler bookkeeping after a due-run is dispatched. Sets `last_scheduled_at = now` and
 /// `next_scheduled_at` to the caller-computed RFC3339 timestamp (or NULL to clear).
 pub async fn mark_scheduled(
@@ -807,6 +882,39 @@ mod tests {
 
         // Unknown workflow → no row touched, no error.
         assert!(!mark_repaired(&pool, 999_999).await.unwrap());
+    }
+
+    /// The recorded replay seed (0026) round-trips through set/clear, and the sealed blob NEVER
+    /// serializes out of the row struct — API responses serialize `Workflow` directly, so
+    /// `skip_serializing` is the only thing standing between the vault blob and the wire. The
+    /// freshness stamp, by contrast, IS exposed (the UI renders it).
+    #[tokio::test]
+    async fn recorded_session_set_clear_and_blob_never_serializes() {
+        let pool = pool().await;
+        let wf = insert(&pool, &NewWorkflow { name: "rec".into(), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(wf.recorded_session_encrypted, None, "a fresh workflow pins nothing");
+        assert_eq!(wf.recorded_session_captured_at, None);
+
+        set_recorded_session(&pool, wf.id, "WF1:sealed-blob", "2026-08-16T00:00:00Z")
+            .await
+            .unwrap();
+        let got = get_by_id(&pool, wf.id).await.unwrap().unwrap();
+        assert_eq!(got.recorded_session_encrypted.as_deref(), Some("WF1:sealed-blob"));
+        assert_eq!(got.recorded_session_captured_at.as_deref(), Some("2026-08-16T00:00:00Z"));
+
+        let v = serde_json::to_value(&got).unwrap();
+        assert!(
+            v.get("recorded_session_encrypted").is_none(),
+            "the sealed blob must never serialize: {v}"
+        );
+        assert_eq!(v["recorded_session_captured_at"], "2026-08-16T00:00:00Z");
+
+        clear_recorded_session(&pool, wf.id).await.unwrap();
+        let cleared = get_by_id(&pool, wf.id).await.unwrap().unwrap();
+        assert_eq!(cleared.recorded_session_encrypted, None);
+        assert_eq!(cleared.recorded_session_captured_at, None);
     }
 
     /// The runs feed resolves names + repair stamps in ONE bulk query; it must carry the stamp

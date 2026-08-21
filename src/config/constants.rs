@@ -14,7 +14,34 @@ pub const VIEWPORT_HEIGHT: u32 = 800;
 
 // Session limits
 pub const MAX_SESSIONS: usize = 5;
+/// Idle window for a HUMAN-driven recording session (`/ws/record`). Generous on
+/// purpose: a person recording a workflow legitimately stops to think, read the
+/// page, or go find a value, and pulling the browser out from under them loses the
+/// recording. Stamped by `action_handler::handle_action`, so it measures real
+/// idleness rather than age.
 pub const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(1800); // 30 minutes
+/// Idle window for an MCP-driven connected browser session.
+///
+/// Deliberately MUCH shorter than the human window above, because the two have
+/// nothing in common but the underlying browser. A connected model calls a tool
+/// every few seconds while it works; the only pauses are a page read (5-60s) or a
+/// question it asked the user in chat (a few minutes). Nothing healthy pauses
+/// longer, so a long TTL does not protect a live session — it only lets an
+/// abandoned one (user redirected the AI, client crashed) pin a Chromium context.
+///
+/// The error is asymmetric: reaping too early costs one `writ_browser_use` call,
+/// which restores the persona's warm session and lands back on the same page.
+pub const MCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+/// How often the MCP connected-session reaper sweeps. The sweep interval adds
+/// directly to the leak window, so it must divide the idle window several times.
+pub const MCP_REAPER_INTERVAL: Duration = Duration::from_secs(60);
+
+// The reaper must sweep several times inside the idle window, or an abandoned
+// session outlives its TTL by up to a whole interval. Same invariant the cloud
+// record bridge asserts in local/record/bridge.rs.
+const _: () = assert!(
+    MCP_REAPER_INTERVAL.as_secs() * 4 <= MCP_SESSION_IDLE_TIMEOUT.as_secs()
+);
 pub const MAX_STEPS: usize = 5000;
 pub const MIN_WAIT_THRESHOLD_MS: u64 = 500;
 pub const MAX_WAIT_CAP_MS: u64 = 10_000;

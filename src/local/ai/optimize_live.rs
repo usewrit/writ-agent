@@ -27,7 +27,7 @@ use crate::local::ai::{brain, explorer, prompts, provider};
 use crate::local::engine::{persona, resolve, twofa, LocalEngine};
 use crate::local::error::{LocalError, LocalResult};
 use crate::local::server::AppState;
-use crate::local::store::workflows;
+use crate::local::store::{personas, workflows};
 use crate::local::vault::Vault;
 use crate::models::ai::{AiMessage, AiMessageContent};
 use crate::models::workflow::WorkflowStepConfig;
@@ -44,6 +44,37 @@ const AUTH_URL_HINTS: &[&str] = &["login", "auth", "token", "session", "signin",
 
 /// Scan the workflow's steps for likely side effects. Returns `Some(reason)` naming what matched when
 /// the workflow looks mutating (so the caller must explicitly confirm before we replay it), else `None`.
+/// True when these steps type the persona's credentials themselves.
+///
+/// Such a workflow signs in on its own, so replaying it COLD reproduces the sign-in (and
+/// captures its request) with no login recipe prepended. Matches only the
+/// `{{secret:<key>}}` channel, which is where credentials resolve from — a bare
+/// `{{key}}` reads form data, so it names ordinary run input, not a credential.
+fn steps_perform_login(steps: &[Value], credentials: &HashMap<String, String>) -> bool {
+    if steps.is_empty() || credentials.is_empty() {
+        return false;
+    }
+    let Ok(blob) = serde_json::to_string(steps) else { return false };
+    credentials.keys().any(|k| {
+        blob.contains(&format!("{{{{secret:{k}}}}}"))
+            || blob.contains(&format!("{{{{ secret:{k} }}}}"))
+    })
+}
+
+/// The persona's login workflow steps, or empty when it is unusable here.
+///
+/// A row with no steps is empty rather than "found": prepending nothing would leave the
+/// cold replay signed out while looking like it had signed in.
+async fn load_login_steps(db: &SqlitePool, login_workflow_id: i64) -> Vec<Value> {
+    let Ok(Some(wf)) = workflows::get_by_id(db, login_workflow_id).await else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Value>(wf.steps.trim())
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+}
+
 fn risky_side_effect(steps: &[Value]) -> Option<String> {
     let mut hits: Vec<String> = Vec::new();
     let note = |h: String, hits: &mut Vec<String>| {
@@ -195,6 +226,40 @@ pub(crate) async fn optimize_workflow_live_core(
     }
     let proxy = resolved_persona.as_ref().and_then(|p| p.proxy.clone());
 
+    // THE SIGN-IN MUST HAPPEN DURING THE REPLAY, NOT BEFORE IT. Restoring the persona's
+    // warm session makes the browser arrive already authenticated: the sign-in form never
+    // renders, the credential fills type into nothing, and no auth request enters the
+    // trace — so an authenticated workflow could never become an API-shaped one, which is
+    // the whole point of optimizing it. Keep the persona (credentials, 2FA, fingerprint,
+    // proxy) and drop the session, letting the replay authenticate for real.
+    //
+    // Signing in live needs steps that sign in: either this workflow types the persona's
+    // credentials itself (it IS a login recipe), or the persona's own login workflow is
+    // PREPENDED so the cold browser authenticates before the first step under
+    // optimization. Only when neither exists do we fall back to restoring the session — a
+    // cold replay would then just trace the login wall.
+    let login_steps: Vec<Value> = if steps_perform_login(&original, &credentials) {
+        Vec::new()
+    } else {
+        // `login_workflow_id` lives on the persona ROW (personas 0025), not on
+        // the engine's ResolvedPersona (which carries only what a replay
+        // context needs) — read it from the store by the same id the resolver
+        // used.
+        let login_wf = match wf.default_persona_id {
+            Some(pid) => personas::get_by_id(db, pid)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| row.login_workflow_id),
+            None => None,
+        };
+        match login_wf {
+            Some(lw) if lw != workflow_id => load_login_steps(db, lw).await,
+            _ => Vec::new(),
+        }
+    };
+    let sign_in_live = !login_steps.is_empty() || steps_perform_login(&original, &credentials);
+
     // Every credential key K resolves to its vault ref `{{secret:K}}` at record time, so a synthesized
     // api_call/login_post carries the replay-safe placeholder (never the plaintext). Form-data keys stay
     // `{{K}}` (resolved from form_data at replay) — record_value leaves unmapped keys untouched.
@@ -233,9 +298,20 @@ pub(crate) async fn optimize_workflow_live_core(
     let mut guard = CtxGuard(Some(context.clone()));
     let net = Arc::new(Mutex::new(NetworkCapture::new()));
     crate::ai::api_discovery_mode::attach_network_capture(&context, net.clone()).await;
+    // The optimizer's whole product is the captured trace: a request still in flight when
+    // the replay ends never gets a response, so it is dropped from the capture and the
+    // sign-in it represents can never be folded into an api_call. Count in-flight traffic
+    // so each step waits for what it started.
+    crate::automation::inflight::attach(&context).await;
 
-    // 5) Establish the session: restore persona cookies if present, else navigate to the entry URL.
-    let nav = match resolved_persona.as_ref().and_then(|p| p.session_state.as_ref()) {
+    // 5) Establish the session: COLD when the replay signs in for real (see above), else
+    //    restore persona cookies if present; either way land on the entry URL.
+    let restorable = if sign_in_live {
+        None
+    } else {
+        resolved_persona.as_ref().and_then(|p| p.session_state.as_ref())
+    };
+    let nav = match restorable {
         Some(state) => {
             crate::automation::session_state::inject_session_state(&page, &context, state, Some(entry_url), 30_000).await
         }
@@ -251,7 +327,12 @@ pub(crate) async fn optimize_workflow_live_core(
     // 6) Replay the steps best-effort — the goal is to TRIGGER + CAPTURE the backend calls, not a perfect
     //    run. A failing step is logged and skipped so partial traffic is still captured.
     let run_files = RunFiles::from_config(&json!({}), None);
-    for (i, raw) in original.iter().enumerate() {
+    // The prepended sign-in runs first and is NOT part of the diff — the proposal is
+    // still about this workflow's own steps; the login is here so its request lands in
+    // the trace.
+    let replay_steps: Vec<Value> =
+        login_steps.iter().cloned().chain(original.iter().cloned()).collect();
+    for (i, raw) in replay_steps.iter().enumerate() {
         let ty = raw.get("type").and_then(|t| t.as_str()).unwrap_or("");
         if ty.is_empty() || !raw.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) {
             continue;

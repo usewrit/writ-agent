@@ -529,6 +529,23 @@ impl PlaywrightRecorder {
         let step_count = session.steps.len();
         let raw_count = session.raw_replay_steps.len();
 
+        // Capture the recording browser's auth state (cookies / storage /
+        // fingerprint) BEFORE the context closes: captcha clearance, cookie
+        // consent, and logins earned while recording get pinned to the saved
+        // workflow as its replay seed. Best-effort — an empty state simply
+        // pins nothing downstream.
+        let auth_session = {
+            let captured = std::collections::HashMap::new();
+            Some(
+                crate::automation::session_state::extract_session_state(
+                    &session.page,
+                    &session.context,
+                    &captured,
+                )
+                .await,
+            )
+        };
+
         // Close the browser context (not the shared browser)
         if let Err(e) = session.context.close().await {
             tracing::warn!(
@@ -551,6 +568,7 @@ impl PlaywrightRecorder {
             steps: session.steps,
             raw_replay: session.raw_replay_steps,
             network_calls,
+            auth_session,
         })
     }
 

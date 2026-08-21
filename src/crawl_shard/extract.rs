@@ -313,7 +313,51 @@ fn extract_links(doc: &Html, base_url: &str) -> Vec<PageLink> {
             }
             out.push(PageLink { url: s, text });
             if out.len() >= 2000 {
-                break; // one page can't flood the frontier
+                return out; // one page can't flood the frontier
+            }
+        }
+    }
+    // Framed documents are pages too: harvest iframe/frame srcs so a document
+    // shown only through an embed still enters the frontier as its own page
+    // (the browser lane ALSO inlines same-site frame content — see `frames` —
+    // but the frontier link works on every lane, and coordinator scope rules
+    // decide cross-site srcs). Text: the frame's title/name, as the relevance
+    // signal an anchor label would give.
+    if let Ok(fsel) = Selector::parse("iframe[src], frame[src]") {
+        for el in doc.select(&fsel) {
+            let Some(src) = el.value().attr("src") else { continue };
+            let src = src.trim();
+            let lower = src.to_ascii_lowercase();
+            if src.is_empty()
+                || lower.starts_with("javascript:")
+                || lower.starts_with("about:")
+                || lower.starts_with("data:")
+                || lower.starts_with("blob:")
+            {
+                continue;
+            }
+            let Ok(mut joined) = base.join(src) else { continue };
+            if !matches!(joined.scheme(), "http" | "https") {
+                continue;
+            }
+            joined.set_fragment(None);
+            let s = joined.to_string();
+            if seen.insert(s.clone()) {
+                let mut text = el
+                    .value()
+                    .attr("title")
+                    .or_else(|| el.value().attr("name"))
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if text.chars().count() > ANCHOR_TEXT_MAX {
+                    text = text.chars().take(ANCHOR_TEXT_MAX).collect();
+                }
+                out.push(PageLink { url: s, text });
+                if out.len() >= 2000 {
+                    break;
+                }
             }
         }
     }
@@ -489,11 +533,136 @@ fn to_markdown(doc: &mut Html, base_url: &str, content: Option<&Value>) -> Strin
     }
 
     let md = normalize_markdown(&html_to_markdown(&inner_html), base_url);
-    if !md.is_empty() {
-        return md;
+    let body = if !md.is_empty() {
+        md
+    } else {
+        // Degrade: collapse the container's text to a single normalized block.
+        normalize_ws(&main_container_text(doc))
+    };
+    append_form_fields(doc, body)
+}
+
+/// A body under this many words is a candidate for field recovery.
+const STARVED_BODY_MAX_WORDS: usize = 120;
+/// ...but only when the page itself carries at least this much visible text, so a
+/// genuinely short page is never scanned for nothing.
+const STARVED_PAGE_MIN_WORDS: usize = 400;
+/// One field value is a label, not a document: a <select> can carry thousands of
+/// characters of options, and a textarea an entire article.
+const FIELD_VALUE_MAX: usize = 300;
+
+/// Append `label: value` lines for the page's form fields when the extracted body is
+/// starved.
+///
+/// ON A SIGNED-IN PAGE THE FORM IS THE CONTENT. An account screen, a dashboard, a
+/// settings panel — the email, the display name, the plan — none of it is text: an
+/// `<input>`'s value is an ATTRIBUTE, so a readability/markdown pass drops it and the
+/// page comes back as a list of empty headings even when the crawl is correctly
+/// signed in. Measured on a real profile page (cloud edition, same defect): 591
+/// visible words, of which the article extractor kept 53.
+///
+/// Only fires when the body is tiny in ABSOLUTE terms while the page clearly has text
+/// — that combination means "no article found", not "short page" — so an ordinary
+/// article is never touched. Password-ish fields are skipped entirely (never their
+/// value, never their presence) and every value is length-capped.
+fn append_form_fields(doc: &Html, body: String) -> String {
+    if body.split_whitespace().count() >= STARVED_BODY_MAX_WORDS {
+        return body;
     }
-    // Degrade: collapse the container's text to a single normalized block.
-    normalize_ws(&main_container_text(doc))
+    if main_container_text(doc).split_whitespace().count() < STARVED_PAGE_MIN_WORDS {
+        return body;
+    }
+    let fields = form_fields_markdown(doc);
+    if fields.is_empty() {
+        return body;
+    }
+    if body.is_empty() {
+        fields
+    } else {
+        format!("{body}\n\n{fields}")
+    }
+}
+
+/// True for a field name/type that must never be emitted — a password box may be
+/// prefilled by a manager, and a crawl row is stored and exported like any other
+/// content.
+fn is_secret_field(name: &str, ty: &str) -> bool {
+    if ty.eq_ignore_ascii_case("password") {
+        return true;
+    }
+    let n = name.to_ascii_lowercase();
+    [
+        "pass", "pwd", "secret", "token", "csrf", "apikey", "api_key", "api-key", "cvv",
+        "card", "otp", "code",
+    ]
+    .iter()
+    .any(|h| n.contains(h))
+}
+
+/// `label: value` lines for every visible, non-secret form field. Empty when there is
+/// nothing worth showing.
+fn form_fields_markdown(doc: &Html) -> String {
+    let sel = match Selector::parse("input, textarea, select") {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for el in doc.select(&sel) {
+        let v = el.value();
+        let ty = v.attr("type").unwrap_or("");
+        if matches!(
+            ty.to_ascii_lowercase().as_str(),
+            "hidden" | "submit" | "button" | "image" | "reset"
+        ) {
+            continue;
+        }
+        let name = v.attr("name").or_else(|| v.attr("id")).unwrap_or("");
+        if is_secret_field(name, ty) {
+            continue;
+        }
+        // Prefer a real label; fall back to aria-label/placeholder/name.
+        let label = el
+            .value()
+            .attr("aria-label")
+            .or_else(|| v.attr("placeholder"))
+            .unwrap_or(name)
+            .trim()
+            .to_string();
+        if label.is_empty() {
+            continue;
+        }
+        let value = match v.name() {
+            "select" => el
+                .select(&Selector::parse("option[selected]").unwrap_or_else(|_| {
+                    Selector::parse("option").expect("option selector is valid")
+                }))
+                .next()
+                .map(|o| o.text().collect::<String>())
+                .unwrap_or_default(),
+            "textarea" => el.text().collect::<String>(),
+            _ if matches!(ty.to_ascii_lowercase().as_str(), "checkbox" | "radio") => {
+                if v.attr("checked").is_some() { "yes".into() } else { "no".into() }
+            }
+            _ => v.attr("value").unwrap_or("").to_string(),
+        };
+        let mut value = normalize_ws(&value);
+        if value.is_empty() {
+            continue;
+        }
+        if value.chars().count() > FIELD_VALUE_MAX {
+            value = value.chars().take(FIELD_VALUE_MAX).collect::<String>().trim_end().to_string();
+            value.push('…');
+        }
+        let line = format!("- {label}: {value}");
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("## Form fields\n\n{}", lines.join("\n"))
+    }
 }
 
 /// Maximum element nesting depth we will hand to the markdown converter. Chosen well above any
@@ -989,6 +1158,58 @@ mod tests {
     }
 
     #[test]
+    fn frame_srcs_join_the_frontier() {
+        // A document shown only through an <iframe>/<frame> must still enter
+        // the frontier as its own page; its title/name rides as link text.
+        let html = r##"<html>
+            <frameset rows="50%,50%">
+              <frame src="/frame_top" name="top-frame">
+              <frame src="https://sub.ex.test/frame_bottom">
+              <noframes>Frames are not rendering.</noframes>
+            </frameset></html>"##;
+        let ex = extract(html, "https://ex.test/nested", 0, "t", "markdown", None, None);
+        let by_url: std::collections::HashMap<&str, &str> =
+            ex.links.iter().map(|l| (l.url.as_str(), l.text.as_str())).collect();
+        assert_eq!(by_url["https://ex.test/frame_top"], "top-frame");
+        assert!(by_url.contains_key("https://sub.ex.test/frame_bottom"));
+
+        let html = r##"<body><a href="/about">About</a>
+            <iframe src="/embed/report" title="Quarterly report"></iframe>
+            <iframe src="https://third.party.test/widget"></iframe>
+            <iframe src="javascript:void(0)"></iframe>
+            <iframe src="about:blank"></iframe></body>"##;
+        let ex = extract(html, "https://ex.test/page", 0, "t", "markdown", None, None);
+        let by_url: std::collections::HashMap<&str, &str> =
+            ex.links.iter().map(|l| (l.url.as_str(), l.text.as_str())).collect();
+        assert_eq!(by_url["https://ex.test/embed/report"], "Quarterly report");
+        // Cross-origin embeds are still harvested — coordinator scope decides.
+        assert!(by_url.contains_key("https://third.party.test/widget"));
+        assert!(!by_url.keys().any(|u| u.starts_with("javascript:") || u.starts_with("about:")));
+    }
+
+    #[test]
+    fn flattened_frame_sections_reach_the_markdown() {
+        // The browser lane replaces frame elements with
+        // <section data-writ-frame-src> blocks (crawl_shard::frames); the
+        // section content must survive chrome pruning while the leftover
+        // un-inlined iframe carcass is dropped.
+        let html = r#"<html><head><title>Wrap</title></head><body>
+            <section data-writ-frame-src="https://ex.test/frame_middle">
+              <h2>Middle pane</h2><p>Framed content the crawler used to lose entirely.</p>
+              <a href="/from-frame">deeper</a>
+            </section>
+            <iframe src="https://third.party.test/ad"></iframe>
+        </body></html>"#;
+        let ex = extract(html, "https://ex.test/nested", 0, "t", "markdown", None, None);
+        let md = ex.rows[0]["markdown"].as_str().unwrap();
+        assert!(md.contains("Middle pane"), "flattened frame content lost: {md}");
+        assert!(md.contains("Framed content the crawler used to lose"), "markdown: {md}");
+        // Links inside flattened frames are harvested (already absolutized here).
+        let urls: Vec<&str> = ex.links.iter().map(|l| l.url.as_str()).collect();
+        assert!(urls.contains(&"https://ex.test/from-frame"), "links: {urls:?}");
+    }
+
+    #[test]
     fn anchor_text_is_clipped_on_a_char_boundary() {
         // Multi-byte glyphs must not be split when the text exceeds ANCHOR_TEXT_MAX.
         let long = "é".repeat(ANCHOR_TEXT_MAX + 40);
@@ -1417,5 +1638,78 @@ mod tests {
         let out = normalize_markdown(md, "https://x.test/");
         assert!(!out.contains("data:image"), "data uri kept: {out}");
         assert!(!out.contains("\n\n\n"), "blank lines not collapsed: {out}");
+    }
+}
+
+#[cfg(test)]
+mod form_field_tests {
+    use super::*;
+
+    const ACCOUNT_PAGE: &str = r#"<html><body>
+      <h2>Mes informations</h2>
+      <form>
+        <input type="text" name="email" aria-label="Email" value="user@example.test">
+        <input type="text" name="name" aria-label="Nom" value="Ben">
+        <input type="checkbox" name="news" aria-label="Newsletter" checked>
+        <input type="password" name="current_password" aria-label="Mot de passe" value="hunter2">
+        <input type="hidden" name="_token" value="abc123">
+      </form></body></html>"#;
+
+    fn long_page(extra: &str) -> String {
+        let filler = "<p>".to_string() + &"mot ".repeat(20) + "</p>";
+        format!("<html><body>{}{}</body></html>", filler.repeat(40), extra)
+    }
+
+    #[test]
+    fn field_values_are_recovered_because_extractors_cannot_see_them() {
+        let doc = Html::parse_document(ACCOUNT_PAGE);
+        let out = form_fields_markdown(&doc);
+        assert!(out.contains("- Email: user@example.test"), "{out}");
+        assert!(out.contains("- Nom: Ben"), "{out}");
+        assert!(out.contains("- Newsletter: yes"), "{out}");
+    }
+
+    #[test]
+    fn password_and_hidden_fields_are_never_emitted() {
+        let doc = Html::parse_document(ACCOUNT_PAGE);
+        let out = form_fields_markdown(&doc);
+        assert!(!out.contains("hunter2"));
+        assert!(!out.contains("Mot de passe"));
+        assert!(!out.contains("abc123"));
+    }
+
+    #[test]
+    fn a_starved_body_on_a_text_rich_page_gets_the_fields_appended() {
+        let doc = Html::parse_document(&long_page(
+            r#"<input type="text" name="email" aria-label="Email" value="user@example.test">"#,
+        ));
+        let out = append_form_fields(&doc, "## A\n\n## B".into());
+        assert!(out.contains("## Form fields"), "{out}");
+    }
+
+    #[test]
+    fn a_normal_article_body_is_left_alone() {
+        let doc = Html::parse_document(&long_page(""));
+        let body = "mot ".repeat(500);
+        assert_eq!(append_form_fields(&doc, body.clone()), body);
+    }
+
+    #[test]
+    fn a_genuinely_short_page_is_not_scanned() {
+        let doc = Html::parse_document(
+            r#"<html><body><p>court</p><input name="email" aria-label="Email" value="a@b.c"></body></html>"#,
+        );
+        assert_eq!(append_form_fields(&doc, "## T".into()), "## T");
+    }
+
+    #[test]
+    fn long_values_are_capped() {
+        let big = "mot ".repeat(400);
+        let doc = Html::parse_document(&long_page(&format!(
+            r#"<textarea name="bio" aria-label="Bio">{big}</textarea>"#
+        )));
+        let out = form_fields_markdown(&doc);
+        assert!(out.chars().count() < 500, "len {}", out.chars().count());
+        assert!(out.trim_end().ends_with('…'), "{out}");
     }
 }

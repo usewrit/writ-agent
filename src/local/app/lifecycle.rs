@@ -210,10 +210,22 @@ pub async fn bootstrap() -> LocalResult<AppState> {
     // second browser, no ws-gateway, no remote agent. If the engine exposes no browser (it always
     // does here; the `None` arm only triggers for the test-only `StubEngine`), recording is simply
     // unavailable and `/ws/record` returns 503.
-    let recorder = engine
-        .browser()
-        .map(|bm| Arc::new(crate::recorder::core::PlaywrightRecorder::new(bm)));
-    if recorder.is_some() {
+    let recorder = engine.browser().map(|bm| {
+        let mut recorder = crate::recorder::core::PlaywrightRecorder::new(bm);
+        // Reclaim recording sessions whose client vanished. Only the CLI entry point
+        // used to start this, so in the desktop app NOTHING reaped the recorder's
+        // session table: a `/ws/record` client that dropped without closing left its
+        // Chromium context alive until the process exited. Measures
+        // `RecordingSession::last_activity`, so an active recording is never touched.
+        recorder.start_cleanup_loop();
+        Arc::new(recorder)
+    });
+    if let Some(recorder) = recorder.as_ref() {
+        // Separate, much shorter reaper for MCP-opened browsers. They share this
+        // recorder but not its idle semantics: a human recording legitimately pauses
+        // for many minutes, while a connected model that has gone quiet for five has
+        // been abandoned (user redirected the AI, or the client went away).
+        crate::local::mcp::static_tools::start_connected_session_reaper(recorder.clone());
         tracing::info!("local recorder ready (shares the engine's warm browser)");
     }
 

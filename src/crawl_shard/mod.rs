@@ -21,6 +21,7 @@ pub mod body_limit;
 pub mod capture;
 pub mod doc_extract;
 pub mod extract;
+pub mod frames;
 pub mod robots;
 
 // Local-daemon control-loop deps (SQLite store, app state) — only compiled for the
@@ -489,6 +490,14 @@ pub struct CrawlAuth {
     /// Registrable domain this session authenticates against. Empty ⇒ no host restriction beyond
     /// each cookie's own domain (older coordinators that don't send one).
     pub domain: String,
+    /// The User-Agent this session was minted under, from the captured fingerprint.
+    ///
+    /// Sites routinely tie a session to the UA that created it and sign out anything else, so a
+    /// crawl replaying persona cookies under the lane's own Chrome UA can be rejected while holding
+    /// a perfectly good session. Unlike the headers above this is NOT a credential — it identifies
+    /// the browser, not the user — so it is presented on every request rather than domain-gated,
+    /// which also keeps one consistent visitor across the off-site hops a crawl makes.
+    pub user_agent: Option<String>,
 }
 
 impl CrawlAuth {
@@ -1106,7 +1115,17 @@ fn auth_from_session(session_state: Option<&Value>, auth_domain: &str) -> CrawlA
             .unwrap_or_default()
     };
 
-    CrawlAuth { cookies, local_storage, session_storage, headers, domain }
+    // The UA the session was captured under. Both spellings appear in the wild: the Writ
+    // fingerprint serializes `userAgent`, older captures used `user_agent`.
+    let user_agent = ss.get("fingerprint").and_then(|fp| {
+        fp.get("userAgent")
+            .or_else(|| fp.get("user_agent"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
+
+    CrawlAuth { cookies, local_storage, session_storage, headers, domain, user_agent }
 }
 
 /// Build a `Cookie:` header value for `url` from the session cookies whose domain/path match. Returns
@@ -1686,6 +1705,54 @@ fn tag_content_kind(rows: &mut [Value], kind: &str) {
 /// Turn a doc-extract result into (title, rows, content_kind, lane). Mirrors the
 /// Python agent's `_rows_from_doc_result`: schema mode surfaces structured
 /// records; otherwise one markdown row (with `ocr_confidence` when OCR'd).
+/// The document page's row when the doc-extract sidecar is unavailable.
+///
+/// The host served the document fine, and (when an artifact context exists)
+/// its original bytes were captured — failing the PAGE over a missing
+/// OPTIONAL text extractor turned every document on a sidecar-less fleet
+/// into pages_failed with zero captured files. The row mirrors the
+/// extracted-doc row shape minus the text, and names why the text is
+/// missing so the gap lives in the data instead of a failure counter.
+/// Byte-parity with the Python engine's `_doc_stub_row`.
+fn doc_stub_row(
+    url: &str,
+    depth: i64,
+    content_type: &str,
+    content_bytes: usize,
+    now: &str,
+    captured: bool,
+    reason: &str,
+) -> (String, Vec<Value>, String, &'static str) {
+    let title = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(url)
+        .to_string();
+    let content_kind = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("document")
+        .to_string();
+    let row = json!({
+        "url": url,
+        "title": title.clone(),
+        "markdown": "",
+        "word_count": 0,
+        "depth": depth,
+        "fetched_at": now,
+        "content_kind": content_kind.clone(),
+        "content_bytes": content_bytes,
+        "extraction_skipped": reason,
+        "captured": captured,
+    });
+    (title, vec![row], content_kind, "doc")
+}
+
 fn rows_from_doc(
     doc: &Value,
     url: &str,
@@ -2015,48 +2082,58 @@ async fn fetch_and_extract(client: reqwest::Client, cfg: Arc<CrawlConfig>, item:
             Some(raw) => raw,
             None => fetched.text.take().unwrap_or_default().into_bytes(),
         };
-        let outcome = if doc_extract::is_configured() {
-            match doc_extract::extract(&bytes, &fetched.content_type, &fetched.final_url, &cfg.ocr_mode).await {
-                Some(doc) => {
-                    let now = now_iso();
-                    let (title, mut rows, content_kind, lane) =
-                        rows_from_doc(&doc, &fetched.final_url, item.depth, &now, &cfg.extract_mode);
-                    // Store the ORIGINAL document as a tenant file (additive; the
-                    // extracted rows above stay the crawl's primary product).
-                    // Dedupe'd server-side per source_url, so an unchanged document
-                    // on a re-crawl uploads nothing. The stamp is verified against
-                    // the DB at completion — a page can never claim a file the
-                    // backend didn't finalize for this crawl.
-                    let mut file: Option<Value> = None;
-                    if let Some(artifact) = cfg.artifact.as_ref() {
-                        if capture::is_capturable(&fetched.content_type, &fetched.final_url) {
-                            file = capture::capture_document(
-                                artifact, &fetched.final_url, &bytes, &fetched.content_type,
-                            )
-                            .await;
-                            if let Some(f) = file.as_ref() {
-                                for r in rows.iter_mut() {
-                                    if let Some(obj) = r.as_object_mut() {
-                                        obj.insert("file".into(), f.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    PageOutcome::Extracted {
-                        title, rows, links: Vec::new(), favicon: None, content_kind, lane,
-                        screenshot: None,
-                        file,
-                    }
-                }
-                None => PageOutcome::Failed {
-                    reason: format!("non-html ({}); doc-extract failed", fetched.content_type),
-                },
-            }
+        let doc_configured = doc_extract::is_configured();
+        let doc = if doc_configured {
+            doc_extract::extract(&bytes, &fetched.content_type, &fetched.final_url, &cfg.ocr_mode).await
         } else {
-            PageOutcome::Failed {
-                reason: format!("non-html ({}); doc-extract not configured", fetched.content_type),
+            None
+        };
+        // Store the ORIGINAL document as a tenant file INDEPENDENTLY of text
+        // extraction (additive; extracted rows stay the crawl's primary
+        // product). Capture needs nothing but the fetched bytes — nesting it
+        // inside the doc-extract success branch made every document on a
+        // sidecar-less fleet a FAILED page with zero captured files. Dedupe'd
+        // server-side per source_url, so an unchanged document on a re-crawl
+        // uploads nothing. The stamp is verified against the DB at completion
+        // — a page can never claim a file the backend didn't finalize for
+        // this crawl.
+        let mut file: Option<Value> = None;
+        if let Some(artifact) = cfg.artifact.as_ref() {
+            if capture::is_capturable(&fetched.content_type, &fetched.final_url) {
+                file = capture::capture_document(
+                    artifact, &fetched.final_url, &bytes, &fetched.content_type,
+                )
+                .await;
             }
+        }
+        let now = now_iso();
+        let (title, mut rows, content_kind, lane) = match doc.as_ref() {
+            Some(doc) => rows_from_doc(doc, &fetched.final_url, item.depth, &now, &cfg.extract_mode),
+            // No sidecar configured (or it failed): DEGRADE, never fail. The
+            // host served the document fine and the capture above may have
+            // stored the very bytes the user wanted kept; text extraction
+            // resumes when the sidecar is deployed.
+            None => doc_stub_row(
+                &fetched.final_url,
+                item.depth,
+                &fetched.content_type,
+                bytes.len(),
+                &now,
+                file.is_some(),
+                if doc_configured { "doc-extract failed" } else { "doc-extract not configured" },
+            ),
+        };
+        if let Some(f) = file.as_ref() {
+            for r in rows.iter_mut() {
+                if let Some(obj) = r.as_object_mut() {
+                    obj.insert("file".into(), f.clone());
+                }
+            }
+        }
+        let outcome = PageOutcome::Extracted {
+            title, rows, links: Vec::new(), favicon: None, content_kind, lane,
+            screenshot: None,
+            file,
         };
         return WorkerOut { url: item.url, depth: item.depth, outcome };
     }
@@ -2149,6 +2226,11 @@ async fn http_fetch(
         .header("Accept-Language", "en-US,en;q=0.9");
     if let Some(cookie) = cookie_header_for(url, &auth.cookies) {
         req = req.header(reqwest::header::COOKIE, cookie);
+    }
+    // Present the browser the session was minted under, not the lane's default Chrome: a site that
+    // pins its session to the UA signs out the mismatch even though every cookie is correct.
+    if let Some(ua) = auth.user_agent.as_deref() {
+        req = req.header(reqwest::header::USER_AGENT, ua);
     }
     // Token auth (Bearer / X-API-Key / CSRF) captured at login. Domain- AND https-gated so a
     // crawl that leaves the session's site cannot leak the token to a third party.
@@ -2328,12 +2410,22 @@ async fn fetch_via_browser(
         // long-poll/streaming page can't hang the crawl).
         let _ = crate::browser::navigation::wait_for_load_state(&page, "networkidle", Duration::from_secs(8)).await;
         let final_url = crate::browser::page_query::get_url(&page).await;
-        let html = crate::browser::page_query::get_content(&page).await.ok()?;
+        // Screenshot BEFORE flattening: the OCR/thumbnail shot must show the
+        // page as rendered (frames are visible in pixels anyway), and the
+        // flatten below rewrites the DOM.
         let shot = if want_screenshot {
             crate::browser::page_query::screenshot_jpeg(&page, 80).await.ok()
         } else {
             None
         };
+        // Fold same-site iframe/frameset content into the document so extraction
+        // and link harvest see it — page.content() serializes ONLY the main
+        // frame. Best-effort by contract: a failure degrades to a plain capture.
+        let inlined = frames::flatten_frames(&page).await;
+        if inlined > 0 {
+            tracing::debug!(url = %final_url, frames = inlined, "crawl render inlined frames");
+        }
+        let html = crate::browser::page_query::get_content(&page).await.ok()?;
         Some((final_url, html, shot))
     }
     .await;
@@ -3326,6 +3418,24 @@ mod tests {
         // HTML is the default — never routed to the document lane.
         assert!(!is_nonhtml("text/html", b"<html>", "https://x/page"));
         assert!(!is_nonhtml("", b"<!doctype html>", "https://x/page"));
+    }
+
+    #[test]
+    fn doc_stub_row_degrades_without_sidecar() {
+        // No doc-extract: the page still succeeds with a metadata row that
+        // mirrors the extracted-doc shape (Python parity: _doc_stub_row).
+        let (title, rows, kind, lane) = doc_stub_row(
+            "https://x/files/report.pdf", 2, "application/pdf; charset=binary",
+            1234, "now", true, "doc-extract not configured",
+        );
+        assert_eq!(title, "report.pdf");
+        assert_eq!(kind, "pdf");
+        assert_eq!(lane, "doc");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["markdown"], json!(""));
+        assert_eq!(rows[0]["content_bytes"], json!(1234));
+        assert_eq!(rows[0]["captured"], json!(true));
+        assert_eq!(rows[0]["extraction_skipped"], json!("doc-extract not configured"));
     }
 
     #[test]

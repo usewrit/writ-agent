@@ -1175,6 +1175,9 @@ pub(crate) fn build_recipe_workflow(
         relogin_max_retries: 0,
         http_capable: -1,
         auth_config: None,
+        // BYO INVARIANT parity: a listing recipe never ships the creator's auth session either.
+        recorded_session_encrypted: None,
+        recorded_session_captured_at: None,
         default_persona_id: None,
         estimated_duration_ms: None,
         usage_count: 0,

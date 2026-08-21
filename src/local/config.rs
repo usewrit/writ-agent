@@ -249,7 +249,7 @@ impl Default for LocalConfig {
             html_floor_ms: HTML_FLOOR_MS,
             js_floor_ms: JS_FLOOR_MS,
             max_check_units_per_min: 0,
-            telemetry_opt_in: false,
+            telemetry_opt_in: true,
             // Default OFF: root the vault in the 0600 `~/.writ/vault.key` file (in a 0700
             // dir). Enabling the OS keyring triggers a BLOCKING macOS Keychain prompt —
             // fine for a SIGNED/notarized prod build (one-time grant) but on an unsigned/dev
@@ -435,7 +435,12 @@ fn de_bool_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Er
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSection {
-    /// Opt-in anonymous telemetry. Env override `WRIT_TELEMETRY`.
+    /// Anonymous usage telemetry — ON by default (counts/durations only, random
+    /// install id, see cloud::usage_metrics). Reports go ONLY to the coordinator
+    /// this install is LINKED to (a self-hosted link reports to your own server;
+    /// an unlinked install never sends anything). Turn off in Settings → General
+    /// or `writ telemetry off`; an explicit `false` in config.toml is always
+    /// honored. Env override `WRIT_TELEMETRY`.
     #[serde(deserialize_with = "de_bool_lenient")]
     pub telemetry_opt_in: bool,
     /// Data retention window in DAYS for the history tables (`0` = keep everything). Env override
@@ -452,7 +457,7 @@ pub struct AppSection {
 impl Default for AppSection {
     fn default() -> Self {
         Self {
-            telemetry_opt_in: false,
+            telemetry_opt_in: true,
             retention_days: DEFAULT_RETENTION_DAYS,
             onboarding_completed: false,
             language: DEFAULT_LANGUAGE.to_string(),
@@ -1035,7 +1040,7 @@ mod tests {
         assert_eq!(cfg.html_floor_ms, HTML_FLOOR_MS);
         assert_eq!(cfg.js_floor_ms, JS_FLOOR_MS);
         assert!(!cfg.use_keyring, "keyring is opt-in; default is the file-rooted vault");
-        assert!(!cfg.telemetry_opt_in);
+        assert!(cfg.telemetry_opt_in, "anonymous telemetry ships ON; an explicit false is what turns it off");
         assert!(!cfg.cloud_expose_workflows);
         assert!(!cfg.network_exposed, "loopback-only is the default");
         assert_eq!(cfg.retention_days, DEFAULT_RETENTION_DAYS);

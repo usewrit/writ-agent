@@ -81,8 +81,15 @@ fn de_i64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Erro
 
 /// The start-crawl request body (mirrors the cloud `StartCrawlRequest`, adapted to the local scope:
 /// `max_concurrent` is the local worker cap rather than a fleet shard count). Several fields
-/// (`executor`/`extract_prompt`/`intent`/`seed_urls`/`relevance_threshold`) are cloud-forward-only —
-/// read solely by `build_cloud_start_body`, so the OSS build (no `cloud`) never touches them.
+/// (`executor`/`extract_prompt`/`intent`/`seed_urls`/`relevance_threshold`/`render_mode`/`ocr_mode`/
+/// `use_residential`) are cloud-forward-only — read solely by `build_cloud_start_body`, so the OSS
+/// build (no `cloud`) never touches them.
+///
+/// EVERY field the UI sends must exist here. Serde drops unknown keys silently, so a knob that is
+/// missing from this struct is not a compile error and not a 4xx — the crawl just runs with the
+/// cloud's default for it, which is indistinguishable from the user never having touched the
+/// control. That is how the Render lane, the OCR policy and the residential opt-in were being
+/// discarded on every desktop crawl.
 #[cfg_attr(not(feature = "cloud"), allow(dead_code))]
 #[derive(Debug, Default, Deserialize)]
 struct StartCrawlRequest {
@@ -99,6 +106,19 @@ struct StartCrawlRequest {
     executor: Option<String>,
     #[serde(default)]
     extract_prompt: Option<String>,
+    // Render + document lanes (cloud-only knobs — the local worker pool derives its own
+    // per-page strategy). `render_mode` is INDEPENDENT of `executor`: the AI reader runs
+    // on whichever lane fetched the page, so "AI + full browser" is a real combination
+    // the UI offers and this must carry.
+    #[serde(default)]
+    render_mode: Option<String>,
+    #[serde(default)]
+    ocr_mode: Option<String>,
+    /// Route shard egress through the platform residential broker (premium, cloud-only).
+    /// The UI already handles the 402 this can raise (`maybeResidentialFork`), which could
+    /// never fire while the flag was being dropped here.
+    #[serde(default, deserialize_with = "de_bool")]
+    use_residential: Option<bool>,
     // AI-supervised scoping (cloud-only): a plain-English goal the cloud fleet turns
     // into a scope + a relevance-ranked frontier. Accepted here so a cloud-routed
     // crawl can carry them; the local worker pool ignores them (deterministic sweep).
@@ -130,7 +150,10 @@ struct StartCrawlRequest {
     allow_subdomains: Option<bool>,
     /// Content-selection spec ({preset, include_comments, exclude_selectors, include_selectors,
     /// keep}) applied to every page; forwarded to the cloud when linked, honored locally otherwise.
-    #[serde(default)]
+    /// Accepted under BOTH wire names: `content` is the original, `content_spec` is what every
+    /// client actually posts (and what the cloud model calls it) — with only `content` declared,
+    /// the spec arrived null on every request the desktop UI made.
+    #[serde(default, alias = "content_spec")]
     content: Option<Value>,
 }
 
@@ -979,6 +1002,11 @@ fn build_cloud_start_body(b: &StartCrawlRequest) -> Value {
         "extract_mode": b.extract_mode.clone().unwrap_or_else(|| "markdown".into()),
         "extract_schema": b.extract_schema,
         "extract_prompt": b.extract_prompt,
+        // Fetch lane + document policy. Sent unset-safe: the cloud validates the string and
+        // falls back to "auto" itself, so a null here means "the user didn't choose".
+        "render_mode": b.render_mode.clone().unwrap_or_else(|| "auto".into()),
+        "ocr_mode": b.ocr_mode.clone().unwrap_or_else(|| "auto".into()),
+        "use_residential": b.use_residential.unwrap_or(false),
         // AI-supervised scoping — forwarded verbatim so the cloud derives the scope
         // + ranks the frontier by relevance. `intent`/`seed_urls`/`max_depth` are
         // Optional on the cloud (null reads as "unset", which is what triggers
@@ -1078,6 +1106,48 @@ mod tests {
         assert_eq!(body.respect_robots, Some(true));
         assert_eq!(body.same_domain, Some(true));
         assert_eq!(body.include_paths.as_ref().unwrap(), &vec!["^/docs".to_string()]);
+    }
+
+    #[cfg(feature = "cloud")]
+    #[test]
+    fn cloud_start_body_carries_every_knob_the_ui_sends() {
+        // A crawl on the managed desktop RUNS ON THE CLOUD, so this body is the whole
+        // contract. Serde drops unknown keys silently and the cloud defaults anything
+        // absent, so a knob missing from either the struct or this body is invisible:
+        // no error, just a crawl that ignored what the user chose. The Render lane in
+        // particular is independent of the executor — "AI reader + full browser" is a
+        // combination the UI offers, and both halves have to survive the hop.
+        let body: StartCrawlRequest = serde_json::from_value(json!({
+            "url": "https://example.com",
+            "executor": "ai",
+            "extract_prompt": "the product name and price",
+            "render_mode": "browser",
+            "ocr_mode": "force",
+            "use_residential": true,
+            // Every client posts `content_spec`; `content` is the legacy wire name.
+            "content_spec": {"preset": "main"},
+        }))
+        .unwrap();
+
+        let out = build_cloud_start_body(&body);
+        assert_eq!(out["executor"], "ai");
+        assert_eq!(out["extract_prompt"], "the product name and price");
+        assert_eq!(out["render_mode"], "browser");
+        assert_eq!(out["ocr_mode"], "force");
+        assert_eq!(out["use_residential"], true);
+        assert_eq!(out["content"]["preset"], "main");
+    }
+
+    #[cfg(feature = "cloud")]
+    #[test]
+    fn cloud_start_body_defaults_the_lane_when_unchosen() {
+        let body: StartCrawlRequest =
+            serde_json::from_value(json!({"url": "https://example.com"})).unwrap();
+        let out = build_cloud_start_body(&body);
+        assert_eq!(out["executor"], "regular");
+        assert_eq!(out["render_mode"], "auto");
+        assert_eq!(out["ocr_mode"], "auto");
+        assert_eq!(out["use_residential"], false);
     }
 
     #[test]

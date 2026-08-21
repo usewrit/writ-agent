@@ -1,6 +1,7 @@
 pub mod engine;
 pub mod agent_actions;
 pub mod step_executor;
+pub mod inflight;
 pub mod step_navigate;
 pub mod step_click;
 pub mod step_fill;

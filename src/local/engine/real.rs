@@ -1056,6 +1056,14 @@ impl RealEngine {
         page.set_default_timeout(STEP_ACTION_TIMEOUT_MS as f64).await;
         page.set_default_navigation_timeout(timeout_ms as f64).await;
 
+        // Count document/XHR/fetch traffic on this context so a step can wait for the
+        // request IT started instead of a fixed pause — the difference between reading the
+        // page a click produced and the one it left, and between banking a signed-in jar
+        // and the anonymous one. Armed per lane (not at context creation) because a crawl
+        // shard makes thousands of requests it never needs to wait on. Forgotten by the
+        // slot watcher.
+        crate::automation::inflight::attach(&context).await;
+
         // CR-11: guarantee the context is closed even if the step loop PANICS **or this future is
         // CANCELLED** (the whole-run timeout aborts the step task; a `monitor_handle.abort()` on the
         // fleet path drops it mid-flight). The normal exits below close it explicitly (awaited, for
@@ -1746,6 +1754,39 @@ impl RealEngine {
                 }
                 Err(e) => tracing::warn!(run_id, error = %e, "AI repair: could not serialize repaired steps"),
             }
+        }
+
+        // SETTLE BEFORE ANY HARVEST — the login cookie is set by the RESPONSE to the last
+        // action, not by the action itself.
+        //
+        // A recorded sign-in ends at the submit click (fill, fill, click). Reading the jar
+        // the instant that click returns banks the PRE-login, ANONYMOUS session: the POST
+        // is still in flight. The persona/workflow session is then stored "successfully"
+        // with a jar that looks authentic — on sites that hand anonymous visitors an
+        // HttpOnly session cookie (Laravel/Symfony and friends) it even passes the
+        // auth-material check — and every later authenticated run quietly returns
+        // signed-out pages. Measured against grafikart.fr on the Python engine: the whole
+        // run finished 4.5s after start, banking the anonymous jar every time, while the
+        // same credentials logged in fine over plain HTTP.
+        //
+        // Bounded and best-effort: a page that never reaches networkidle (polling widgets,
+        // open sockets) must not stall or fail a run that already succeeded. `load` is the
+        // one that matters — it covers the post-submit redirect that actually sets the
+        // cookie; networkidle is a short extra for SPA logins that set it from a
+        // background XHR. Only worth paying for on a run that will actually harvest.
+        let will_harvest = step_failure.is_none()
+            && (hybrid_range.is_some()
+                || http_fallback_reason.is_some()
+                || resolved_persona.is_some());
+        if will_harvest {
+            let _ = crate::browser::navigation::wait_for_load_state(
+                &page, "load", std::time::Duration::from_secs(8),
+            )
+            .await;
+            let _ = crate::browser::navigation::wait_for_load_state(
+                &page, "networkidle", std::time::Duration::from_secs(4),
+            )
+            .await;
         }
 
         // Hybrid: on a SUCCESSFUL browser run that persists its session, harvest the session (cookies +

@@ -221,6 +221,10 @@ fn build_recipe(config: &Value, credentials_encrypted: Option<String>) -> Workfl
         relogin_max_retries: 0,
         http_capable: -1,
         auth_config: None,
+        // The cloud never ships a recorded auth seed; an ad-hoc recipe always signs in with the
+        // per-run creds it carries.
+        recorded_session_encrypted: None,
+        recorded_session_captured_at: None,
         // Persona is resolved cloud-side; on-device the cloud-supplied creds ARE the identity.
         default_persona_id: None,
         estimated_duration_ms: None,

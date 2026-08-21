@@ -59,6 +59,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/personas/:id", get(get_one).patch(update_one).delete(remove))
         .route("/v1/personas/:id/test-2fa", post(test_twofa))
         .route("/v1/personas/:id/sign-in", post(sign_in))
+        .route("/v1/personas/:id/record-login-ai", post(record_login_ai))
         .route("/v1/personas/:id/runs", get(persona_runs))
 }
 
@@ -415,10 +416,16 @@ impl ListQuery {
     }
 }
 
-/// `GET /v1/personas` — newest-first list, capped by `?limit`, optionally filtered by `?domain=`.
-async fn list(State(st): State<AppState>, Query(q): Query<ListQuery>) -> LocalResult<Json<Value>> {
-    let mut rows = personas::list(&st.db, Some(q.limit())).await?;
-    if let Some(domain) = q.domain.as_deref().map(|d| d.trim().to_lowercase()) {
+/// Shaped persona rows, optionally filtered by domain suffix — the shared core
+/// behind `GET /v1/personas` and the `writ_personas` MCP tool, so both surfaces
+/// speak the one (secret-free) shape.
+pub(crate) async fn list_shaped(
+    st: &AppState,
+    domain: Option<&str>,
+    limit: i64,
+) -> LocalResult<Vec<Value>> {
+    let mut rows = personas::list(&st.db, Some(limit.clamp(1, MAX_LIMIT))).await?;
+    if let Some(domain) = domain.map(|d| d.trim().to_lowercase()) {
         let d = domain.trim_start_matches('.').to_string();
         if !d.is_empty() {
             rows.retain(|p| match p.target_domain.as_deref().map(|t| t.trim_start_matches('.').to_lowercase()) {
@@ -431,13 +438,18 @@ async fn list(State(st): State<AppState>, Query(q): Query<ListQuery>) -> LocalRe
     let links = workflow_links(&st.db).await?;
     let login_names = login_workflow_names(&st.db, &rows).await?;
     let empty: Vec<Value> = Vec::new();
-    let items: Vec<Value> = rows
+    Ok(rows
         .iter()
         .map(|p| {
             let lw = p.login_workflow_id.and_then(|w| login_names.get(&w)).map(String::as_str);
             shape(&st.vault, p, links.get(&p.id).unwrap_or(&empty), lw)
         })
-        .collect();
+        .collect())
+}
+
+/// `GET /v1/personas` — newest-first list, capped by `?limit`, optionally filtered by `?domain=`.
+async fn list(State(st): State<AppState>, Query(q): Query<ListQuery>) -> LocalResult<Json<Value>> {
+    let items = list_shaped(&st, q.domain.as_deref(), q.limit()).await?;
     Ok(Json(json!({ "data": items, "count": items.len() })))
 }
 
@@ -514,8 +526,9 @@ async fn create(State(st): State<AppState>, Json(body): Json<PersonaWrite>) -> L
     Ok(Json(shape(&st.vault, &row, &[], lw)))
 }
 
-/// `GET /v1/personas/:id` — one persona (shaped) or 404.
-async fn get_one(State(st): State<AppState>, Path(id): Path<i64>) -> LocalResult<Json<Value>> {
+/// One shaped persona or NotFound — the shared core behind `GET /v1/personas/:id`
+/// and the `writ_personas` MCP tool.
+pub(crate) async fn get_shaped(st: &AppState, id: i64) -> LocalResult<Value> {
     let p = personas::get_by_id(&st.db, id)
         .await?
         .ok_or_else(|| LocalError::NotFound(format!("persona {id}")))?;
@@ -523,7 +536,12 @@ async fn get_one(State(st): State<AppState>, Path(id): Path<i64>) -> LocalResult
     let login_names = login_workflow_names(&st.db, std::slice::from_ref(&p)).await?;
     let lw = p.login_workflow_id.and_then(|w| login_names.get(&w)).map(String::as_str);
     let empty: Vec<Value> = Vec::new();
-    Ok(Json(shape(&st.vault, &p, links.get(&p.id).unwrap_or(&empty), lw)))
+    Ok(shape(&st.vault, &p, links.get(&p.id).unwrap_or(&empty), lw))
+}
+
+/// `GET /v1/personas/:id` — one persona (shaped) or 404.
+async fn get_one(State(st): State<AppState>, Path(id): Path<i64>) -> LocalResult<Json<Value>> {
+    Ok(Json(get_shaped(&st, id).await?))
 }
 
 /// `PATCH /v1/personas/:id` — partial update. Cloud semantics: simple fields patch individually;
@@ -621,25 +639,222 @@ async fn sign_in(
     Path(id): Path<i64>,
     body: Option<Json<SignInBody>>,
 ) -> LocalResult<Json<Value>> {
+    let force = body.map(|Json(b)| b.force).unwrap_or(false);
+    Ok(Json(sign_in_core(&st, id, force).await?))
+}
+
+/// Run the persona's login workflow and report the VERIFIED outcome — the shared
+/// core behind `POST /v1/personas/:id/sign-in` and the `writ_personas` MCP tool
+/// (action `sign_in`), so both surfaces apply the same auth-material check.
+pub(crate) async fn sign_in_core(st: &AppState, id: i64, force: bool) -> LocalResult<Value> {
     guard_unlocked()?;
     personas::get_by_id(&st.db, id)
         .await?
         .ok_or_else(|| LocalError::NotFound(format!("persona {id}")))?;
 
-    let force = body.map(|Json(b)| b.force).unwrap_or(false);
-    let outcome = crate::local::persona_login::ensure_fresh_session(&st, id, force).await;
+    let outcome = crate::local::persona_login::ensure_fresh_session(st, id, force).await;
 
     // Re-read: the sign-in wrote the captured session / last_login_* from the engine
     // side, so the pre-dispatch row is stale by construction.
     let p = personas::get_by_id(&st.db, id)
         .await?
         .ok_or_else(|| LocalError::NotFound(format!("persona {id}")))?;
-    Ok(Json(json!({
-        "ok": outcome.ok,
-        "error": outcome.error,
+
+    // VERIFY THE LOGIN ACTUALLY TOOK. ensure_fresh_session only guarantees a session BLOB was
+    // captured (session_is_fresh — presence + expiry, the permissive gate the crawl path shares).
+    // But the write-back seals WHATEVER a run harvested (engine/real.rs), so a login that ran and
+    // landed back on the sign-in page still banks the site's anonymous cookies (consent/analytics)
+    // — which would read as "signed in". The test the user clicked must confirm real AUTH material
+    // — a session/auth cookie or a token store — so a logged-OUT persona is never reported as
+    // connected. Cloud parity: backend/routers/personas.py::sign_in_persona.
+    let mut ok = outcome.ok;
+    let mut error = outcome.error;
+    let authenticated = ok
+        && crate::local::engine::persona::open_session_value(&st.vault, &p)
+            .as_ref()
+            .map(crate::local::persona_login::session_has_auth_material)
+            .unwrap_or(false);
+    if ok && !authenticated {
+        ok = false;
+        error = Some(error.unwrap_or_else(|| {
+            "The login ran but no session cookie or auth token was captured — it likely didn't \
+             sign in (landed back on the login page, or the site uses a login this persona can't \
+             complete). Check the login workflow ends on a logged-in page, then try again."
+                .to_string()
+        }));
+        // Persist the honest outcome so the persona list doesn't show a green "signed in" it can't
+        // back up. Best-effort — never fail the response on it.
+        let _ = personas::record_login_result(&st.db, id, error.as_deref()).await;
+    }
+
+    Ok(json!({
+        "ok": ok,
+        "error": error,
         "has_warm_session": has(&p.session_state_encrypted),
         "session_expires_at": p.expires_at,
-    })))
+        // The VERIFIED truth the UI keys its "Signed in" state on — not has_warm_session, which
+        // reflects the raw blob (anonymous cookies included).
+        "authenticated": authenticated,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// AI login recording — "let AI sign in and record it"
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct RecordLoginAiBody {
+    /// Exact sign-in page when the user knows it; defaults to the persona's domain
+    /// root (the AI finds the form from there).
+    #[serde(default)]
+    login_url: Option<String>,
+}
+
+/// `POST /v1/personas/:id/record-login-ai` — drive an autonomous AI session that signs
+/// in AS this persona and RECORDS the flow, then wire the recording on as its login
+/// workflow. Cloud parity: `backend/routers/personas.py::record_login_ai`.
+///
+/// Returns as soon as the session row exists (`{ai_session_id, status}`) so the UI can
+/// poll `/v1/ai-sessions/:id` and watch the live preview on channel `ai-{id}`. The
+/// wiring happens in the detached task, so closing the window loses nothing.
+///
+/// The model never sees a credential: it is handed `{{key}}` placeholders and the loop
+/// substitutes real values at the wire, recording the `{{secret:key}}` TEMPLATE (see
+/// `persona_login_record`). Single-flight per persona — a second call while one runs is
+/// refused rather than launching a concurrent login against the same account.
+async fn record_login_ai(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    body: Option<Json<RecordLoginAiBody>>,
+) -> LocalResult<Json<Value>> {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    Ok(Json(record_login_core(&st, id, body.login_url.as_deref()).await?))
+}
+
+/// Launch the AI login-record session — the shared core behind
+/// `POST /v1/personas/:id/record-login-ai` and the `writ_personas` MCP tool
+/// (action `record_login`), so both surfaces share the provider gate, the
+/// single-flight guard, and the masked-credential plan.
+pub(crate) async fn record_login_core(
+    st: &AppState,
+    id: i64,
+    login_url: Option<&str>,
+) -> LocalResult<Value> {
+    use crate::local::persona_login_record as plr;
+    use crate::local::store::ai_sessions::{self, NewAiSession};
+
+    guard_unlocked()?;
+
+    let p = personas::get_by_id(&st.db, id)
+        .await?
+        .ok_or_else(|| LocalError::NotFound(format!("persona {id}")))?;
+
+    // Resolve the brain up front — a recording with no configured provider cannot run
+    // (the cloud gateway toggle supplies one, so a local key is optional then).
+    let ai_cfg = match crate::local::ai::provider::resolve_config(&st.db, &st.vault).await? {
+        Some(c) if !c.provider.trim().is_empty() => c,
+        _ if crate::local::ai::provider::cloud_gateway_enabled(&st.db).await => {
+            crate::local::ai::provider::AiConfig {
+                provider: String::new(),
+                model: String::new(),
+                base_url: None,
+                api_key: None,
+            }
+        }
+        _ => {
+            return Err(LocalError::BadRequest(
+                "No AI provider configured. Open Settings → AI and choose a provider + API \
+                 key, or turn on the cloud AI gateway."
+                    .into(),
+            ))
+        }
+    };
+    let browser = st
+        .engine
+        .browser()
+        .ok_or_else(|| LocalError::BadRequest("this engine cannot run AI sessions (no browser)".into()))?;
+
+    // Validate credentials/URL and resolve the identity BEFORE claiming the slot, so a
+    // bad request fails the HTTP call rather than a background task.
+    let plan = plr::plan_login_record(st, &p, login_url).await?;
+
+    // Single-flight: one AI login per persona. Concurrent logins against one account
+    // are how a site locks it.
+    let guard = plr::RecordGuard::claim(id).ok_or_else(|| {
+        LocalError::BadRequest(
+            "A login recording for this persona is already running. Watch that session, \
+             or wait for it to finish."
+                .into(),
+        )
+    })?;
+
+    let session = ai_sessions::insert(
+        &st.db,
+        &NewAiSession {
+            run_id: None,
+            workflow_id: None,
+            name: Some(plan.name.clone()),
+            goal: plan.goal.clone(),
+            entry_url: Some(plan.entry_url.clone()),
+            max_steps: Some(plr::LOGIN_RECORD_MAX_STEPS as i64),
+            // The model sees KEY NAMES only — never a credential value. (fill_data
+            // holds the real values for the wire; it is never serialized to a response.)
+            available_data: Some(
+                serde_json::to_string(
+                    &plan
+                        .fill_data
+                        .keys()
+                        .map(|k| (k.clone(), format!("[SECURE:{k}]")))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                )
+                .unwrap_or_else(|_| "{}".into()),
+            ),
+            fill_data: Some(serde_json::to_string(&plan.fill_data).unwrap_or_else(|_| "{}".into())),
+            generate_workflow: Some(true),
+        },
+    )
+    .await?;
+
+    let session_id = session.id;
+    let db = st.db.clone();
+    let engine = st.engine.clone();
+    let st_bg = st.clone();
+    let params = crate::local::ai::run::AiSessionParams {
+        name: Some(plan.name),
+        goal: plan.goal,
+        entry_url: Some(plan.entry_url),
+        available_data: std::collections::HashMap::new(),
+        fill_data: plan.fill_data,
+        max_steps: plr::LOGIN_RECORD_MAX_STEPS,
+        workflow_id: None,
+        resolved_persona: Some(plan.resolved_persona),
+        generate_workflow: true,
+        // Classic form-filler: a login IS a form, and the explorer's navigate/extract
+        // freedom is exactly the wandering this recording must not do.
+        explore: false,
+        record_templates: plan.record_templates,
+        ask_concierge_session_id: None,
+        cancel: Some(plan.cancel),
+    };
+
+    tokio::spawn(async move {
+        // The guard rides into the task so the slot frees however this ends.
+        let _guard = guard;
+        let outcome =
+            crate::local::ai::run::finish_ai_session(&db, &engine, &browser, &ai_cfg, session_id, params)
+                .await;
+        let (workflow_id, status, error) = match &outcome {
+            Ok(o) => (o.workflow_id, o.status.clone(), o.error.clone()),
+            Err(e) => (None, "error".to_string(), Some(e.to_string())),
+        };
+        if let Err(e) =
+            plr::wire_login_record_result(&st_bg, id, workflow_id, &status, error.as_deref()).await
+        {
+            tracing::warn!(persona_id = id, error = %e, "persona login wiring failed");
+        }
+    });
+
+    Ok(json!({ "ai_session_id": session_id, "status": "running" }))
 }
 
 // ---------------------------------------------------------------------------
@@ -729,18 +944,14 @@ struct RunsQuery {
     limit: Option<i64>,
 }
 
-/// `GET /v1/personas/:id/runs` — recent runs that acted as this persona (via the workflows whose
-/// `default_persona_id` is this persona). Cloud `PersonaRun` wire shape.
-async fn persona_runs(
-    State(st): State<AppState>,
-    Path(id): Path<i64>,
-    Query(q): Query<RunsQuery>,
-) -> LocalResult<Json<Value>> {
+/// Recent runs that acted as this persona, shaped — the shared core behind
+/// `GET /v1/personas/:id/runs` and the `writ_personas` MCP tool (`include_runs`).
+pub(crate) async fn runs_shaped(st: &AppState, id: i64, limit: i64) -> LocalResult<Vec<Value>> {
     if personas::get_by_id(&st.db, id).await?.is_none() {
         return Err(LocalError::NotFound(format!("persona {id}")));
     }
-    let rows = runs::list_by_default_persona(&st.db, id, q.limit.unwrap_or(20)).await?;
-    let items: Vec<Value> = rows
+    let rows = runs::list_by_default_persona(&st.db, id, limit).await?;
+    Ok(rows
         .iter()
         .map(|r| {
             json!({
@@ -754,7 +965,17 @@ async fn persona_runs(
                 "error": r.error_message.as_deref().map(|e| e.chars().take(200).collect::<String>()),
             })
         })
-        .collect();
+        .collect())
+}
+
+/// `GET /v1/personas/:id/runs` — recent runs that acted as this persona (via the workflows whose
+/// `default_persona_id` is this persona). Cloud `PersonaRun` wire shape.
+async fn persona_runs(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<RunsQuery>,
+) -> LocalResult<Json<Value>> {
+    let items = runs_shaped(&st, id, q.limit.unwrap_or(20)).await?;
     Ok(Json(json!({ "data": items, "count": items.len() })))
 }
 
@@ -1309,6 +1530,84 @@ mod tests {
         workflows::delete(&st.db, wf.id).await.unwrap();
         let after = get_one(State(st.clone()), Path(id)).await.unwrap();
         assert_eq!(after.0["login_workflow_id"], Value::Null, "FK is SET NULL");
+    }
+
+    /// The sign-in TEST tightening (cloud parity with `backend/routers/personas.py`):
+    /// `ensure_fresh_session` only proves a session BLOB exists (the permissive gate the crawl
+    /// path shares), but the "Sign in now" outcome + the new `authenticated` flag must reflect real
+    /// AUTH material. Pre-sealing a session lets us reach the check with ok=true WITHOUT the engine
+    /// (force=false early-returns on a fresh session), exercising exactly the divergence: an
+    /// anonymous-only session reports ok:false / authenticated:false (and records the honest error),
+    /// while a real auth cookie or a token store reports ok:true / authenticated:true — both with
+    /// has_warm_session:true (the raw blob is unchanged; only the verdict tightens).
+    #[tokio::test]
+    async fn sign_in_verifies_real_auth_material_not_just_a_session_blob() {
+        let (st, vault) = fixture().await;
+
+        // Seal a SessionState-shaped JSON onto a fresh persona with NO expiry, so `session_is_fresh`
+        // is true and the force=false sign-in never dispatches to the engine.
+        async fn with_session(st: &AppState, vault: &Vault, name: &str, session: Value) -> i64 {
+            let p = personas::insert(&st.db, &NewPersona { name: name.into(), ..Default::default() })
+                .await
+                .unwrap();
+            let blob = vault
+                .seal_field(
+                    &serde_json::to_vec(&session).unwrap(),
+                    &persona_aad(crate::local::engine::persona::AAD_SESSION_STATE, p.id),
+                )
+                .unwrap();
+            personas::save_session(&st.db, p.id, &blob, None).await.unwrap();
+            p.id
+        }
+
+        // 1. ONLY anonymous cookies — the blob looks alive, but the login did not take.
+        let anon_id = with_session(
+            &st,
+            &vault,
+            "anon",
+            json!({ "cookies": [
+                { "name": "_ga", "value": "x" },
+                { "name": "cookie_consent", "value": "1" }
+            ] }),
+        )
+        .await;
+        let res = sign_in(State(st.clone()), Path(anon_id), Some(Json(SignInBody { force: false })))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(res["ok"], Value::Bool(false), "anonymous cookies are not a login");
+        assert_eq!(res["authenticated"], Value::Bool(false));
+        assert_eq!(res["has_warm_session"], Value::Bool(true), "the blob still exists — only the verdict tightens");
+        assert!(res["error"].as_str().unwrap().contains("session cookie or auth token"));
+        // The honest outcome is persisted so the persona list can't show a green "signed in".
+        let after = personas::get_by_id(&st.db, anon_id).await.unwrap().unwrap();
+        assert!(after.last_login_error.as_deref().unwrap().contains("session cookie or auth token"));
+
+        // 2. A real HttpOnly session cookie — a genuine login.
+        let auth_id = with_session(
+            &st,
+            &vault,
+            "auth",
+            json!({ "cookies": [{ "name": "sessionid", "value": "s3cr3t", "httpOnly": true }] }),
+        )
+        .await;
+        let res = sign_in(State(st.clone()), Path(auth_id), Some(Json(SignInBody { force: false })))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(res["ok"], Value::Bool(true));
+        assert_eq!(res["authenticated"], Value::Bool(true));
+        assert_eq!(res["has_warm_session"], Value::Bool(true));
+        assert_eq!(res["error"], Value::Null);
+
+        // 3. A token-auth SPA (localStorage JWT, no cookie at all) is also a verified login.
+        let spa_id = with_session(&st, &vault, "spa", json!({ "localStorage": { "access_token": "ey" } })).await;
+        let res = sign_in(State(st.clone()), Path(spa_id), Some(Json(SignInBody { force: false })))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(res["ok"], Value::Bool(true));
+        assert_eq!(res["authenticated"], Value::Bool(true));
     }
 }
 

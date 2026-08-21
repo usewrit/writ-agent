@@ -1,0 +1,22 @@
+-- RECORD-TIME PINNED SESSION — the recording browser's auth state, kept as the replay seed.
+--
+-- Recording happens in a real signed-in browser: the user logs in, clears cookie consent, maybe
+-- earns a captcha clearance — and the save used to throw all of that away with the recording
+-- context. The very first replay then started COLD and died on the login wall unless the user
+-- separately built a persona and captured a session onto it. The cloud now pins the recording
+-- browser's auth session to the workflow at save and seeds replays from it; these columns are the
+-- desktop twin of that contract.
+--
+-- `recorded_session_encrypted` is the recording browser's auth state (cookies / localStorage /
+-- sessionStorage / fingerprint) captured when the workflow was saved, sealed as a Vault Layer-B
+-- `WF1:` blob (AAD-bound to this row) ON TOP of SQLCipher — never stored or served in the clear,
+-- never echoed over the API. At run time it is the LAST rung of the injection precedence shared
+-- with the cloud: persona warm session > persisted workflow session > this recorded seed — i.e.
+-- it is the replay seed when no persona is linked. A successful seeded run (no persona) re-seals
+-- it from the harvested state so the seed tracks rotated cookies instead of aging until it dies.
+--
+-- `recorded_session_captured_at` (RFC3339) is duplicated OUTSIDE the sealed blob so the UI can
+-- show session freshness without a decrypt. NULL on both = nothing pinned (the workflow was
+-- recorded logged-out, or the user cleared the seed).
+ALTER TABLE workflows ADD COLUMN recorded_session_encrypted TEXT;
+ALTER TABLE workflows ADD COLUMN recorded_session_captured_at TEXT;

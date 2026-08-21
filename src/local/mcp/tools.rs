@@ -567,6 +567,8 @@ mod tests {
             relogin_max_retries: 0,
             http_capable: -1,
             auth_config: None,
+            recorded_session_encrypted: None,
+            recorded_session_captured_at: None,
             default_persona_id: None,
             estimated_duration_ms: None,
             usage_count: 0,

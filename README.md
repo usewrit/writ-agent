@@ -158,8 +158,12 @@ The agent makes **no** outbound calls you did not configure.
 | The Chromium project's download bucket | First browser use only, if no browser is found. The agent fetches open-source Chromium over HTTPS and verifies it against a checksum built into the binary, refusing to install on a mismatch. Pre-install into `PLAYWRIGHT_BROWSERS_PATH` to skip it; the container image already ships a browser. |
 | The sites your workflows target | When you run them. |
 
-There is no analytics, no phone-home, and no update check. Usage telemetry is off unless you both
-opt in and supply your own endpoint — there is no built-in destination.
+There is no update check, and telemetry opens no destination of its own. Anonymous usage counts —
+totals and durations, never page content or URLs — ride the coordinator link you already
+configured, so a self-hosted coordinator receives its own agents' numbers and an agent you never
+linked sends nothing at all. It is on by default; `writ telemetry off` turns it off for good, and
+`writ telemetry preview` shows you a day's report before it is sent. Crash reporting stays inert
+unless you supply your own `WRIT_TELEMETRY_DSN` — there is no built-in one.
 
 For the finer points — what monitoring stores, how long data is kept, what the browser flags do —
 see [`docs/DISCLOSURES.md`](./docs/DISCLOSURES.md).

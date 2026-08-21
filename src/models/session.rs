@@ -254,6 +254,12 @@ pub struct SessionResult {
     /// capture was enabled. The backend synthesizes these into callable api_functions.
     #[serde(default)]
     pub network_calls: Vec<NetworkCall>,
+    /// The recording browser's auth state (cookies/storage/fingerprint),
+    /// extracted just before the context closed. Pinned to the saved workflow
+    /// as its replay seed — captcha clearance / cookie consent / logins earned
+    /// while recording survive into runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_session: Option<SessionState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -871,6 +871,46 @@ pub fn flatten(
     (columns, rows)
 }
 
+/// One run's contribution to the flat table, without materializing rows: the
+/// record count, the run's first-seen column order, whether `extracted_data`
+/// is present and non-null (the scan's authoritative filter), and the
+/// snapshot-chain bearing flag. Computed with the SAME coercion the flatten
+/// runs (`records_from_result`), so the numbers can never drift from it — the
+/// API layer caches these per run to serve the default page / picker / facets
+/// from bounded reads.
+pub fn run_digest(run: &RunInput, declared: &[String]) -> RunDigest {
+    let declared_cols = declared_columns(declared);
+    let (records, data_bearing, _sources) = records_from_result(&run.result_data, &declared_cols);
+    let mut cols: Vec<String> = Vec::new();
+    for (_idx, rec) in &records {
+        for k in rec.keys() {
+            if !cols.contains(k) {
+                cols.push(k.clone());
+            }
+        }
+    }
+    let nonnull = run
+        .result_data
+        .as_object()
+        .and_then(|o| o.get("extracted_data"))
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    RunDigest { n: records.len(), cols, nonnull, data_bearing }
+}
+
+/// See [`run_digest`].
+#[derive(Debug, Clone)]
+pub struct RunDigest {
+    /// Rows this run contributes to the flat table.
+    pub n: usize,
+    /// First-seen key order across the run's cleaned records.
+    pub cols: Vec<String>,
+    /// `extracted_data` present and non-null (counts toward `scanned_runs`).
+    pub nonnull: bool,
+    /// Snapshot-chain bearing (explicit-empty datasets included).
+    pub data_bearing: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Filters.
 // ---------------------------------------------------------------------------

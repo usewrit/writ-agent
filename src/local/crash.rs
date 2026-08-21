@@ -564,21 +564,22 @@ mod tests {
         assert!(out.contains("<token:redacted>"));
     }
 
-    /// Telemetry is OFF by default: with no opt-in and no DSN, `maybe_report_crash` is a no-op and
-    /// does not panic. (We can't assert on "no network call" directly, but the stub never makes one.)
+    /// The opt-in flag is ON by default, but crash reporting still needs a DSN and there is no
+    /// built-in one — so out of the box `maybe_report_crash` is a no-op and does not panic. (We
+    /// can't assert on "no network call" directly, but the stub never makes one.)
     #[test]
-    fn telemetry_off_by_default_is_noop() {
+    fn crash_reporting_is_a_noop_without_a_dsn() {
         let _g = crate::local::config::test_env_guard();
         // Ensure a clean env for this assertion (tests share the process).
         std::env::remove_var("WRIT_TELEMETRY");
         std::env::remove_var(TELEMETRY_DSN_ENV);
-        // Point WRIT_HOME at a throwaway dir so `telemetry_enabled` reads a default (no opt-in) config
-        // instead of the developer's real ~/.writ.
+        // Point WRIT_HOME at a throwaway dir so `telemetry_enabled` reads a default config instead
+        // of the developer's real ~/.writ.
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("WRIT_HOME", dir.path().join(".writ"));
 
-        assert!(!telemetry_enabled(), "default config is not opted in");
-        assert!(telemetry_dsn().is_none(), "no DSN by default");
+        assert!(telemetry_enabled(), "the default config carries the opt-in flag on");
+        assert!(telemetry_dsn().is_none(), "no DSN by default — so the flag alone reports nothing");
 
         let rec = CrashRecord {
             timestamp: now_rfc3339(),

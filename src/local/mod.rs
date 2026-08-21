@@ -50,6 +50,7 @@ pub mod ai;
 pub mod auth;
 pub mod authenticator_import;
 pub mod persona_login;
+pub mod persona_login_record;
 pub mod runtime_token;
 pub mod ws_ticket;
 pub mod tls;

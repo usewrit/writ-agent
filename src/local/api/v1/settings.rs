@@ -752,20 +752,22 @@ mod tests {
 
         let (code, body) = call(&st, "GET", "/v1/settings/telemetry", None).await;
         assert_eq!(code, 200);
-        assert_eq!(body["enabled"], false, "OFF by default");
+        assert_eq!(body["enabled"], true, "ON by default");
         assert!(body["last_reported_day"].is_null(), "nothing reported yet");
 
-        let (code, body) = call(&st, "PUT", "/v1/settings/telemetry", Some(r#"{"enabled":true}"#)).await;
+        // Turning it OFF is the direction that matters now that the default is on: the opt-out has
+        // to reach the file the reporter loop reads, not just echo back in the response.
+        let (code, body) = call(&st, "PUT", "/v1/settings/telemetry", Some(r#"{"enabled":false}"#)).await;
         assert_eq!(code, 200);
-        assert_eq!(body["enabled"], true);
+        assert_eq!(body["enabled"], false);
 
         // The on-disk config the daemon loads — not just the response echo.
         let paths = Paths::resolve().unwrap();
-        assert!(config::load_config(&paths).telemetry_opt_in, "must land in [app].telemetry_opt_in");
+        assert!(!config::load_config(&paths).telemetry_opt_in, "must land in [app].telemetry_opt_in");
 
-        let (_, body) = call(&st, "PUT", "/v1/settings/telemetry", Some(r#"{"enabled":false}"#)).await;
-        assert_eq!(body["enabled"], false);
-        assert!(!config::load_config(&paths).telemetry_opt_in);
+        let (_, body) = call(&st, "PUT", "/v1/settings/telemetry", Some(r#"{"enabled":true}"#)).await;
+        assert_eq!(body["enabled"], true);
+        assert!(config::load_config(&paths).telemetry_opt_in);
 
         std::env::remove_var("WRIT_HOME");
     }
@@ -780,13 +782,14 @@ mod tests {
         let admin_key = mint_key(&st, "admin").await;
         let manage_key = mint_key(&st, "manage").await;
 
-        let (code, _) = call_as(&st, &admin_key, "PUT", "/v1/settings/telemetry", Some(r#"{"enabled":true}"#)).await;
-        assert_eq!(code, 403, "an admin key must not be able to turn telemetry on");
+        let (code, _) = call_as(&st, &admin_key, "PUT", "/v1/settings/telemetry", Some(r#"{"enabled":false}"#)).await;
+        assert_eq!(code, 403, "an admin key must not be able to turn telemetry off");
         let paths = Paths::resolve().unwrap();
-        assert!(!config::load_config(&paths).telemetry_opt_in, "and nothing was persisted");
+        assert!(config::load_config(&paths).telemetry_opt_in, "and nothing was persisted");
 
-        let (code, _) = call_as(&st, &manage_key, "PUT", "/v1/settings/telemetry", Some(r#"{"enabled":true}"#)).await;
+        let (code, _) = call_as(&st, &manage_key, "PUT", "/v1/settings/telemetry", Some(r#"{"enabled":false}"#)).await;
         assert_eq!(code, 200, "manage is the capability that owns device-level decisions");
+        assert!(!config::load_config(&paths).telemetry_opt_in, "and manage's decision persisted");
 
         std::env::remove_var("WRIT_HOME");
     }

@@ -949,6 +949,24 @@ pub async fn cloud_api_key_catalog(db: &SqlitePool) -> LocalResult<Value> {
         .await
 }
 
+/// `POST /api/ws-ticket` — mint a single-use recording-WS ticket on the linked account, for the
+/// desktop's "record on Writ Cloud" venue. The cloud accepts the daemon's first-party `wto_` token
+/// and binds the ticket to a short-lived session JWT it mints server-side; the reply
+/// (`{ticket, expires_in, record_ws_url}`) carries everything the webview needs to dial the
+/// ws-gateway directly (`record_ws_url?ticket=…`). The `wto_` token itself never reaches the
+/// webview — only the one-shot ticket does.
+pub async fn mint_record_ticket(db: &SqlitePool) -> LocalResult<Value> {
+    client(db).await?.post_json("/api/ws-ticket", &json!({})).await
+}
+
+/// `POST /api/automation/workflows` — create a workflow ON the linked cloud account (the wizard's
+/// cloud-venue save). Body is the cloud `WorkflowCreate` passed through verbatim; the cloud
+/// re-enforces every plan limit, so a refusal surfaces as this call's error. The created row is a
+/// CLOUD workflow — it appears in the Cloud list via [`cloud_workflows`], is never written locally.
+pub async fn create_cloud_workflow(db: &SqlitePool, body: &Value) -> LocalResult<Value> {
+    client(db).await?.post_json("/api/automation/workflows", body).await
+}
+
 /// `POST /api/api-keys` — mint an account key. `body` is the cloud `CreateAPIKeyRequest`
 /// (`{label, preset|scopes, …}`) passed through verbatim; the reply carries the one-time secret.
 pub async fn create_cloud_api_key(db: &SqlitePool, body: &Value) -> LocalResult<Value> {

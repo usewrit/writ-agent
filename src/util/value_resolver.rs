@@ -108,10 +108,25 @@ pub fn resolve_value_full(
     result = secret_re
         .replace_all(&result, |caps: &regex::Captures| {
             let key = &caps[1];
-            credentials
-                .get(key)
-                .cloned()
-                .unwrap_or_else(|| caps[0].to_string())
+            match credentials.get(key) {
+                Some(v) => v.clone(),
+                None => {
+                    // Leave the placeholder VERBATIM (never an empty string): a login step
+                    // that types "" looks like a wrong password and the run still reports
+                    // success, banking an anonymous session. The literal is at least
+                    // diagnosable on the page. Names only, never values.
+                    tracing::warn!(
+                        secret_key = %key,
+                        available = ?{
+                            let mut k: Vec<&str> = credentials.keys().map(|s| s.as_str()).collect();
+                            k.sort_unstable();
+                            k
+                        },
+                        "unresolved {{secret:…}} placeholder — left verbatim"
+                    );
+                    caps[0].to_string()
+                }
+            }
         })
         .into_owned();
 

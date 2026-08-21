@@ -3321,10 +3321,17 @@ async fn handle_ai_session_start(
         },
         None => None,
     };
+    // Which fill keys carry SECRET material. A recorded step must name these on
+    // the credentials channel (`{{secret:KEY}}`) — that is where the replay path
+    // puts a persona's credentials (`merge_into_credentials`, engine/real.rs). A
+    // step left with a bare `{{password}}` resolves against run INPUTS instead,
+    // finds nothing, and types an empty string: a silent logged-out re-login.
+    let mut secret_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(p) = resolved_persona.as_ref() {
         let mut creds: HashMap<String, String> = HashMap::new();
         p.merge_into_credentials(&mut creds);
         for (k, v) in creds {
+            secret_keys.insert(k.clone());
             fill_data.entry(k).or_insert(v);
         }
     }
@@ -3344,6 +3351,7 @@ async fn handle_ai_session_start(
         match serde_json::from_str::<HashMap<String, String>>(&json_text) {
             Ok(secrets) => {
                 for (k, v) in secrets {
+                    secret_keys.insert(k.clone());
                     fill_data.insert(k, v);
                 }
             }
@@ -3370,7 +3378,12 @@ async fn handle_ai_session_start(
         resolved_persona,
         generate_workflow,
         explore: false,  // fleet AI session keeps the classic form-filler behavior
-        record_templates: std::collections::HashMap::new(),
+        // Spell every secret fill for the credentials channel in the RECORDING
+        // (the loop still fills the real value at the wire). See `secret_keys`.
+        record_templates: secret_keys
+            .iter()
+            .map(|k| (k.clone(), format!("{{{{secret:{k}}}}}")))
+            .collect(),
         ask_concierge_session_id: None,
         cancel,
     };
@@ -3378,6 +3391,26 @@ async fn handle_ai_session_start(
     match run_ai_session_and_record(db, engine, &browser, &ai_cfg, params).await {
         Ok(outcome) => {
             let recorded = outcome.workflow_id.is_some();
+            // SHIP THE RECIPE HOME, not just its local id. `workflow_id` is an
+            // AGENT-LOCAL id in a different namespace from the coordinator's
+            // `automation_workflows.id`, so a coordinator that only learns the id
+            // cannot run the recording, nor point a persona's `login_workflow_id`
+            // at it. Returning the steps lets the coordinator materialize its own
+            // workflow row (that is how an AI-recorded persona sign-in becomes a
+            // workflow the coordinator can dispatch on session expiry).
+            //
+            // Safe to send: the loop recorded `{{secret:KEY}}` references, never a
+            // credential value (see `record_templates` above).
+            let (workflow_steps, workflow_entry_url) = match outcome.workflow_id {
+                Some(wf_id) => match crate::local::store::workflows::get_by_id(db, wf_id).await {
+                    Ok(Some(wf)) => (
+                        serde_json::from_str::<Value>(&wf.steps).ok(),
+                        wf.entry_url.clone(),
+                    ),
+                    _ => (None, None),
+                },
+                None => (None, None),
+            };
             (
                 json!({
                     "type": "ai_session_complete",
@@ -3385,7 +3418,11 @@ async fn handle_ai_session_start(
                     "status": outcome.status,
                     "workflow_id": outcome.workflow_id,
                     "workflow_name": outcome.workflow_name,
+                    // Page ITERATIONS taken (not the recipe) — historical field name.
                     "steps": outcome.steps,
+                    // The recorded RECIPE + where it starts, for the coordinator's copy.
+                    "workflow_steps": workflow_steps,
+                    "workflow_entry_url": workflow_entry_url,
                     "message": outcome.message,
                     "error": outcome.error,
                 }),

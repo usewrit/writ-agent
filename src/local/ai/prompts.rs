@@ -61,7 +61,12 @@ INTERACTION (when the goal is to DO something — log in, fill/submit a form, cl
 - wait for the page to settle: {"type":"wait","description":"...","config":{"seconds":2}}
 For credentials/secrets use placeholders in value: {{secret:password}}; for other dynamic user inputs use {{field_name}}. Do NOT hardcode real passwords.
 
-Drive the flow with run_actions to confirm each selector works on the LIVE page BEFORE proposing; for extraction verify the script returns real data via evaluate_js. Extraction goals are usually ONE step; interaction goals are the ordered sequence of actions you performed."##;
+API CALL (when the data should come from the site's BACKEND API — the user asks to use/call an endpoint, or a captured API call already returns the goal's data):
+- {"type":"api_call","description":"...","config":{"method":"GET|POST|PUT","url":"<absolute URL>","headers":{...},"body_template":"<string or null>","response_extractions":{"<name>":"$.json.path"},"variable":"<name>"}}
+    Prefer reusing a captured call (shown in your context; discover more with the capture_network action) — it replays with the session's cookies/auth. Parameterize dynamic values as {{placeholders}} and secrets as {{secret:name}}. NEVER wrap a fetch() inside an "evaluate" or "extract" script when an api_call step can make the request: api_call is the step type FOR endpoints — it needs no browser page, survives layout changes, and its response_extractions pull the fields out of the JSON directly.
+    CSRF/XSRF: when the captured request carries an anti-CSRF header (X-XSRF-TOKEN, X-CSRF-Token, ...) whose value came from a COOKIE, you MUST reproduce that header — set it to the placeholder {{cookie:<cookie-name>}} (e.g. "X-XSRF-TOKEN":"{{cookie:XSRF-TOKEN}}"), which is read FRESH from the live cookie jar at every replay. Never bake the captured literal token (it expires — the replay 403s) and never drop the header (same result). Cookies themselves ride automatically; only the header/body ECHO of a cookie needs this placeholder.
+
+Drive the flow with run_actions to confirm each selector works on the LIVE page BEFORE proposing; for extraction verify the script returns real data via evaluate_js. Extraction goals are usually ONE step; interaction goals are the ordered sequence of actions you performed. CHOOSING THE DELIVERABLE: endpoint/API goal -> api_call step | scripted/structured scrape -> evaluate step | one element's text -> extract step."##;
 
 /// API mode addendum.
 pub const AGENT_API: &str = r##"MODE: API RECORDING. The user wants to call the site's backend directly instead of clicking the UI. Inspect the captured API calls (provided) and/or trigger the relevant request, then when done return an api_call step in "steps_to_add":
@@ -173,7 +178,8 @@ Two kinds of optimization:
 
 HARD SAFETY RULES:
 - NEVER remove fill/select whose value is later used, unless folded into api_call
-- NEVER remove navigate/navigated_to/extract/return
+- NEVER remove the ENTRY navigate (establishes origin + cookies) or return steps. An INTERMEDIATE navigate MAY be dropped when EVERY step after it (up to the next navigate) is an api_call/login_post — those fetch their URL directly. Do NOT refuse a substitution "because of the navigate".
+- extract/evaluate MAY be folded into an api_call ONLY when its response_extractions reproduce the same variable from data demonstrably present in the captured response; otherwise NEVER remove extract/evaluate
 - NEVER reorder across navigate
 - NEVER change selectors/values on kept steps
 - A login/auth may ONLY be replaced by api_call if a matching auth request was captured

@@ -115,6 +115,71 @@ pub async fn inject_session_state(
         }
     }
 
+    // 1b. Persona HEADER-token auth (bearer / X-Auth), scoped to the login site over
+    // https ONLY — never to third-party / cross-origin hosts. A browser context can't
+    // safely carry a bearer context-wide (set_extra_http_headers would send it to every
+    // CDN/analytics host the page touches — a cross-origin credential leak), so this
+    // registers a route AFTER the SSRF blocker (runs first, last-registered), rewrites
+    // the request headers on same-registrable-domain https requests, then defers via
+    // fallback so the SSRF blocker still vetoes internal hosts. Parity with Python
+    // url_guard.install_persona_header_injection. No-op unless the persona has header
+    // tokens. Installed BEFORE the entry navigation so that request already carries it.
+    const NON_REPLAYABLE_HEADERS: &[&str] = &[
+        "host", "cookie", "content-length", "content-type", "connection",
+        "accept-encoding", "transfer-encoding", "upgrade", "te",
+    ];
+    let auth_headers: std::collections::HashMap<String, String> = session_state
+        .headers
+        .iter()
+        .filter(|(k, v)| !v.is_empty() && !NON_REPLAYABLE_HEADERS.contains(&k.to_lowercase().as_str()))
+        .map(|(k, v)| (k.to_lowercase(), v.clone()))
+        .collect();
+    let header_dom = allowed_domain.as_ref().map(|h| {
+        // Registrable domain (last two labels) — matches the crawl HTTP lane's gate.
+        let labels: Vec<&str> = h.split('.').filter(|s| !s.is_empty()).collect();
+        if labels.len() <= 2 { h.clone() } else { labels[labels.len() - 2..].join(".") }
+    });
+    if !auth_headers.is_empty() {
+        if let Some(dom) = header_dom.filter(|d| !d.is_empty()) {
+            let _log_dom = dom.clone();
+            let _log_n = auth_headers.len();
+            let route_res = context
+                .route("**/*", move |route: playwright_rs::Route| {
+                    let hdrs = auth_headers.clone();
+                    let dom = dom.clone();
+                    async move {
+                        let url = route.request().url().to_string();
+                        let host = url::Url::parse(&url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+                            .unwrap_or_default();
+                        let same = host == dom || host.ends_with(&format!(".{}", dom));
+                        if url.starts_with("https://") && same {
+                            let mut merged = route.request().headers();
+                            for (k, v) in &hdrs {
+                                merged.insert(k.clone(), v.clone());
+                            }
+                            route
+                                .fallback(Some(playwright_rs::protocol::route::ContinueOptions {
+                                    headers: Some(merged),
+                                    ..Default::default()
+                                }))
+                                .await?;
+                        } else {
+                            route.fallback(None).await?;
+                        }
+                        Ok(())
+                    }
+                })
+                .await;
+            if let Err(e) = route_res {
+                tracing::warn!(error = %e, "persona header injection not installed");
+            } else {
+                tracing::info!(domain = %_log_dom, count = _log_n, "persona auth-header injection installed");
+            }
+        }
+    }
+
     // 2. Navigate to entry URL (Python line 2927-2928)
     if let Some(url) = entry_url {
         if !url.is_empty() && url_guard::is_url_safe(url) {

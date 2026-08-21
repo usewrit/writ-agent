@@ -374,6 +374,23 @@ pub(crate) async fn save_session_state(
     }
 }
 
+/// Open a persona's sealed session blob as RAW JSON, for the sign-in AUTH-MATERIAL check
+/// ([`crate::local::persona_login::session_has_auth_material`]).
+///
+/// Deliberately NOT via [`resolve_from_row`]: that types the session into a [`SessionState`],
+/// whose struct has no `origins` field, so a Playwright `storage_state` shape (`origins[]`
+/// carrying localStorage) would be silently dropped before the detector could see it. Reading
+/// the untyped `Value` lets the detector recognize EVERY auth shape the cloud detector does.
+///
+/// Fail-soft: an absent / locked / undecryptable / unparseable blob yields `None`, which the
+/// caller reads as "no verifiable auth material" — the safe direction (never report a login as
+/// authenticated when its session cannot even be opened).
+pub(crate) fn open_session_value(vault: &Vault, row: &Persona) -> Option<serde_json::Value> {
+    let blob = row.session_state_encrypted.as_deref().filter(|s| !s.is_empty())?;
+    let plain = vault.open_field(blob, &persona_aad(AAD_SESSION_STATE, row.id)).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&plain).ok()
+}
+
 /// Mint the CURRENT RFC-6238 TOTP code for a persona, re-reading the sealed seed at call time.
 ///
 /// A TOTP code is only valid for one ~30s window, but a run can take much longer than that to walk
@@ -611,6 +628,40 @@ mod tests {
 
         // A missing persona id resolves to None (non-fatal).
         assert!(resolve_persona(&pool, &v, 9_999).await.unwrap().is_none());
+    }
+
+    /// `open_session_value` returns the UNTYPED session so the sign-in detector can see a
+    /// Playwright `origins[]` array — a shape `resolve_from_row` (typed `SessionState`) drops.
+    #[tokio::test]
+    async fn open_session_value_preserves_untyped_origins() {
+        let (pool, v) = fixture().await;
+        // A storage_state-shaped session: origins[] carrying localStorage (no top-level fields
+        // that SessionState models). Sealed bound to the row we are about to insert (id 1).
+        let raw = br#"{"origins":[{"origin":"https://a.test","localStorage":[{"name":"tok","value":"ey"}]}]}"#;
+        let blob = v.seal_field(raw, &persona_aad(AAD_SESSION_STATE, 1)).unwrap();
+        let p = personas::insert(
+            &pool,
+            &NewPersona { name: "sess".into(), session_state_encrypted: Some(blob), ..Default::default() },
+        )
+        .await
+        .unwrap();
+        assert_eq!(p.id, 1, "fixture assumes first row id = 1 for AAD binding");
+
+        // The raw opener keeps origins[] intact...
+        let value = open_session_value(&v, &p).expect("session opens");
+        assert!(value["origins"].is_array(), "origins[] survives the untyped open");
+        assert_eq!(value["origins"][0]["localStorage"][0]["name"], "tok");
+
+        // ...whereas the typed restore has no origins field to carry it (the reason the raw
+        // opener exists): the SessionState deserializes with everything-empty.
+        let typed = resolve_from_row(&v, &p).unwrap().session_state.unwrap();
+        assert!(typed.cookies.is_empty() && typed.local_storage.is_empty());
+
+        // A persona with no session blob → None (fail-soft).
+        let bare = personas::insert(&pool, &NewPersona { name: "bare".into(), ..Default::default() })
+            .await
+            .unwrap();
+        assert!(open_session_value(&v, &bare).is_none());
     }
 
     #[test]

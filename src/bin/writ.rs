@@ -65,7 +65,7 @@ enum Command {
         action: CloudAction,
     },
 
-    /// Inspect or change the anonymous usage-telemetry opt-in (off by default).
+    /// Inspect or change anonymous usage telemetry (on by default; counts only, never content).
     Telemetry {
         #[command(subcommand)]
         action: TelemetryAction,

@@ -175,12 +175,18 @@ security-weakening toggles".
 | `WRIT_HTML_FLOOR_MS` | (see DISCLOSURES) | Raise the HTML/HTTP monitor check floor. Absolute minimum floors are raisable, never lowerable. |
 | `WRIT_JS_FLOOR_MS` | (see DISCLOSURES) | Raise the browser (playwright) monitor check floor. |
 
-### Telemetry (default no-op)
+### Telemetry
+
+Anonymous usage counts (totals and durations — never page content or URLs) are **on by default**
+and are sent to the coordinator this agent is linked to, over the link you already configured.
+An agent that is not linked to any coordinator has nowhere to send and never tries; a self-hosted
+coordinator receives its own agents' numbers. Turn it off with `writ telemetry off`, or inspect a
+day's report first with `writ telemetry preview`.
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `WRIT_TELEMETRY` | `false` | Opt in to anonymous telemetry. **No-op unless a DSN is also configured.** |
-| `WRIT_TELEMETRY_DSN` | unset | The telemetry/crash-report endpoint. There is **no built-in DSN**, so with this unset telemetry is genuinely a no-op even if `WRIT_TELEMETRY` is on. |
+| `WRIT_TELEMETRY` | `true` | Anonymous usage telemetry. Set to `false` to opt out; an explicit `false` here or in `config.toml` is always honored. |
+| `WRIT_TELEMETRY_DSN` | unset | The **crash-report** endpoint, which is separate from usage counts. There is **no built-in DSN**, so with this unset crash reporting is a no-op even when `WRIT_TELEMETRY` is on. |
 
 ### AI provider key fallbacks
 
@@ -233,7 +239,7 @@ port = 8131            # WRIT_PORT
 
 [app]
 language = "en"        # WRIT_LANGUAGE
-telemetry_opt_in = false   # WRIT_TELEMETRY
+telemetry_opt_in = true    # WRIT_TELEMETRY  (false = opt out)
 retention_days = 90        # WRIT_RETENTION_DAYS
 onboarding_completed = false
 

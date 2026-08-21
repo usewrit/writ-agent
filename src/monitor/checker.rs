@@ -375,9 +375,30 @@ impl Checker {
 
         // Extract each selector via the live DOM (or screenshot, for visual zones).
         let mut outcome = CheckOutcome::default();
-        for sel in &target.selectors {
+        // Visual zones are captured FIRST, before the frame flatten below
+        // rewrites the DOM — pixel baselines must come from the page exactly as
+        // rendered. Stored by selector index; the finalize loop appends them in
+        // the original selector order.
+        let mut visual_shots: HashMap<usize, Option<(String, Vec<u8>)>> = HashMap::new();
+        for (i, sel) in target.selectors.iter().enumerate() {
             if sel.content_type == "visual" {
-                let shot = extract_visual(&page, sel).await;
+                visual_shots.insert(i, extract_visual(&page, sel).await);
+            }
+        }
+        // Fold same-site iframe/frameset content into the live DOM so content
+        // selectors can match elements INSIDE frames — the main document alone
+        // never sees them. Same flatten (and same admission/caps) as the crawl
+        // lane. Visual-only targets skip the rewrite entirely; best-effort by
+        // contract, so a failure degrades to the old top-document extraction.
+        if target.selectors.iter().any(|s| s.content_type != "visual") {
+            let inlined = crate::crawl_shard::frames::flatten_frames(&page).await;
+            if inlined > 0 {
+                tracing::debug!(target = %target.url, frames = inlined, "monitor render inlined frames");
+            }
+        }
+        for (i, sel) in target.selectors.iter().enumerate() {
+            if sel.content_type == "visual" {
+                let shot = visual_shots.remove(&i).flatten();
                 outcome.reports.push(finalize_visual(target, sel, shot, &mut outcome.changed));
                 continue;
             }

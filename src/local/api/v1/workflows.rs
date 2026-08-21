@@ -312,7 +312,39 @@ async fn list(
     // would offer them everywhere a workflow can be picked (run modals, the persona
     // login-workflow dropdown) where running one is never what the user means.
     rows.retain(|wf| wf.workflow_type != "crawl");
-    let items = rows.iter().map(|wf| redact(wf, &st.vault)).collect::<LocalResult<Vec<_>>>()?;
+    // PERSONA LOGIN linkage (cloud parity): which of these workflows are some
+    // persona's sign-in workflow. The link lives on the persona side
+    // (`personas.login_workflow_id`), so without this reverse stamp the list shows
+    // a persona's login recording as an anonymous recorded workflow. One query for
+    // the whole page; a read failure degrades to no chips rather than no list.
+    let mut login_personas: std::collections::HashMap<i64, Vec<Value>> =
+        std::collections::HashMap::new();
+    if let Ok(personas) = crate::local::store::personas::list(&st.db, None).await {
+        for p in personas {
+            if p.is_active == 0 {
+                continue;
+            }
+            if let Some(wf_id) = p.login_workflow_id {
+                login_personas
+                    .entry(wf_id)
+                    .or_default()
+                    .push(json!({ "id": p.id, "name": p.name }));
+            }
+        }
+    }
+    let items = rows
+        .iter()
+        .map(|wf| {
+            let mut v = redact(wf, &st.vault)?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "login_personas".into(),
+                    Value::Array(login_personas.get(&wf.id).cloned().unwrap_or_default()),
+                );
+            }
+            Ok(v)
+        })
+        .collect::<LocalResult<Vec<_>>>()?;
     Ok(Json(json!({ "data": items, "count": items.len() })))
 }
 

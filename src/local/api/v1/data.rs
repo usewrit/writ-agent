@@ -23,7 +23,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Mutex, OnceLock};
 
 /// How many recent runs we scan when building the table. Bounded so a workflow with a huge
 /// history stays responsive; the response flags `truncated` when the scan hits this ceiling.
@@ -44,6 +45,7 @@ pub fn router() -> Router<AppState> {
             "/v1/workflows/:id/data",
             get(workflow_data).delete(delete_workflow_data),
         )
+        .route("/v1/workflows/:id/data/rows", get(workflow_data_rows))
         .route("/v1/workflows/:id/data/runs", get(workflow_data_runs))
         .route(
             "/v1/workflows/:id/data/records/:record_uid/history",
@@ -285,6 +287,11 @@ struct TableParams {
     /// `limit`, …) through `flatten`, which 400-rejected every `view=run` snapshot export.
     #[serde(default)]
     format: Option<String>,
+    /// Grid preview mode: string fields longer than this many characters are cut to it and the
+    /// row lists them under `_truncated`; the grid hydrates full records on demand via
+    /// `GET /data/rows`. JSON table responses only — exports stay full.
+    #[serde(default)]
+    preview_chars: Option<usize>,
 }
 
 impl TableParams {
@@ -777,6 +784,291 @@ fn encode_path_segment(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Bounded fastpath — serve the hot data reads without parsing the whole window.
+//
+// Every handler above used to load and parse the FULL payload of up to
+// DATA_SCAN_CAP runs per request; for a content dataset (crawled pages of
+// markdown) that is megabytes of JSON parsed per request, several times per
+// Data-page open. The fastpath mirrors the cloud/coordinator
+// services/dataset_fastpath.py: a stub pass fetches only (id, recency,
+// payload size), a tiny per-run digest {row count, column order, flags} is
+// computed ONCE with the real data_query coercion and cached, and only the
+// runs covering the requested page load their payloads. Any fastpath error
+// falls back to the legacy full scan — it is an optimization, never the only
+// road to the data.
+// ---------------------------------------------------------------------------
+
+/// The picker's last_delta teaser needs the full window to compute exactly, so
+/// it is size-gated (rows via the spec's PICKER_DELTA_MAX_ROWS, bytes here);
+/// past the gates it is null — the API contract's "unknown".
+const PICKER_DELTA_MAX_BYTES: i64 = 3_000_000;
+/// view=all facets budget: past it the facets describe only the NEWEST rows
+/// (`sampled: true`, `row_count` = rows faceted, `total_rows` exact).
+const FACET_SAMPLE_ROWS: usize = 2000;
+const FACET_SAMPLE_BYTES: i64 = 12_000_000;
+/// Digest-miss payload loads are batched by run count AND bytes so a cold
+/// cache over a heavy window streams through memory instead of spiking it.
+const DIGEST_BATCH_RUNS: usize = 64;
+const DIGEST_BATCH_BYTES: i64 = 16_000_000;
+/// Digest entries are a few dozen bytes; the coarse full clear past the cap is
+/// a runaway backstop, not an eviction policy — entries recompute on demand.
+const DIGEST_CACHE_MAX: usize = 200_000;
+
+/// (run id, payload size, declared-fields fingerprint, per-workflow delete
+/// epoch). Size self-invalidates edits; the epoch makes row deletes
+/// deterministic rather than probabilistic; the fingerprint misses when the
+/// declared output schema changes (the digest projects records to it).
+type DigestKey = (i64, i64, u64, u64);
+
+fn digest_cache() -> &'static Mutex<HashMap<DigestKey, data_query::RunDigest>> {
+    static CACHE: OnceLock<Mutex<HashMap<DigestKey, data_query::RunDigest>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn data_epochs() -> &'static Mutex<HashMap<i64, u64>> {
+    static EPOCHS: OnceLock<Mutex<HashMap<i64, u64>>> = OnceLock::new();
+    EPOCHS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn data_epoch_for(workflow_id: i64) -> u64 {
+    data_epochs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&workflow_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Call after mutating stored extracted data (row deletes / clear-all) so
+/// cached digests for the workflow stop matching.
+fn bump_data_epoch(workflow_id: i64) {
+    let mut m = data_epochs()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *m.entry(workflow_id).or_insert(0) += 1;
+}
+
+fn declared_fingerprint(declared: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    declared.hash(&mut h);
+    h.finish()
+}
+
+/// Digests for every stub — cache-first, misses loaded in bounded batches and
+/// computed with `data_query::run_digest` (the real coercion). Keyed back by
+/// run id; a run deleted since the stub pass is simply absent (0 rows).
+async fn window_digests(
+    db: &sqlx::sqlite::SqlitePool,
+    stubs: &[runs::DataStub],
+    declared: &[String],
+    epoch: u64,
+) -> LocalResult<HashMap<i64, data_query::RunDigest>> {
+    let fp = declared_fingerprint(declared);
+    let mut out: HashMap<i64, data_query::RunDigest> = HashMap::new();
+    let mut missing: Vec<&runs::DataStub> = Vec::new();
+    {
+        let cache = digest_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for s in stubs {
+            match cache.get(&(s.id, s.size, fp, epoch)) {
+                Some(d) => {
+                    out.insert(s.id, d.clone());
+                }
+                None => missing.push(s),
+            }
+        }
+    }
+    let mut batches: Vec<Vec<i64>> = Vec::new();
+    let mut cur: Vec<i64> = Vec::new();
+    let mut cur_bytes: i64 = 0;
+    let mut size_by_id: HashMap<i64, i64> = HashMap::new();
+    for s in &missing {
+        size_by_id.insert(s.id, s.size);
+        if !cur.is_empty() && (cur.len() >= DIGEST_BATCH_RUNS || cur_bytes + s.size > DIGEST_BATCH_BYTES)
+        {
+            batches.push(std::mem::take(&mut cur));
+            cur_bytes = 0;
+        }
+        cur.push(s.id);
+        cur_bytes += s.size;
+    }
+    if !cur.is_empty() {
+        batches.push(cur);
+    }
+    for ids in batches {
+        let loaded = runs::get_by_ids(db, &ids).await?;
+        let mut cache = digest_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() > DIGEST_CACHE_MAX {
+            cache.clear();
+        }
+        for run in loaded {
+            let size = size_by_id.get(&run.id).copied().unwrap_or(0);
+            let input = to_run_input(run);
+            let digest = data_query::run_digest(&input, declared);
+            cache.insert((input.run_id, size, fp, epoch), digest.clone());
+            out.insert(input.run_id, digest);
+        }
+    }
+    Ok(out)
+}
+
+/// Columns exactly as the flatten derives them: declared fields verbatim when
+/// present, else first-seen key order across the window in SCAN order.
+fn merged_columns(
+    stubs: &[runs::DataStub],
+    digests: &HashMap<i64, data_query::RunDigest>,
+    declared: &[String],
+) -> Vec<String> {
+    let declared_cols = data_query::declared_columns(declared);
+    if !declared_cols.is_empty() {
+        return declared_cols;
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for s in stubs {
+        if let Some(d) = digests.get(&s.id) {
+            for c in &d.cols {
+                if !seen.contains(c) {
+                    seen.push(c.clone());
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Preview-size the serialized table rows: any top-level STRING field longer
+/// than `chars` is cut to `chars` characters and the row gains a
+/// `_truncated: [field, ...]` sibling so the UI hydrates the full record on
+/// demand. Objects/arrays pass through whole (client-side collection pivots
+/// and file stamps need them) — mirrors the python engines byte-for-byte.
+fn truncate_preview_rows(rows: &mut [Value], chars: usize) {
+    for row in rows.iter_mut() {
+        let Some(fields) = row.get_mut("fields").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let mut cut: Vec<String> = Vec::new();
+        for (k, v) in fields.iter_mut() {
+            if let Value::String(s) = v {
+                if s.chars().count() > chars {
+                    *s = s.chars().take(chars).collect();
+                    cut.push(k.clone());
+                }
+            }
+        }
+        if !cut.is_empty() {
+            row["_truncated"] = json!(cut);
+        }
+    }
+}
+
+/// True when a table request is the DEFAULT page shape the fastpath can serve
+/// exactly: no search, no filters, no inputs, newest-first run_at order.
+fn fast_table_shape(params: &TableParams) -> bool {
+    params.q.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true)
+        && parse_col_filters(&params.filter).is_empty()
+        && parse_structured_filters(params.filters.as_deref()).is_empty()
+        && !params.include_inputs
+        && params.sort_by.as_deref().map(|s| s == "run_at").unwrap_or(true)
+        && !params
+            .sort_dir
+            .as_deref()
+            .unwrap_or("desc")
+            .eq_ignore_ascii_case("asc")
+}
+
+/// The bounded view=all page. Reproduces `build_table`'s row order exactly:
+/// build_table stable-sorts ALL rows ascending by run_at then reverses, so the
+/// served order is (run_at DESC, scan-position DESC) with each run's records
+/// slot-DESC — emulated here as reversed stable-ascending run blocks with each
+/// block's rows reversed.
+async fn fast_workflow_data_all(
+    db: &sqlx::sqlite::SqlitePool,
+    wf: &workflows::Workflow,
+    declared: &[String],
+    params: &TableParams,
+) -> LocalResult<Value> {
+    let (stubs, raw_n) = runs::data_window_stubs(db, wf.id, DATA_SCAN_CAP).await?;
+    let truncated = raw_n >= DATA_SCAN_CAP;
+    let epoch = data_epoch_for(wf.id);
+    let digests = window_digests(db, &stubs, declared, epoch).await?;
+    let scanned = stubs
+        .iter()
+        .filter(|s| digests.get(&s.id).map(|d| d.nonnull).unwrap_or(false))
+        .count();
+    let n_of = |id: i64| digests.get(&id).map(|d| d.n).unwrap_or(0);
+    let total: usize = stubs.iter().map(|s| n_of(s.id)).sum();
+    let columns = merged_columns(&stubs, &digests, declared);
+
+    let query = params.to_query(true);
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE);
+    let offset = query.offset;
+
+    let mut order: Vec<&runs::DataStub> = stubs.iter().collect();
+    order.sort_by(|a, b| {
+        a.at.as_deref().unwrap_or("").cmp(b.at.as_deref().unwrap_or(""))
+    });
+    order.reverse();
+
+    let mut cover: Vec<i64> = Vec::new();
+    let mut before: usize = 0;
+    let mut pos: usize = 0;
+    for s in &order {
+        let n = n_of(s.id);
+        if n == 0 {
+            continue;
+        }
+        if pos + n > offset && pos < offset + limit {
+            if cover.is_empty() {
+                before = pos;
+            }
+            cover.push(s.id);
+        }
+        pos += n;
+        if pos >= offset + limit {
+            break;
+        }
+    }
+
+    let mut page_rows: Vec<data_query::Row> = Vec::new();
+    if !cover.is_empty() {
+        let loaded = runs::get_by_ids(db, &cover).await?;
+        let by_id: HashMap<i64, RunInput> =
+            loaded.into_iter().map(|r| (r.id, to_run_input(r))).collect();
+        for id in &cover {
+            if let Some(input) = by_id.get(id) {
+                let (_cols, mut rows) =
+                    data_query::flatten(std::slice::from_ref(input), declared, false);
+                rows.reverse();
+                page_rows.extend(rows);
+            }
+        }
+        let skip = offset.saturating_sub(before);
+        page_rows = page_rows.into_iter().skip(skip).take(limit).collect();
+    }
+
+    let mut rows_json = data_query::rows_to_table_json(&page_rows, &columns);
+    if let Some(chars) = params.preview_chars {
+        truncate_preview_rows(&mut rows_json, chars);
+    }
+    Ok(json!({
+        "workflow_id": wf.id,
+        "workflow_name": wf.name,
+        "columns": columns,
+        "declared": !data_query::declared_columns(declared).is_empty(),
+        "rows": rows_json,
+        "total": total,
+        "scanned_runs": scanned,
+        "truncated": truncated,
+        "limit": query.limit,
+        "offset": query.offset,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Handlers.
 // ---------------------------------------------------------------------------
 
@@ -795,72 +1087,14 @@ async fn list_data_workflows(State(st): State<AppState>) -> LocalResult<Json<Val
     let wfs = workflows::list(&st.db, false, 1000).await?;
     let mut out: Vec<Value> = Vec::new();
     for wf in wfs {
-        let (mut runs_with_data, _truncated) = scan_workflow_data_runs(&st, wf.id).await?;
-        if runs_with_data.is_empty() {
-            continue;
+        // Bounded picker line: run_count / last_data_at from cached per-run
+        // digests (real record_count semantics — zero-row workflows still
+        // hide), payloads loaded only for datasets small enough to compute the
+        // exact last_delta teaser. This is what keeps opening the Data page
+        // from parsing every workflow's whole corpus.
+        if let Some(line) = fast_picker_line(&st.db, &wf).await? {
+            out.push(line);
         }
-        // Materialize the SAME per-run extraction the Data view builds — declared-field projection
-        // + meta/secret redaction — so the picker lists a workflow ONLY when its table actually has
-        // rows, and the count reflects runs that produced ≥1 row. A cheap `extracted_data is not
-        // null` check is not enough: a run whose payload is `{}`, meta-only, or an AI/chat envelope
-        // passes that check but flattens to zero rows, which padded the picker with entries whose
-        // table then read "No extracted data yet" (the reported noise).
-        sort_runs_ascending(&mut runs_with_data);
-        let declared = declared_output_fields(&wf);
-        let flat = data_query::flatten_runs(&runs_with_data, &declared);
-        let total_rows: usize = flat.iter().map(|r| r.records.len()).sum();
-        if total_rows == 0 {
-            continue;
-        }
-        // run_count = DISTINCT runs that contributed a row; last_data_at = newest such run's time.
-        let contributing: Vec<&data_query::FlatRun> =
-            flat.iter().filter(|r| !r.records.is_empty()).collect();
-        let run_count = contributing.len();
-        let last_data_at: Option<String> =
-            contributing.iter().filter_map(|r| r.run_at.clone()).max();
-        // last_delta = the newest two chain snapshots compared under the sampled identity —
-        // null when the dataset is too large or has fewer than 2 snapshots (spec 1.5.7). Reuses
-        // the rows already flattened above (no second scan).
-        let chain: Vec<&data_query::FlatRun> = flat.iter().filter(|r| r.data_bearing).collect();
-        let last_delta = if chain.len() < 2 || total_rows > PICKER_DELTA_MAX_ROWS {
-            Value::Null
-        } else {
-            let columns = data_query::canonical_columns(&flat, &declared);
-            let identity = pick_identity(&flat, &columns, None);
-            let uids_of = |run: &data_query::FlatRun| -> BTreeMap<String, Map<String, Value>> {
-                data_query::assign_uids(&run.records, identity.mode, &identity.fields)
-                    .into_iter()
-                    .map(|(uid, _idx, rec)| (uid, rec))
-                    .collect()
-            };
-            let prev = uids_of(chain[chain.len() - 2]);
-            let cur = uids_of(chain[chain.len() - 1]);
-            let mut new = 0usize;
-            let mut changed = 0usize;
-            for (uid, rec) in &cur {
-                match prev.get(uid) {
-                    None => new += 1,
-                    Some(old) => {
-                        if !data_query::diff_fields(old, rec).0.is_empty() {
-                            changed += 1;
-                        }
-                    }
-                }
-            }
-            let removed = prev.keys().filter(|u| !cur.contains_key(*u)).count();
-            json!({ "new": new, "changed": changed, "removed": removed })
-        };
-        out.push(json!({
-            "workflow_id": wf.id,
-            "workflow_name": wf.name,
-            // Lets the Data explorer lock a crawl dataset to the aggregated view
-            // (its shards are one dataset, not temporal snapshots).
-            "workflow_type": wf.workflow_type,
-            "run_count": run_count,
-            "last_data_at": last_data_at,
-            "last_delta": last_delta,
-            "origin": "local",
-        }));
     }
     // Linked desktop: a Dragnet crawl runs on the fleet, so its collected dataset lives on cloud —
     // merge those in (tagged `origin:"cloud"`) so the Outputs picker lists them alongside local
@@ -915,6 +1149,94 @@ async fn list_data_workflows(State(st): State<AppState>) -> LocalResult<Json<Val
         bv.cmp(av)
     });
     Ok(Json(json!({ "workflows": out })))
+}
+
+/// One picker line from stubs + cached digests (payloads only for the
+/// size-gated last_delta). None hides the workflow: no window run flattens to
+/// a row — the exact legacy rule, decided from real per-run record counts.
+async fn fast_picker_line(
+    db: &sqlx::sqlite::SqlitePool,
+    wf: &workflows::Workflow,
+) -> LocalResult<Option<Value>> {
+    let declared = declared_output_fields(wf);
+    let (stubs, _raw_n) = runs::data_window_stubs(db, wf.id, DATA_SCAN_CAP).await?;
+    if stubs.is_empty() {
+        return Ok(None);
+    }
+    let epoch = data_epoch_for(wf.id);
+    let digests = window_digests(db, &stubs, &declared, epoch).await?;
+    let n_of = |id: i64| digests.get(&id).map(|d| d.n).unwrap_or(0);
+    let total_rows: usize = stubs.iter().map(|s| n_of(s.id)).sum();
+    if total_rows == 0 {
+        return Ok(None);
+    }
+    let contributing: Vec<&runs::DataStub> =
+        stubs.iter().filter(|s| n_of(s.id) > 0).collect();
+    let run_count = contributing.len();
+    let last_data_at: Option<String> = contributing.iter().filter_map(|s| s.at.clone()).max();
+    let chain_len = stubs
+        .iter()
+        .filter(|s| digests.get(&s.id).map(|d| d.data_bearing).unwrap_or(false))
+        .count();
+    let total_bytes: i64 = stubs.iter().map(|s| s.size).sum();
+    // last_delta stays exact (the legacy computation over the full window) but
+    // only for datasets small enough to load; past the row/byte gates it is
+    // null — the API contract's "unknown".
+    let last_delta = if chain_len < 2
+        || total_rows > PICKER_DELTA_MAX_ROWS
+        || total_bytes > PICKER_DELTA_MAX_BYTES
+    {
+        Value::Null
+    } else {
+        let (mut runs_with_data, _t) = scan_workflow_data_runs_pool(db, wf.id).await?;
+        sort_runs_ascending(&mut runs_with_data);
+        let flat = data_query::flatten_runs(&runs_with_data, &declared);
+        picker_delta(&flat, &declared)
+    };
+    Ok(Some(json!({
+        "workflow_id": wf.id,
+        "workflow_name": wf.name,
+        // Lets the Data explorer lock a crawl dataset to the aggregated view
+        // (its shards are one dataset, not temporal snapshots).
+        "workflow_type": wf.workflow_type,
+        "run_count": run_count,
+        "last_data_at": last_data_at,
+        "last_delta": last_delta,
+        "origin": "local",
+    })))
+}
+
+/// last_delta = the newest two chain snapshots compared under the sampled
+/// identity (spec 1.5.7). `flat` must be the full window, ascending.
+fn picker_delta(flat: &[data_query::FlatRun], declared: &[String]) -> Value {
+    let chain: Vec<&data_query::FlatRun> = flat.iter().filter(|r| r.data_bearing).collect();
+    if chain.len() < 2 {
+        return Value::Null;
+    }
+    let columns = data_query::canonical_columns(flat, declared);
+    let identity = pick_identity(flat, &columns, None);
+    let uids_of = |run: &data_query::FlatRun| -> BTreeMap<String, Map<String, Value>> {
+        data_query::assign_uids(&run.records, identity.mode, &identity.fields)
+            .into_iter()
+            .map(|(uid, _idx, rec)| (uid, rec))
+            .collect()
+    };
+    let prev = uids_of(chain[chain.len() - 2]);
+    let cur = uids_of(chain[chain.len() - 1]);
+    let mut new = 0usize;
+    let mut changed = 0usize;
+    for (uid, rec) in &cur {
+        match prev.get(uid) {
+            None => new += 1,
+            Some(old) => {
+                if !data_query::diff_fields(old, rec).0.is_empty() {
+                    changed += 1;
+                }
+            }
+        }
+    }
+    let removed = prev.keys().filter(|u| !cur.contains_key(*u)).count();
+    json!({ "new": new, "changed": changed, "removed": removed })
 }
 
 // ---------------------------------------------------------------------------
@@ -1462,10 +1784,21 @@ async fn workflow_data(
     }
 }
 
-/// `view=all` — today's flat grid, schema unchanged (no new keys).
+/// `view=all` — today's flat grid, schema unchanged (no new keys). The default
+/// page shape (no search/filters, newest-first) serves from the bounded
+/// fastpath; anything else — and any fastpath error — takes the full scan.
 async fn workflow_data_all(st: &AppState, id: i64, params: &TableParams) -> LocalResult<Response> {
     let wf = load_workflow(st, id).await?;
     let declared = declared_output_fields(&wf);
+    if fast_table_shape(params) {
+        match fast_workflow_data_all(&st.db, &wf, &declared, params).await {
+            Ok(body) => return Ok(Json(body).into_response()),
+            Err(e) => tracing::warn!(
+                workflow_id = id, error = %e,
+                "data fastpath failed; serving via full scan"
+            ),
+        }
+    }
     let (runs_with_data, truncated) = scan_workflow_data_runs(st, id).await?;
     let scanned = runs_with_data.len();
     let query = params.to_query(true);
@@ -1473,7 +1806,10 @@ async fn workflow_data_all(st: &AppState, id: i64, params: &TableParams) -> Loca
 
     // The desktop table UI reads each cell from `row.fields[column]`, so the rows MUST nest data
     // columns under `fields` (a flat row renders every data cell blank).
-    let rows = data_query::rows_to_table_json(&table.rows, &table.columns);
+    let mut rows = data_query::rows_to_table_json(&table.rows, &table.columns);
+    if let Some(chars) = params.preview_chars {
+        truncate_preview_rows(&mut rows, chars);
+    }
     Ok(Json(json!({
         "workflow_id": wf.id,
         "workflow_name": wf.name,
@@ -1517,12 +1853,16 @@ async fn workflow_data_latest(
     }
     let query = params.to_query(true);
     let (page, total) = apply_lens_query(pairs, &query, &lens.columns);
+    let mut rows = pairs_to_table_json(&page, &lens.columns);
+    if let Some(chars) = params.preview_chars {
+        truncate_preview_rows(&mut rows, chars);
+    }
     Ok(Json(json!({
         "workflow_id": lens.wf.id,
         "workflow_name": lens.wf.name,
         "columns": lens.columns,
         "declared": !lens.declared.is_empty(),
-        "rows": pairs_to_table_json(&page, &lens.columns),
+        "rows": rows,
         "total": total,
         "scanned_runs": lens.scanned,
         "truncated": lens.truncated,
@@ -1555,17 +1895,22 @@ async fn workflow_data_run(st: &AppState, id: i64, params: &TableParams) -> Loca
     }
     let query = params.to_query(true);
     let (page, total) = apply_lens_query(pairs, &query, &lens.columns);
-    let removed_records: Vec<Value> = detail
+    let mut removed_records: Vec<Value> = detail
         .removed
         .iter()
         .map(|(uid, fields)| json!({ "uid": uid, "fields": fields }))
         .collect();
+    let mut rows = pairs_to_table_json(&page, &lens.columns);
+    if let Some(chars) = params.preview_chars {
+        truncate_preview_rows(&mut rows, chars);
+        truncate_preview_rows(&mut removed_records, chars);
+    }
     Ok(Json(json!({
         "workflow_id": lens.wf.id,
         "workflow_name": lens.wf.name,
         "columns": lens.columns,
         "declared": !lens.declared.is_empty(),
-        "rows": pairs_to_table_json(&page, &lens.columns),
+        "rows": rows,
         "total": total,
         "scanned_runs": lens.scanned,
         "truncated": lens.truncated,
@@ -1578,6 +1923,74 @@ async fn workflow_data_run(st: &AppState, id: i64, params: &TableParams) -> Loca
         "sources": sources,
     }))
     .into_response())
+}
+
+/// Row refs for the hydration lane (`GET /data/rows?ref=run:idx&ref=…`).
+#[derive(Debug, Default, Deserialize)]
+struct RowRefsParams {
+    #[serde(rename = "ref", default)]
+    refs: Vec<String>,
+}
+
+/// `GET /v1/workflows/:id/data/rows` — FULL (untruncated) rows for specific
+/// `run_id:record_index` refs: the hydration lane behind the table's
+/// `preview_chars` mode. The grid loads preview-sized cells, then fetches the
+/// complete record here only when the user expands, views, copies, or sends
+/// it. Same flatten pipeline (same redaction + declared projection) as the
+/// table; unknown refs are simply absent from the result. Cloud datasets
+/// forward like every other data read.
+async fn workflow_data_rows(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    RawQuery(raw_query): RawQuery,
+    Query(params): Query<RowRefsParams>,
+) -> LocalResult<Response> {
+    if let Some(resp) = try_forward_cloud_data(&st, id, "/rows", raw_query.as_deref()).await? {
+        return Ok(resp);
+    }
+    let wf = load_workflow(&st, id).await?;
+    let declared = declared_output_fields(&wf);
+    let mut refs: Vec<(i64, usize)> = Vec::new();
+    for raw in &params.refs {
+        if let Some((run_s, idx_s)) = raw.split_once(':') {
+            if let (Ok(run_id), Ok(idx)) = (run_s.parse::<i64>(), idx_s.parse::<usize>()) {
+                refs.push((run_id, idx));
+            }
+        }
+    }
+    if refs.len() > 100 {
+        return Ok(lens_params_400("at most 100 refs per request"));
+    }
+    let mut ids: Vec<i64> = Vec::new();
+    for (rid, _) in &refs {
+        if !ids.contains(rid) {
+            ids.push(*rid);
+        }
+    }
+    let loaded = runs::get_by_ids(&st.db, &ids).await?;
+    let mut by_ref: HashMap<(i64, usize), Value> = HashMap::new();
+    for run in loaded {
+        // Scope + parity with the table scan: this workflow's SUCCESSFUL runs only.
+        if run.workflow_id != Some(wf.id) || run.success != Some(1) {
+            continue;
+        }
+        let input = to_run_input(run);
+        let (_cols, rows) = data_query::flatten(std::slice::from_ref(&input), &declared, false);
+        for row in rows {
+            by_ref.insert(
+                (row.run_id, row.record_index),
+                json!({
+                    "run_id": row.run_id,
+                    "run_at": row.run_at,
+                    "status": row.status,
+                    "record_index": row.record_index,
+                    "fields": row.fields,
+                }),
+            );
+        }
+    }
+    let rows: Vec<Value> = refs.iter().filter_map(|r| by_ref.remove(r)).collect();
+    Ok(Json(json!({ "workflow_id": wf.id, "rows": rows })).into_response())
 }
 
 /// `GET /v1/workflows/:id/data/runs` — the snapshot index: every successful data-bearing run
@@ -1716,6 +2129,19 @@ async fn workflow_data_facets(
     }
     let wf = load_workflow(&st, id).await?;
     let declared = declared_output_fields(&wf);
+    if !params.include_inputs {
+        // Fastpath: exact for small windows; a heavy dataset gets facets over
+        // its NEWEST rows within a sample budget (`sampled: true`, `row_count`
+        // = rows faceted, `total_rows` = exact window total) instead of a
+        // whole-corpus parse per request. Errors fall back to the full scan.
+        match fast_workflow_data_facets(&st.db, &wf, &declared).await {
+            Ok(body) => return Ok(Json(body).into_response()),
+            Err(e) => tracing::warn!(
+                workflow_id = id, error = %e,
+                "data facets fastpath failed; serving via full scan"
+            ),
+        }
+    }
     let (runs_with_data, truncated) = scan_workflow_data_runs(&st, id).await?;
     let scanned = runs_with_data.len();
     let (columns, rows) = data_query::flatten(&runs_with_data, &declared, params.include_inputs);
@@ -1729,6 +2155,61 @@ async fn workflow_data_facets(
         "truncated": truncated,
     }))
     .into_response())
+}
+
+/// The bounded view=all facets body (see the fastpath section notes).
+async fn fast_workflow_data_facets(
+    db: &sqlx::sqlite::SqlitePool,
+    wf: &workflows::Workflow,
+    declared: &[String],
+) -> LocalResult<Value> {
+    let (stubs, raw_n) = runs::data_window_stubs(db, wf.id, DATA_SCAN_CAP).await?;
+    let truncated = raw_n >= DATA_SCAN_CAP;
+    let epoch = data_epoch_for(wf.id);
+    let digests = window_digests(db, &stubs, declared, epoch).await?;
+    let scanned = stubs
+        .iter()
+        .filter(|s| digests.get(&s.id).map(|d| d.nonnull).unwrap_or(false))
+        .count();
+    let n_of = |id: i64| digests.get(&id).map(|d| d.n).unwrap_or(0);
+    let total: usize = stubs.iter().map(|s| n_of(s.id)).sum();
+    let columns = merged_columns(&stubs, &digests, declared);
+
+    // Cover the newest rows within the sample budget, in SCAN order (the
+    // legacy facets flatten un-sorted, so its "first rows" are these).
+    let mut cover: Vec<i64> = Vec::new();
+    let mut covered_rows: usize = 0;
+    let mut covered_bytes: i64 = 0;
+    let mut sampled = false;
+    for s in &stubs {
+        let n = n_of(s.id);
+        if n == 0 {
+            continue;
+        }
+        if !cover.is_empty()
+            && (covered_rows >= FACET_SAMPLE_ROWS || covered_bytes + s.size > FACET_SAMPLE_BYTES)
+        {
+            sampled = true;
+            break;
+        }
+        cover.push(s.id);
+        covered_rows += n;
+        covered_bytes += s.size;
+    }
+    let loaded = runs::get_by_ids(db, &cover).await?;
+    let inputs: Vec<RunInput> = loaded.into_iter().map(to_run_input).collect();
+    let (_cols, rows) = data_query::flatten(&inputs, declared, false);
+    let facets = data_query::compute_facets(&columns, &rows);
+    Ok(json!({
+        "workflow_id": wf.id,
+        "columns": columns,
+        "facets": facets,
+        "row_count": rows.len(),
+        "total_rows": total,
+        "sampled": sampled,
+        "scanned_runs": scanned,
+        "truncated": truncated,
+    }))
 }
 
 /// `GET /v1/workflows/:id/data/export` — download the full (search/sort/filter applied,
@@ -2077,6 +2558,9 @@ async fn delete_workflow_data(
             let new_json = serde_json::to_string(&rd)?;
             runs::set_result_data(&st.db, run.id, Some(&new_json)).await?;
         }
+        // Rewritten payloads invalidate the fastpath's cached per-run digests
+        // deterministically (size-keying alone is only near-certain).
+        bump_data_epoch(id);
         return Ok(Json(
             json!({ "deleted": deleted, "resolved": {}, "unmatched": [] }),
         ));
@@ -2301,12 +2785,190 @@ async fn delete_workflow_data(
         runs::set_result_data(&st.db, run_id, Some(&new_json)).await?;
     }
 
+    if deleted > 0 {
+        // Rewritten payloads invalidate the fastpath's cached per-run digests
+        // deterministically (size-keying alone is only near-certain).
+        bump_data_epoch(id);
+    }
     Ok(Json(json!({ "deleted": deleted, "resolved": resolved, "unmatched": unmatched })))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // Bounded fastpath — byte parity with the legacy full scan.
+    // ------------------------------------------------------------------
+    mod fastpath {
+        use super::super::*;
+        use crate::local::db;
+        use crate::local::store::workflows::{self, NewWorkflow};
+        use crate::local::store::runs::NewRun;
+
+        async fn pool() -> sqlx::sqlite::SqlitePool {
+            let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+            db::open(&dir.path().join("t.db"), "test-key-data-fastpath").await.unwrap()
+        }
+
+        /// Insert a completed, successful run carrying `extracted_data`.
+        async fn seed_run(
+            pool: &sqlx::sqlite::SqlitePool,
+            wf_id: i64,
+            completed_at: &str,
+            extracted: Value,
+        ) -> i64 {
+            let run = runs::insert(pool, &NewRun { workflow_id: Some(wf_id), ..Default::default() })
+                .await
+                .unwrap();
+            let rd = json!({ "extracted_data": extracted }).to_string();
+            sqlx::query(
+                "UPDATE runs SET status='success', success=1, completed_at=?2, result_data=?3
+                 WHERE id=?1",
+            )
+            .bind(run.id)
+            .bind(completed_at)
+            .bind(rd)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+            run.id
+        }
+
+        /// One of every coercion shape, timestamp TIES included (the tie order
+        /// build_table produces — asc stable sort then reverse — is the trap).
+        async fn seed_workflow(pool: &sqlx::sqlite::SqlitePool) -> workflows::Workflow {
+            let wf = workflows::insert(pool, &NewWorkflow { name: "wf".into(), ..Default::default() })
+                .await
+                .unwrap();
+            seed_run(pool, wf.id, "2026-08-19T10:00:00Z", json!([
+                {"title": "A", "price": 120},
+                {"title": "B", "price": 95},
+                {"title": "C", "url": "https://example.com", "posts": {"items": [{"a": 1}, {"a": 2}]}},
+            ]))
+            .await;
+            seed_run(pool, wf.id, "2026-08-18T10:00:00Z", json!({"title": "solo", "extra": "x"})).await;
+            seed_run(pool, wf.id, "2026-08-18T10:00:00Z", json!([
+                ["Store", "Net"], ["s1", "10"], ["s2", "20"],
+            ]))
+            .await;
+            seed_run(pool, wf.id, "2026-08-17T10:00:00Z", json!([1, "x", null])).await;
+            seed_run(pool, wf.id, "2026-08-16T10:00:00Z", json!({"dry_run": true})).await;
+            seed_run(pool, wf.id, "2026-08-13T10:00:00Z", json!([])).await;
+            seed_run(pool, wf.id, "2026-08-12T10:00:00Z", json!([
+                {"title": "Doc", "markdown": "M".repeat(5000), "meta": {"lang": "fr"}},
+            ]))
+            .await;
+            wf
+        }
+
+        #[tokio::test]
+        async fn fast_page_matches_build_table_for_every_offset() {
+            let pool = pool().await;
+            let wf = seed_workflow(&pool).await;
+            let declared: Vec<String> = Vec::new();
+            let (inputs, _t) = scan_workflow_data_runs_pool(&pool, wf.id).await.unwrap();
+            let scanned = inputs.len();
+            let full = data_query::build_table(
+                &inputs,
+                &declared,
+                &TableQuery {
+                    sort_by: Some("run_at".into()),
+                    sort_dir: "desc".into(),
+                    offset: 0,
+                    limit: None,
+                    ..Default::default()
+                },
+                false,
+            );
+            for limit in [1usize, 3, 50] {
+                for offset in 0..=(full.total + 1) {
+                    let query = TableQuery {
+                        sort_by: Some("run_at".into()),
+                        sort_dir: "desc".into(),
+                        offset,
+                        limit: Some(limit),
+                        ..Default::default()
+                    };
+                    let table = data_query::build_table(&inputs, &declared, &query, false);
+                    let expected = data_query::rows_to_table_json(&table.rows, &table.columns);
+                    let params = TableParams {
+                        sort_by: Some("run_at".into()),
+                        sort_dir: Some("desc".into()),
+                        limit: Some(limit),
+                        offset: Some(offset),
+                        ..Default::default()
+                    };
+                    let body = fast_workflow_data_all(&pool, &wf, &declared, &params)
+                        .await
+                        .unwrap();
+                    assert_eq!(body["rows"], json!(expected), "offset={offset} limit={limit}");
+                    assert_eq!(body["total"], json!(table.total));
+                    assert_eq!(body["columns"], json!(table.columns));
+                    assert_eq!(body["scanned_runs"], json!(scanned));
+                }
+            }
+        }
+
+        #[test]
+        fn preview_truncation_marks_and_bounds_string_cells() {
+            let mut rows = vec![json!({
+                "run_id": 1, "record_index": 0,
+                "fields": {"title": "Doc", "markdown": "M".repeat(5000), "meta": {"lang": "fr"}},
+            })];
+            truncate_preview_rows(&mut rows, 256);
+            assert_eq!(rows[0]["fields"]["markdown"], json!("M".repeat(256)));
+            assert_eq!(rows[0]["_truncated"], json!(["markdown"]));
+            // Short strings and objects pass through untouched.
+            assert_eq!(rows[0]["fields"]["title"], json!("Doc"));
+            assert_eq!(rows[0]["fields"]["meta"], json!({"lang": "fr"}));
+            // Nothing to cut: no marker key appears.
+            let mut short = vec![json!({"fields": {"title": "A"}})];
+            truncate_preview_rows(&mut short, 256);
+            assert!(short[0].get("_truncated").is_none());
+        }
+
+        #[tokio::test]
+        async fn picker_line_matches_the_scan_and_hides_empty_workflows() {
+            let pool = pool().await;
+            let wf = seed_workflow(&pool).await;
+            let line = fast_picker_line(&pool, &wf).await.unwrap().expect("listed");
+
+            let (mut inputs, _t) = scan_workflow_data_runs_pool(&pool, wf.id).await.unwrap();
+            sort_runs_ascending(&mut inputs);
+            let declared: Vec<String> = Vec::new();
+            let flat = data_query::flatten_runs(&inputs, &declared);
+            let contributing: Vec<&data_query::FlatRun> =
+                flat.iter().filter(|r| !r.records.is_empty()).collect();
+            assert_eq!(line["run_count"], json!(contributing.len()));
+            let last: Option<String> = contributing.iter().filter_map(|r| r.run_at.clone()).max();
+            assert_eq!(line["last_data_at"], json!(last));
+            assert_eq!(line["last_delta"], picker_delta(&flat, &declared));
+
+            // A workflow whose only runs flatten to zero rows never lists.
+            let empty =
+                workflows::insert(&pool, &NewWorkflow { name: "empty".into(), ..Default::default() })
+                    .await
+                    .unwrap();
+            seed_run(&pool, empty.id, "2026-08-19T10:00:00Z", json!({"dry_run": true})).await;
+            assert!(fast_picker_line(&pool, &empty).await.unwrap().is_none());
+        }
+
+        #[tokio::test]
+        async fn facets_are_exact_under_the_budget_and_flagged_past_it() {
+            let pool = pool().await;
+            let wf = seed_workflow(&pool).await;
+            let declared: Vec<String> = Vec::new();
+            let (inputs, _t) = scan_workflow_data_runs_pool(&pool, wf.id).await.unwrap();
+            let (columns, rows) = data_query::flatten(&inputs, &declared, false);
+            let body = fast_workflow_data_facets(&pool, &wf, &declared).await.unwrap();
+            assert_eq!(body["sampled"], json!(false));
+            assert_eq!(body["columns"], json!(columns));
+            assert_eq!(body["row_count"], json!(rows.len()));
+            assert_eq!(body["total_rows"], json!(rows.len()));
+            assert_eq!(body["facets"], data_query::compute_facets(&columns, &rows));
+        }
+    }
 
     // ------------------------------------------------------------------
     // Relayed cloud-export headers are pinned, not passed through.
@@ -2884,6 +3546,8 @@ mod tests {
             relogin_max_retries: 0,
             http_capable: -1,
             auth_config: None,
+            recorded_session_encrypted: None,
+            recorded_session_captured_at: None,
             default_persona_id: None,
             estimated_duration_ms: None,
             usage_count: 0,

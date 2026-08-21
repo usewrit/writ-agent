@@ -21,8 +21,13 @@ pub async fn execute(
 ) -> StepResult {
     let result = do_click(page, config, timeout_ms, fast_mode).await;
 
-    // Settle after a click that landed (parity with the Python agent, which sleeps `wait_after`
-    // after every click). A failed click already returns Err below and skips the wait.
+    // Settle after a click that landed (parity with the Python agent, which settles after
+    // every click). A failed click already returns Err below and skips the wait.
+    //
+    // Not a plain sleep: the click returns before the request it triggers leaves, so a
+    // fixed pause lets the next step read the page the click was performed ON — and at
+    // the end of a sign-in it banks the pre-login session. `wait_after` becomes the
+    // PROBE window; with no traffic this costs exactly what the old sleep did.
     if result.is_ok() {
         let wait_after = config
             .extra
@@ -30,7 +35,12 @@ pub async fn execute(
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_WAIT_AFTER_MS);
         if wait_after > 0 {
-            tokio::time::sleep(Duration::from_millis(wait_after)).await;
+            super::inflight::settle_after_action(
+                page,
+                Duration::from_millis(wait_after),
+                Duration::from_millis(9_000),
+            )
+            .await;
         }
     }
 
