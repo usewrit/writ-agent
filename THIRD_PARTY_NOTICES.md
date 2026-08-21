@@ -1,4 +1,4 @@
-- **MIT License** (`MIT`) — 447 crates
+- **MIT License** (`MIT`) — 453 crates
 - **Unicode License v3** (`Unicode-3.0`) — 19 crates
 - **Apache License 2.0** (`Apache-2.0`) — 16 crates
 - **BSD 3-Clause "New" or "Revised" License** (`BSD-3-Clause`) — 10 crates
@@ -14,7 +14,7 @@
 
 Used by:
 
-- `writ-agent` 1.0.1 — https://github.com/usewrit/writ-agent
+- `writ-agent` 1.0.6 — https://github.com/usewrit/writ-agent
 
 <details><summary>License text — GNU Affero General Public License v3.0</summary>
 
@@ -3278,6 +3278,7 @@ THE SOFTWARE.
 
 Used by:
 
+- `md-5` 0.10.6 — https://github.com/RustCrypto/hashes
 - `sha1` 0.10.6 — https://github.com/RustCrypto/hashes
 - `sha2` 0.10.9 — https://github.com/RustCrypto/hashes
 
@@ -5625,7 +5626,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
-- `h2` 0.4.14 — https://github.com/hyperium/h2
+- `h2` 0.4.18 — https://github.com/hyperium/h2
 
 <details><summary>License text — MIT License</summary>
 
@@ -9019,15 +9020,20 @@ Used by:
 - `windows-result` 0.4.1 — https://github.com/microsoft/windows-rs
 - `windows-strings` 0.5.1 — https://github.com/microsoft/windows-rs
 - `windows-sys` 0.48.0 — https://github.com/microsoft/windows-rs
+- `windows-sys` 0.52.0 — https://github.com/microsoft/windows-rs
 - `windows-sys` 0.59.0 — https://github.com/microsoft/windows-rs
+- `windows-sys` 0.60.2 — https://github.com/microsoft/windows-rs
 - `windows-sys` 0.61.2 — https://github.com/microsoft/windows-rs
 - `windows-targets` 0.48.5 — https://github.com/microsoft/windows-rs
 - `windows-targets` 0.52.6 — https://github.com/microsoft/windows-rs
+- `windows-targets` 0.53.5 — https://github.com/microsoft/windows-rs
 - `windows` 0.52.0 — https://github.com/microsoft/windows-rs
 - `windows_x86_64_gnu` 0.48.5 — https://github.com/microsoft/windows-rs
 - `windows_x86_64_gnu` 0.52.6 — https://github.com/microsoft/windows-rs
+- `windows_x86_64_gnu` 0.53.1 — https://github.com/microsoft/windows-rs
 - `windows_x86_64_msvc` 0.48.5 — https://github.com/microsoft/windows-rs
 - `windows_x86_64_msvc` 0.52.6 — https://github.com/microsoft/windows-rs
+- `windows_x86_64_msvc` 0.53.1 — https://github.com/microsoft/windows-rs
 - `yasna` 0.5.2 — https://github.com/qnighy/yasna.rs
 
 <details><summary>License text — MIT License</summary>

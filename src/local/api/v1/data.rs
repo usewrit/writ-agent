@@ -2298,24 +2298,24 @@ async fn export_lens(
     params: &TableParams,
     is_run: bool,
 ) -> LocalResult<Response> {
-    let lens;
-    let pairs;
-    if is_run {
-        let Some(run_id) = params.run_id else {
-            return Ok(run_id_required());
-        };
-        lens = build_lens(st, id, params.key.as_deref(), Some(run_id)).await?;
+    // `Some` only for a run export, which is also what selects the run lens below.
+    let run_id = match (is_run, params.run_id) {
+        (true, None) => return Ok(run_id_required()),
+        (true, some) => some,
+        (false, _) => None,
+    };
+    let lens = build_lens(st, id, params.key.as_deref(), run_id).await?;
+    let pairs = if let Some(run_id) = run_id {
         let Some(detail) = lens.lineage.run_detail.as_ref() else {
             return Err(LocalError::NotFound(format!(
                 "run {run_id} is not a data snapshot of workflow {id}"
             )));
         };
-        pairs = run_pairs(&lens, detail);
+        run_pairs(&lens, detail)
     } else {
-        lens = build_lens(st, id, params.key.as_deref(), None).await?;
         let include_missing = parse_include_missing(params.include_missing.as_deref());
-        pairs = latest_pairs(&lens, include_missing);
-    }
+        latest_pairs(&lens, include_missing)
+    };
     let query = params.to_query(false); // un-paginated export
     let (rows, _total) = apply_lens_query(pairs, &query, &lens.columns);
 
