@@ -8,7 +8,7 @@ license = "AGPL-3.0-only"
 repository = "https://github.com/usewrit/writ-agent"
 homepage = "https://github.com/usewrit/writ-agent"
 readme = "README.md"
-keywords = ["browser-automation", "playwright", "self-hosted", "agent", "scraping"]
+keywords = ["browser-automation", "playwright", "web-scraping", "agent", "scraping"]
 categories = ["web-programming", "command-line-utilities"]
 
 # Cloud agent (managed product). Requires the `cloud` feature — the self-host

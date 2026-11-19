@@ -13,20 +13,20 @@ binds **`127.0.0.1`** — reaching it from the LAN requires an explicit opt-in (
 
 ## Environment variables
 
-### Fleet worker (`writ-agent-fleet`, self-host)
+### Fleet worker (`writ-agent-fleet`)
 
-The self-host fleet worker is configured **entirely via environment variables**
+The fleet worker is configured **entirely via environment variables**
 (the config-writing CLI is absent from the fleet build; the worker still reads
 `config.toml` for the engine resource-governor ceilings, see below). It connects
-*out* to your self-host coordinator
-([usewrit/writ](https://github.com/usewrit/writ)): it POSTs
-`<coordinator>/api/recorder/connect` with the fleet token as Bearer, then dials
-the WebSocket the coordinator hands back.
+*out* to Writ (`https://api.usewrit.app`): it POSTs
+`<WRIT_COORDINATOR_URL>/api/recorder/connect` with the fleet token as Bearer, then
+dials the WebSocket Writ hands back. The install command from **Agents → Connect a
+machine** in [Writ](https://usewrit.app) sets both variables for you.
 
 | Variable | Required | Effect |
 |----------|----------|--------|
-| `WRIT_SERVICE_TOKEN` | **yes** | The fleet token for the coordinator link, minted in the coordinator UI (**Fleet → "Connect a new agent"**). Sent as the connect Bearer. |
-| `WRIT_COORDINATOR_URL` | **yes** | The coordinator HTTP(S) **base** URL (e.g. `https://coordinator.example.com`) — *not* the WS URL. `SAAS_URL` is accepted as a legacy alias. |
+| `WRIT_SERVICE_TOKEN` | **yes** | The agent's token for the Writ link. The install command exchanges its pairing code for it (**Agents → Connect a machine**). Sent as the connect Bearer. |
+| `WRIT_COORDINATOR_URL` | **yes** | The Writ HTTPS **base** URL, `https://api.usewrit.app` (*not* the WS URL; the name is historical). `SAAS_URL` is accepted as a legacy alias. |
 | `WRIT_HOME` | no (default `~/.writ`) | Data directory: the SQLCipher-encrypted `writ.db` plus the `0600 vault.key` file root when the OS keyring is off. `WRIT_VAULT_ROOT` is an alias for pointing a headless deployment at a mounted volume. **One process per directory** — see the singleton lock below. |
 | `WRIT_USE_KEYRING` | no (default off) | `1`/`true` roots the vault key in the OS keyring instead of the `vault.key` file. Off by default so a container/service never blocks on a keychain prompt. |
 | `WRIT_FLEET_ALLOW_INSECURE` | no (default off) | `1`/`true` allows a plaintext `http://`/`ws://` coordinator that is not loopback. Only for trusted private networks — the worker otherwise refuses to send its token in cleartext. |
@@ -179,8 +179,7 @@ security-weakening toggles".
 
 Anonymous usage counts (totals and durations — never page content or URLs) are **on by default**
 and are sent to the coordinator this agent is linked to, over the link you already configured.
-An agent that is not linked to any coordinator has nowhere to send and never tries; a self-hosted
-coordinator receives its own agents' numbers. Turn it off with `writ telemetry off`, or inspect a
+An agent that is not linked has nowhere to send and never tries. Turn it off with `writ telemetry off`, or inspect a
 day's report first with `writ telemetry preview`.
 
 | Variable | Default | Effect |

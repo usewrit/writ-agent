@@ -27,7 +27,7 @@ setup, how to run the checks CI runs, and what we expect from pull requests.
 
 ## Building
 
-The OSS self-host build (the one CI checks) is:
+The open-source build (the one CI checks) is:
 
 ```sh
 cargo check --no-default-features --features local,fleet,openai

@@ -1,7 +1,7 @@
 # Security
 
 This document describes the security model of the `writ-agent` daemon and the
-things a self-host operator must know to run it safely. For the full behavior
+things you need to know to run it safely on your own machine. For the full behavior
 disclosure list (browser flags, what monitoring stores, the cloud→local
 capability surface) see [`docs/DISCLOSURES.md`](./docs/DISCLOSURES.md).
 
@@ -95,7 +95,7 @@ authenticated reverse proxy or an SSH tunnel.
 
 ## Entitlements key pinning
 
-Cloud/self-host entitlements are signature-verified against a pinned public key
+Entitlements are signature-verified against a pinned public key
 (`src/local/cloud/entitlements.rs`, `PINNED_KEYS`).
 
 `PINNED_KEYS` ships **empty on purpose**, and the verifier **fails closed**: with no
@@ -135,5 +135,4 @@ review `docs/DISCLOSURES.md` and your build for the exact routes gated by the lo
 - **LAN-exposed:** bearer token is the sole gate; anyone with it has full,
   admin-level control.
 - **Cloud link (optional):** once linked, the cloud can drive a broad set of local
-  operations — see `docs/DISCLOSURES.md`. The self-host `fleet` build has no cloud
-  link.
+  operations — see `docs/DISCLOSURES.md`. The `fleet` build has no cloud link.
